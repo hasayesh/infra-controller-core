@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
@@ -25,6 +26,7 @@ import (
 	tp "go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 
@@ -42,9 +44,8 @@ import (
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
+	flowv1 "github.com/NVIDIA/infra-controller/rest-api/proto/flow/gen/v1"
 	swe "github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/error"
-	flowv1 "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/flow/protobuf/v1"
-	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 )
 
 const (
@@ -52,10 +53,12 @@ const (
 	RECENT_STATUS_DETAIL_COUNT = 20
 	DefaultIpxeScript          = "#ipxe\ndefault"
 
-	// Likely to be moved into cloud-db later, similar
-	// to machine status.
-	MachineHealthStatusHealthy   = "healthy"
+	// MachineHealthStatusHealthy is the health status for a machine that is healthy
+	MachineHealthStatusHealthy = "healthy"
+	// MachineHealthStatusUnhealthy is the health status for a machine that is unhealthy
 	MachineHealthStatusUnhealthy = "unhealthy"
+	// TenantCapabilityTargetedInstanceCreation is the capability key for targeted instance creation
+	TenantCapabilityTargetedInstanceCreation = "targetedInstanceCreation"
 )
 
 var (
@@ -82,6 +85,28 @@ var (
 	RequestAsTenant = "Tenant"
 )
 
+// InfiniBandMachineSelectionError is returned when no machine satisfies the requested InfiniBand
+// device instances but enough active ports exist on a candidate machine.
+type InfiniBandMachineSelectionError struct {
+	SuggestedByDevice map[string][]int
+}
+
+func (e *InfiniBandMachineSelectionError) Error() string {
+	return "Requested InfiniBand device instances are not available on any Machine for this Instance Type"
+}
+
+// ValidationError returns a validation error that includes suggested device instances.
+func (e *InfiniBandMachineSelectionError) ValidationError() validation.Errors {
+	errMsg := "requested device instances are not available on any Machine for this Instance Type"
+
+	for device, deviceInstances := range e.SuggestedByDevice {
+		errMsg += fmt.Sprintf(". Use deviceInstances: %v for device: %s", deviceInstances, device)
+	}
+	return validation.Errors{
+		"infiniBandInterfaces": errors.New(errMsg),
+	}
+}
+
 // GetInfrastructureProviderForOrg gets the infrastructureProvider for org
 func GetInfrastructureProviderForOrg(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, org string) (*cdbm.InfrastructureProvider, error) {
 	ipDAO := cdbm.NewInfrastructureProviderDAO(dbSession)
@@ -100,7 +125,7 @@ func GetInfrastructureProviderForOrg(ctx context.Context, tx *cdb.Tx, dbSession 
 func GetTenantForOrg(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, org string) (*cdbm.Tenant, error) {
 	tnDAO := cdbm.NewTenantDAO(dbSession)
 
-	ts, err := tnDAO.GetAllByOrg(ctx, tx, org, nil)
+	ts, _, err := tnDAO.GetAll(ctx, tx, cdbm.TenantFilterInput{Orgs: []string{org}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +300,7 @@ func AcquireInstanceTypeQuotaLock(ctx context.Context, tx *cdb.Tx, tenantID uuid
 }
 
 // GetUnallocatedMachineForInstanceType provides unallocatd machine based on instancetype
-func GetUnallocatedMachineForInstanceType(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, instanceType *cdbm.InstanceType) (*cdbm.Machine, error) {
+func GetUnallocatedMachineForInstanceType(ctx context.Context, logger zerolog.Logger, tx *cdb.Tx, dbSession *cdb.Session, instanceType *cdbm.InstanceType, apiRequest *cam.APIInstanceCreateRequest) (*cdbm.Machine, error) {
 	if instanceType == nil {
 		return nil, ErrInvalidFunctionParams
 	}
@@ -286,6 +311,7 @@ func GetUnallocatedMachineForInstanceType(ctx context.Context, tx *cdb.Tx, dbSes
 	}
 
 	mcDAO := cdbm.NewMachineDAO(dbSession)
+	mcCapDAO := cdbm.NewMachineCapabilityDAO(dbSession)
 
 	// Get all available Machines for the Instance Type
 	// Since this query is occurring outside of a lock, we will have to double check availability of Machines
@@ -304,7 +330,7 @@ func GetUnallocatedMachineForInstanceType(ctx context.Context, tx *cdb.Tx, dbSes
 	// each release+creation attempt to deal with cases where a machine's health
 	// status isn't being properly reported and thus a bad machine isn't
 	// being pulled from rotation.
-	// As of Go 1.21, the default behavior is to use auto-seeding and fastrand64,
+	// Modern Go defaults to auto-seeding and fast random number generation,
 	// so we can rely on just calling the top-level Shuffle as needed.
 	rand.Shuffle(
 		len(machines),
@@ -312,6 +338,34 @@ func GetUnallocatedMachineForInstanceType(ctx context.Context, tx *cdb.Tx, dbSes
 			machines[i], machines[j] = machines[j], machines[i]
 		},
 	)
+
+	var infiniBandInterfaces []cam.APIInfiniBandInterfaceCreateOrUpdateRequest
+	if apiRequest != nil {
+		infiniBandInterfaces = apiRequest.InfiniBandInterfaces
+	}
+	requireInfiniBandMatch := len(infiniBandInterfaces) > 0
+	var suggestedByDevice map[string][]int
+	foundInfiniBandSuggestion := false
+
+	// Get all Machine InfiniBand Capabilities for the Machines
+	machineIbCapsByMachineID := map[string][]cdbm.MachineCapability{}
+	if requireInfiniBandMatch && len(machines) > 0 {
+		machineIDs := make([]string, len(machines))
+		for i, mc := range machines {
+			machineIDs[i] = mc.ID
+		}
+		allIbCaps, _, capErr := mcCapDAO.GetAll(ctx, tx, machineIDs, nil, cdb.GetTypedStrPtr(cdbm.MachineCapabilityTypeInfiniBand), nil, nil, nil, nil, nil, nil, nil, nil, nil, cutil.GetPtr(cdbp.TotalLimit), nil)
+		if capErr != nil {
+			logger.Error().Err(capErr).Msg("failed to retrieve Machine InfiniBand Capabilities from DB")
+			return nil, capErr
+		}
+		for _, cap := range allIbCaps {
+			if cap.MachineID == nil {
+				continue
+			}
+			machineIbCapsByMachineID[*cap.MachineID] = append(machineIbCapsByMachineID[*cap.MachineID], cap)
+		}
+	}
 
 	if len(machines) > 0 {
 		for _, mc := range machines {
@@ -336,12 +390,37 @@ func GetUnallocatedMachineForInstanceType(ctx context.Context, tx *cdb.Tx, dbSes
 				continue
 			}
 
+			// If InfiniBand Interfaces are specified in the request, verify that the Machine has matching InfiniBand Interfaces
+			if requireInfiniBandMatch {
+				// Get the Machine InfiniBand Capabilities for the Machine
+				machineIbCaps := machineIbCapsByMachineID[mc.ID]
+				if len(machineIbCaps) == 0 {
+					continue
+				}
+
+				// Validate the InfiniBand Interfaces against the Machine InfiniBand Capabilities
+				match := apiRequest.ValidateInfiniBandRequestForMachineCapability(machineIbCaps)
+				if !match.Satisfied {
+					// If the request is not satisfied, but the count is satisfiable, keep track of the suggestion and continue to the next machine
+					// if foundInfiniBandSuggestion is true, we have already found a suggestion and we don't need to find another one
+					if match.CountSatisfiable && !foundInfiniBandSuggestion {
+						foundInfiniBandSuggestion = true
+						suggestedByDevice = make(map[string][]int, len(match.SuggestedByDevice))
+						for device, instances := range match.SuggestedByDevice {
+							suggestedByDevice[device] = append([]int(nil), instances...)
+						}
+					}
+					continue
+				}
+			}
+
 			// We should now be able to proceed with the allocation
 			// Update the machine status to assigned
 			updateInput := cdbm.MachineUpdateInput{
 				MachineID:  mc.ID,
 				IsAssigned: cutil.GetPtr(true),
 			}
+
 			// return the updated machine
 			mcu, err := mcDAO.Update(ctx, tx, updateInput)
 			if err != nil {
@@ -350,6 +429,10 @@ func GetUnallocatedMachineForInstanceType(ctx context.Context, tx *cdb.Tx, dbSes
 			return mcu, nil
 		}
 	}
+	// If we found a suggestion, return the error with the suggestion
+	if foundInfiniBandSuggestion {
+		return nil, &InfiniBandMachineSelectionError{SuggestedByDevice: suggestedByDevice}
+	}
 	return nil, ErrInstanceTypeMachineNotFound
 }
 
@@ -357,7 +440,7 @@ func GetUnallocatedMachineForInstanceType(ctx context.Context, tx *cdb.Tx, dbSes
 // machines for instance type
 func GetCountOfMachinesForInstanceType(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, instanceTypeID uuid.UUID) (int, error) {
 	mitDAO := cdbm.NewMachineInstanceTypeDAO(dbSession)
-	_, tot, err := mitDAO.GetAll(ctx, tx, nil, []uuid.UUID{instanceTypeID}, nil, nil, nil, nil)
+	_, tot, err := mitDAO.GetAll(ctx, tx, cdbm.MachineInstanceTypeFilterInput{InstanceTypeIDs: []uuid.UUID{instanceTypeID}}, cdbp.PageInput{Limit: cutil.GetPtr(0)}, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -369,7 +452,7 @@ func GetCountOfMachinesForInstanceType(ctx context.Context, tx *cdb.Tx, dbSessio
 func GetSiteMachineCountStats(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, logger zerolog.Logger, infrastructureProviderID *uuid.UUID, siteID *uuid.UUID) (map[uuid.UUID]*cam.APISiteMachineStats, error) {
 	mDAO := cdbm.NewMachineDAO(dbSession)
 
-	filterInput := cdbm.MachineFilterInput{}
+	filterInput := cdbm.MachineFilterInput{ExcludeMetadata: true}
 	if infrastructureProviderID != nil {
 		filterInput.InfrastructureProviderIDs = []uuid.UUID{*infrastructureProviderID}
 	}
@@ -491,6 +574,37 @@ func GetSiteMachineCountStats(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Se
 
 		stats[siteID].TotalByAllocation[cam.MachineStatsAllocatedNotInUse] = totalAllocation - stats[siteID].TotalByAllocation[cam.MachineStatsAllocatedInUse]
 		stats[siteID].TotalByAllocation[cam.MachineStatsUnallocated] = stats[siteID].Total - totalAllocation
+	}
+
+	return stats, nil
+}
+
+// GetSiteGPUStats returns per-site GPU summary stats (grouped by GPU name),
+// optionally scoped to an infrastructure provider and/or a single site. The
+// aggregation is performed in the database; each site's slice is sorted by GPU
+// name for deterministic output.
+func GetSiteGPUStats(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, logger zerolog.Logger, infrastructureProviderID *uuid.UUID, siteID *uuid.UUID) (map[uuid.UUID][]cam.APIMachineGPUStats, error) {
+	mcDAO := cdbm.NewMachineCapabilityDAO(dbSession)
+
+	rows, err := mcDAO.GetGPUStatsBySite(ctx, tx, infrastructureProviderID, siteID)
+	if err != nil {
+		logger.Error().Err(err).Msg("error aggregating GPU stats by site")
+		return nil, err
+	}
+
+	stats := map[uuid.UUID][]cam.APIMachineGPUStats{}
+	for _, row := range rows {
+		stats[row.SiteID] = append(stats[row.SiteID], cam.APIMachineGPUStats{
+			Name:     row.Name,
+			GPUs:     row.GPUs,
+			Machines: row.Machines,
+		})
+	}
+
+	for siteID := range stats {
+		slices.SortFunc(stats[siteID], func(a, b cam.APIMachineGPUStats) int {
+			return strings.Compare(a.Name, b.Name)
+		})
 	}
 
 	return stats, nil
@@ -685,9 +799,8 @@ func GetAllInstanceTypeAllocationStats(ctx context.Context, dbSession *cdb.Sessi
 		}
 	}
 
-	// Get all Machines for the Instance Type IDs
 	machineDAO := cdbm.NewMachineDAO(dbSession)
-	machines, _, err := machineDAO.GetAll(ctx, nil, cdbm.MachineFilterInput{InstanceTypeIDs: instanceTypeIDs}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+	machines, _, err := machineDAO.GetAll(ctx, nil, cdbm.MachineFilterInput{InstanceTypeIDs: instanceTypeIDs, ExcludeMetadata: true}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving Machines from DB")
 		return nil, cutil.NewAPIError(http.StatusInternalServerError, "Error retrieving Machines assigned to the Instance Type, DB error", nil)
@@ -888,6 +1001,7 @@ func MatchInstanceTypeCapabilitiesForMachines(ctx context.Context, logger zerolo
 	// All Machines valid if Instance Type does not have Capabilities
 	if total == 0 {
 		return true, nil, nil
+
 	}
 
 	// Build a map of capability type to capability object for instancetype
@@ -1105,6 +1219,7 @@ func TerminateWorkflowOnTimeOut(echoCtx echo.Context, logger zerolog.Logger, tem
 	return cutil.NewAPIErrorResponse(echoCtx, http.StatusInternalServerError, fmt.Sprintf("Failed to perform %s %s - timeout occurred executing workflow on Site: %s", objectType, workflowName, originalError), nil)
 }
 
+// UnwrapWorkflowError removes Temporal wrappers and maps backend errors to HTTP status codes.
 func UnwrapWorkflowError(err error) (code int, unwrappedError error) {
 	code, unwrappedError = http.StatusInternalServerError, err
 
@@ -1150,6 +1265,8 @@ func UnwrapWorkflowError(err error) (code int, unwrappedError error) {
 			code = http.StatusPreconditionFailed
 		case codes.InvalidArgument:
 			code = http.StatusBadRequest
+		case codes.ResourceExhausted:
+			code = http.StatusTooManyRequests
 		}
 	}
 
@@ -1177,6 +1294,8 @@ func UnwrapWorkflowError(err error) (code int, unwrappedError error) {
 		code = http.StatusPreconditionFailed
 	case swe.ErrTypeNICoInvalidArgument, swe.ErrTypeCarbideInvalidArgument:
 		code = http.StatusBadRequest
+	case swe.ErrTypeNICoResourceExhausted:
+		code = http.StatusTooManyRequests
 	}
 
 	// if the error is an internal Temporal error it is mostly useless so we unwrap it but we keep
@@ -1186,6 +1305,18 @@ func UnwrapWorkflowError(err error) (code int, unwrappedError error) {
 	}
 
 	return
+}
+
+// GRPCStatusMessage returns the gRPC status message when err is a gRPC status,
+// otherwise err.Error(). Intended for errors already unwrapped by ExecuteCoreGRPC.
+func GRPCStatusMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	if s, ok := status.FromError(err); ok {
+		return s.Message()
+	}
+	return err.Error()
 }
 
 // GetUserAndEnrichLogger retrieves the user from the echo context and enriches the logger
@@ -1258,9 +1389,93 @@ func IsProvider(ctx context.Context, logger zerolog.Logger, dbSession *cdb.Sessi
 	return infrastructureProvider, nil
 }
 
+// SiteTemporalClientPool resolves the per-site Temporal client used to proxy
+// requests to Core.
+type SiteTemporalClientPool interface {
+	GetClientByID(siteID uuid.UUID) (tclient.Client, error)
+}
+
+// AuthorizeProviderSiteForCoreInput carries the inputs for AuthorizeProviderSiteForCore.
+type AuthorizeProviderSiteForCoreInput struct {
+	Ctx       context.Context
+	Logger    zerolog.Logger
+	DBSession *cdb.Session
+	SCP       SiteTemporalClientPool
+	Org       string
+	User      *cdbm.User
+	SiteID    string
+}
+
+// AuthorizeProviderSiteForCore validates that user is a Provider Admin for org,
+// resolves siteStrID to a Site owned by the org's Infrastructure Provider, and
+// returns the per-site Temporal client plus the site ID string. The site ID is
+// the shared key used to encrypt redacted secret fields for transport to the
+// site agent.
+func AuthorizeProviderSiteForCore(in AuthorizeProviderSiteForCoreInput) (tclient.Client, string, *cutil.APIError) {
+	if in.User == nil {
+		in.Logger.Error().Msg("invalid User object found in request context")
+		return nil, "", cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve current user", nil)
+	}
+
+	ok, err := auth.ValidateOrgMembership(in.User, in.Org)
+	if !ok {
+		if err != nil {
+			in.Logger.Error().Err(err).Msg("error validating org membership for User in request")
+		} else {
+			in.Logger.Warn().Msg("could not validate org membership for user, access denied")
+		}
+		return nil, "", cutil.NewAPIError(http.StatusForbidden, fmt.Sprintf("Failed to validate membership for org: %s", in.Org), nil)
+	}
+
+	if ok := auth.ValidateUserRoles(in.User, in.Org, nil, auth.ProviderAdminRole); !ok {
+		in.Logger.Warn().Msg("user does not have Provider Admin role, access denied")
+		return nil, "", cutil.NewAPIError(http.StatusForbidden, "User does not have Provider Admin role with org", nil)
+	}
+
+	provider, err := GetInfrastructureProviderForOrg(in.Ctx, nil, in.DBSession, in.Org)
+	if err != nil {
+		if errors.Is(err, ErrOrgInstrastructureProviderNotFound) {
+			return nil, "", cutil.NewAPIError(http.StatusNotFound,
+				fmt.Sprintf("Org '%v' does not have an Infrastructure Provider", in.Org), nil)
+		}
+		in.Logger.Error().Err(err).Msg("error retrieving Infrastructure Provider for this org")
+		return nil, "", cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Infrastructure Provider", nil)
+	}
+
+	site, err := GetSiteFromIDString(in.Ctx, nil, in.SiteID, in.DBSession)
+	if err != nil {
+		if errors.Is(err, cdb.ErrDoesNotExist) || errors.Is(err, ErrInvalidID) {
+			in.Logger.Warn().Err(err).Str("Site ID", in.SiteID).Msg("site not found in request")
+			return nil, "", cutil.NewAPIError(http.StatusBadRequest,
+				fmt.Sprintf("Could not find Site with ID specified in request data: %s", in.SiteID), nil)
+		}
+		in.Logger.Error().Err(err).Str("Site ID", in.SiteID).Msg("error retrieving Site from DB")
+		return nil, "", cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Site due to DB error", nil)
+	}
+
+	if site.InfrastructureProviderID != provider.ID {
+		return nil, "", cutil.NewAPIError(http.StatusForbidden, "Site specified in request doesn't belong to current org's Provider", nil)
+	}
+
+	if site.Status != cdbm.SiteStatusRegistered {
+		return nil, "", cutil.NewAPIError(http.StatusBadRequest, "Site is not in Registered state, unable to execute operation on Site", nil)
+	}
+
+	stc, err := in.SCP.GetClientByID(site.ID)
+	if err != nil {
+		in.Logger.Error().Err(err).Msg("failed to retrieve Temporal client for Site")
+		return nil, "", cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve client for Site", nil)
+	}
+
+	return stc, site.ID.String(), nil
+}
+
 // IsTenant ensures that user is authorized to act as a Tenant Admin for the org.
 // if authorized it returns the tenant otherwise a relevant error.
-func IsTenant(ctx context.Context, logger zerolog.Logger, dbSession *cdb.Session, org string, user *cdbm.User, requirePrivileged bool) (*cdbm.Tenant, *cutil.APIError) {
+// requirePrivilegedScope gates on the TargetedInstanceCreation capability: nil
+// means no privilege is required; a non-nil scope requires the capability to be
+// effective within that scope (see TenantPrivilegeScope).
+func IsTenant(ctx context.Context, logger zerolog.Logger, dbSession *cdb.Session, org string, user *cdbm.User, requirePrivilegedScope *TenantPrivilegeScope) (*cdbm.Tenant, *cutil.APIError) {
 	// Validate that user belongs to org
 	ok, err := auth.ValidateOrgMembership(user, org)
 	if !ok {
@@ -1290,16 +1505,237 @@ func IsTenant(ctx context.Context, logger zerolog.Logger, dbSession *cdb.Session
 		return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve tenant for org, DB error", nil)
 	}
 
-	if requirePrivileged && !tenant.Config.TargetedInstanceCreation {
-		return nil, cutil.NewAPIError(http.StatusForbidden, "Tenant does not have Targeted Instance Creation capability enabled", nil)
+	if requirePrivilegedScope != nil {
+		privileged, perr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tenant, requirePrivilegedScope)
+		if perr != nil {
+			logger.Error().Err(perr).Msg("error resolving privileged TenantAccount for Tenant")
+			return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to resolve Tenant capability, DB error", nil)
+		}
+		if !privileged {
+			return nil, cutil.NewAPIError(http.StatusForbidden, "Tenant does not have Targeted Instance Creation capability enabled", nil)
+		}
 	}
 
 	return tenant, nil
 }
 
+// TenantPrivilegeScope narrows where a Tenant's TargetedInstanceCreation
+// capability must be effective for a privilege check.
+//
+// The scope pointer's presence is itself the "require privileged" signal for
+// the auth gates (IsTenant / IsProviderOrTenant): a nil *TenantPrivilegeScope
+// means no privilege is required. For TenantHasTargetedInstanceCreation a
+// non-nil scope is required and the fields select how the capability is
+// resolved:
+//
+//   - SiteID set: resolve the effective capability for that exact Site.
+//   - InfrastructureProviderID set: privileged if the Ready TenantAccount for
+//     that Provider has TargetedInstanceCreation enabled globally.
+//
+// SiteID and InfrastructureProviderID must not be set together.
+type TenantPrivilegeScope struct {
+	InfrastructureProviderID *uuid.UUID
+	SiteID                   *uuid.UUID
+}
+
+// TenantHasLegacyTargetedInstanceCreation reports whether the deprecated
+// Tenant.capabilities.targetedInstanceCreation compatibility field may be
+// returned as true. It requires at least one Ready TenantAccount, every Ready
+// TenantAccount default to be enabled, and no explicit TenantSite override to
+// disable the capability.
+//
+// This coarse aggregate is for response compatibility only. Authorization must
+// use TenantHasTargetedInstanceCreation with an explicit Provider or Site scope.
+func TenantHasLegacyTargetedInstanceCreation(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, tenant *cdbm.Tenant) (bool, error) {
+	if tenant == nil {
+		return false, nil
+	}
+
+	taDAO := cdbm.NewTenantAccountDAO(dbSession)
+	tas, _, err := taDAO.GetAll(ctx, tx, cdbm.TenantAccountFilterInput{
+		TenantIDs: []uuid.UUID{tenant.ID},
+		Statuses:  []string{cdbm.TenantAccountStatusReady},
+	}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+	if err != nil {
+		return false, err
+	}
+	if len(tas) == 0 {
+		return false, nil
+	}
+
+	for _, ta := range tas {
+		if !ta.Config.TargetedInstanceCreation {
+			return false, nil
+		}
+	}
+
+	tsDAO := cdbm.NewTenantSiteDAO(dbSession)
+	disabledSites, _, err := tsDAO.GetAll(ctx, tx, cdbm.TenantSiteFilterInput{
+		TenantIDs: []uuid.UUID{tenant.ID},
+		ConfigKey: cutil.GetPtr(TenantCapabilityTargetedInstanceCreation),
+		ConfigVal: cutil.GetPtr("false"),
+	}, cdbp.PageInput{Limit: cutil.GetPtr(1)}, nil)
+	if err != nil {
+		return false, err
+	}
+
+	return len(disabledSites) == 0, nil
+}
+
+// TenantHasTargetedInstanceCreation reports whether the Tenant has the
+// TargetedInstanceCreation capability enabled within the given scope. It is
+// nil-safe so callers don't have to repeat the tenant nil check, and it
+// deliberately does not read the deprecated tenant-level flag
+// (tenant.Config.TargetedInstanceCreation), which is superseded by
+// TenantAccount.config with per-site TenantSite.config overrides. See
+// TenantPrivilegeScope for how scope selects the resolution strategy.
+func TenantHasTargetedInstanceCreation(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, tenant *cdbm.Tenant, scope *TenantPrivilegeScope) (bool, error) {
+	if tenant == nil {
+		return false, nil
+	}
+
+	if scope == nil {
+		return false, errors.New("scope must be specified when evaluating Tenant's targeted Instance creation capability")
+	}
+
+	if scope.SiteID != nil && scope.InfrastructureProviderID != nil {
+		return false, errors.New("site ID and infrastructure provider ID cannot be specified together when evaluating Tenant's targeted Instance creation capability")
+	}
+
+	siteID := scope.SiteID
+	providerID := scope.InfrastructureProviderID
+	var siteOverride *bool
+
+	// Site-scoped: resolve the effective capability for the exact Site.
+	if siteID != nil {
+		tsDAO := cdbm.NewTenantSiteDAO(dbSession)
+		ts, err := tsDAO.GetByTenantIDAndSiteID(ctx, tx, tenant.ID, *siteID, []string{cdbm.SiteRelationName})
+		if err != nil {
+			if errors.Is(err, cdb.ErrDoesNotExist) {
+				siteDAO := cdbm.NewSiteDAO(dbSession)
+				site, err := siteDAO.GetByID(ctx, tx, *siteID, nil, false)
+				if err != nil {
+					return false, err
+				}
+
+				// Site-scoped: resolve the effective capability for the exact Site.
+				providerID = &site.InfrastructureProviderID
+			} else {
+				return false, err
+			}
+		} else {
+			if ts.Site != nil {
+				providerID = &ts.Site.InfrastructureProviderID
+			} else {
+				return false, errors.New("failed to retrieve related Site for Tenant/Site association, DB error")
+			}
+			// This will ensure TenantAccount is ready for the Site.
+			siteOverride = ts.Config.TargetedInstanceCreation
+		}
+	}
+
+	if providerID != nil {
+		taDAO := cdbm.NewTenantAccountDAO(dbSession)
+		tas, _, err := taDAO.GetAll(ctx, tx, cdbm.TenantAccountFilterInput{
+			InfrastructureProviderID: providerID,
+			TenantIDs:                []uuid.UUID{tenant.ID},
+			Statuses:                 []string{cdbm.TenantAccountStatusReady},
+		}, cdbp.PageInput{Limit: cutil.GetPtr(1)}, nil)
+		if err != nil {
+			return false, err
+		}
+
+		if len(tas) == 0 {
+			return false, nil
+		}
+
+		ta := tas[0]
+		if siteOverride != nil {
+			return *siteOverride, nil
+		}
+
+		return ta.Config.TargetedInstanceCreation, nil
+	}
+
+	return false, nil
+}
+
+// GetPrivilegedAccessSiteIDsForTenant returns Site IDs where the Tenant has
+// effective TargetedInstanceCreation via a Ready TenantAccount and optional
+// TenantSite.config overrides. It is nil-safe and returns an empty slice when
+// the Tenant has no privileged Site access.
+func GetPrivilegedAccessSiteIDsForTenant(ctx context.Context, tx *cdb.Tx, dbSession *cdb.Session, tenant *cdbm.Tenant) ([]uuid.UUID, error) {
+	if tenant == nil {
+		return nil, nil
+	}
+
+	taDAO := cdbm.NewTenantAccountDAO(dbSession)
+	tas, _, err := taDAO.GetAll(ctx, tx, cdbm.TenantAccountFilterInput{
+		TenantIDs: []uuid.UUID{tenant.ID},
+		Statuses:  []string{cdbm.TenantAccountStatusReady},
+	}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(tas) == 0 {
+		return nil, nil
+	}
+
+	readyProviderIDs := mapset.NewSet[uuid.UUID]()
+	enabledProviderIDs := mapset.NewSet[uuid.UUID]()
+	for _, ta := range tas {
+		readyProviderIDs.Add(ta.InfrastructureProviderID)
+		if ta.Config.TargetedInstanceCreation {
+			enabledProviderIDs.Add(ta.InfrastructureProviderID)
+		}
+	}
+
+	siteIDs := mapset.NewSet[uuid.UUID]()
+	if !enabledProviderIDs.IsEmpty() {
+		siteDAO := cdbm.NewSiteDAO(dbSession)
+		sites, _, err := siteDAO.GetAll(ctx, tx, cdbm.SiteFilterInput{
+			InfrastructureProviderIDs: enabledProviderIDs.ToSlice(),
+		}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, site := range sites {
+			siteIDs.Add(site.ID)
+		}
+	}
+
+	tsDAO := cdbm.NewTenantSiteDAO(dbSession)
+	tss, _, err := tsDAO.GetAll(ctx, tx, cdbm.TenantSiteFilterInput{
+		TenantIDs: []uuid.UUID{tenant.ID},
+	}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, []string{cdbm.SiteRelationName})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ts := range tss {
+		if ts.Config.TargetedInstanceCreation != nil {
+			if *ts.Config.TargetedInstanceCreation {
+				if ts.Site != nil && readyProviderIDs.Contains(ts.Site.InfrastructureProviderID) {
+					siteIDs.Add(ts.SiteID)
+				}
+			} else {
+				siteIDs.Remove(ts.SiteID)
+			}
+		}
+	}
+
+	return siteIDs.ToSlice(), nil
+}
+
 // IsProviderOrTenant ensures that user is authorized to act as a Provider Admin or/and Tenant Admin for the org.
 // if authorized it returns the tenant otherwise a relevant error.
-func IsProviderOrTenant(ctx context.Context, logger zerolog.Logger, dbSession *cdb.Session, org string, user *cdbm.User, allowViewerRole bool, requirePrivilegedTenant bool) (infrastructureProvider *cdbm.InfrastructureProvider, tenant *cdbm.Tenant, apiError *cutil.APIError) {
+//
+// requirePrivilegedScope gates the Tenant on the TargetedInstanceCreation
+// capability: nil means no privilege is required; a non-nil scope requires the
+// capability to be effective within that scope (see TenantPrivilegeScope). It
+// only affects the Tenant path — Provider authorization is unaffected.
+func IsProviderOrTenant(ctx context.Context, logger zerolog.Logger, dbSession *cdb.Session, org string, user *cdbm.User, allowViewerRole bool, requirePrivilegedScope *TenantPrivilegeScope) (infrastructureProvider *cdbm.InfrastructureProvider, tenant *cdbm.Tenant, apiError *cutil.APIError) {
 	// Validate that user belongs to org
 	ok, err := auth.ValidateOrgMembership(user, org)
 	if !ok {
@@ -1347,8 +1783,13 @@ func IsProviderOrTenant(ctx context.Context, logger zerolog.Logger, dbSession *c
 			}
 		}
 
-		if tenant != nil && requirePrivilegedTenant {
-			if !tenant.Config.TargetedInstanceCreation {
+		if tenant != nil && requirePrivilegedScope != nil {
+			privileged, perr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tenant, requirePrivilegedScope)
+			if perr != nil {
+				logger.Error().Err(perr).Msg("error resolving privileged TenantAccount for Tenant")
+				return nil, nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to resolve Tenant capability, DB error", nil)
+			}
+			if !privileged {
 				if infrastructureProvider == nil {
 					return nil, nil, cutil.NewAPIError(http.StatusForbidden, "Tenant does not have targeted Instance creation capability enabled", nil)
 				}
@@ -1633,8 +2074,9 @@ func QueryParamHash(params url.Values) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(sortedParams, "&"))))[:12]
 }
 
-// ExecutePowerControlWorkflow determines the appropriate power control workflow based on state,
-// executes it via Temporal, and returns the raw SubmitTaskResponse.
+// ExecutePowerControlWorkflow determines the appropriate Flow power control
+// method based on state, proxies it to the site, and returns the raw
+// SubmitTaskResponse.
 //
 // ruleID, when non-nil and non-empty, pins the operation to a specific
 // Operation Rule (overrides Flow's default rule resolution). Must be a valid
@@ -1651,13 +2093,13 @@ func ExecutePowerControlWorkflow(
 	workflowID string,
 	entityName string,
 ) (*flowv1.SubmitTaskResponse, error) {
-	var workflowName string
-	var flowRequest interface{}
+	var fullMethod string
+	var flowRequest proto.Message
 	ruleUUID := GetFlowUUIDPtr(ruleID)
 
 	switch state {
 	case cam.PowerControlStateOn:
-		workflowName = "PowerOnRack"
+		fullMethod = flowv1.Flow_PowerOnRack_FullMethodName
 		flowRequest = &flowv1.PowerOnRackRequest{
 			TargetSpec:             targetSpec,
 			Description:            fmt.Sprintf("API power on %s", entityName),
@@ -1665,7 +2107,7 @@ func ExecutePowerControlWorkflow(
 			OverrideReadinessCheck: overrideReadinessCheck,
 		}
 	case cam.PowerControlStateOff:
-		workflowName = "PowerOffRack"
+		fullMethod = flowv1.Flow_PowerOffRack_FullMethodName
 		flowRequest = &flowv1.PowerOffRackRequest{
 			TargetSpec:             targetSpec,
 			Description:            fmt.Sprintf("API power off %s", entityName),
@@ -1673,7 +2115,7 @@ func ExecutePowerControlWorkflow(
 			OverrideReadinessCheck: overrideReadinessCheck,
 		}
 	case cam.PowerControlStateCycle:
-		workflowName = "PowerResetRack"
+		fullMethod = flowv1.Flow_PowerResetRack_FullMethodName
 		flowRequest = &flowv1.PowerResetRackRequest{
 			TargetSpec:             targetSpec,
 			Description:            fmt.Sprintf("API power cycle %s", entityName),
@@ -1681,7 +2123,7 @@ func ExecutePowerControlWorkflow(
 			OverrideReadinessCheck: overrideReadinessCheck,
 		}
 	case cam.PowerControlStateForceOff:
-		workflowName = "PowerOffRack"
+		fullMethod = flowv1.Flow_PowerOffRack_FullMethodName
 		flowRequest = &flowv1.PowerOffRackRequest{
 			TargetSpec:             targetSpec,
 			Forced:                 true,
@@ -1690,7 +2132,7 @@ func ExecutePowerControlWorkflow(
 			OverrideReadinessCheck: overrideReadinessCheck,
 		}
 	case cam.PowerControlStateForceCycle:
-		workflowName = "PowerResetRack"
+		fullMethod = flowv1.Flow_PowerResetRack_FullMethodName
 		flowRequest = &flowv1.PowerResetRackRequest{
 			TargetSpec:             targetSpec,
 			Forced:                 true,
@@ -1702,39 +2144,22 @@ func ExecutePowerControlWorkflow(
 		return nil, cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Invalid power control state: %s", state), nil)
 	}
 
-	workflowOptions := tclient.StartWorkflowOptions{
-		ID:                       workflowID,
-		WorkflowIDReusePolicy:    temporalEnums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-		WorkflowIDConflictPolicy: temporalEnums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-		WorkflowExecutionTimeout: cutil.WorkflowExecutionTimeout,
-		TaskQueue:                queue.SiteTaskQueue,
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, cutil.WorkflowContextTimeout)
-	defer cancel()
-
-	we, err := stc.ExecuteWorkflow(ctx, workflowOptions, workflowName, flowRequest)
-	if err != nil {
-		logger.Error().Err(err).Msg(fmt.Sprintf("failed to execute %s workflow", workflowName))
-		return nil, cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to power control %s", entityName), nil)
-	}
-
 	var flowResponse flowv1.SubmitTaskResponse
-	err = we.Get(ctx, &flowResponse)
-	if err != nil {
-		var timeoutErr *tp.TimeoutError
-		if errors.As(err, &timeoutErr) || err == context.DeadlineExceeded || ctx.Err() != nil {
-			return nil, TerminateWorkflowOnTimeOut(c, logger, stc, workflowID, err, entityName, workflowName)
-		}
-		logger.Error().Err(err).Msg(fmt.Sprintf("failed to get result from %s workflow", workflowName))
-		return nil, cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to power control %s", entityName), nil)
+	proxyErr := ProxyFlowGRPC(
+		ctx, c, logger, stc,
+		fullMethod,
+		flowRequest, &flowResponse,
+		FlowWorkflowID(workflowID), temporalEnums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	)
+	if proxyErr != nil {
+		return nil, proxyErr
 	}
 
 	return &flowResponse, nil
 }
 
-// ExecuteBringUpRackWorkflow builds a BringUpRackRequest, executes the BringUpRack
-// workflow via Temporal, and returns the raw SubmitTaskResponse.
+// ExecuteBringUpRackWorkflow builds a BringUpRackRequest, proxies it to Flow's
+// BringUpRack, and returns the raw SubmitTaskResponse.
 //
 // ruleID, when non-nil and non-empty, pins the bring-up to a specific
 // Operation Rule.
@@ -1757,39 +2182,22 @@ func ExecuteBringUpRackWorkflow(
 		OverrideReadinessCheck: overrideReadinessCheck,
 	}
 
-	workflowOptions := tclient.StartWorkflowOptions{
-		ID:                       workflowID,
-		WorkflowIDReusePolicy:    temporalEnums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-		WorkflowIDConflictPolicy: temporalEnums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-		WorkflowExecutionTimeout: cutil.WorkflowExecutionTimeout,
-		TaskQueue:                queue.SiteTaskQueue,
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, cutil.WorkflowContextTimeout)
-	defer cancel()
-
-	we, err := stc.ExecuteWorkflow(ctx, workflowOptions, "BringUpRack", flowRequest)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to execute BringUpRack workflow")
-		return nil, cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to bring up %s", entityName), nil)
-	}
-
 	var flowResponse flowv1.SubmitTaskResponse
-	err = we.Get(ctx, &flowResponse)
-	if err != nil {
-		var timeoutErr *tp.TimeoutError
-		if errors.As(err, &timeoutErr) || err == context.DeadlineExceeded || ctx.Err() != nil {
-			return nil, TerminateWorkflowOnTimeOut(c, logger, stc, workflowID, err, entityName, "BringUpRack")
-		}
-		logger.Error().Err(err).Msg("failed to get result from BringUpRack workflow")
-		return nil, cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to bring up %s", entityName), nil)
+	proxyErr := ProxyFlowGRPC(
+		ctx, c, logger, stc,
+		flowv1.Flow_BringUpRack_FullMethodName,
+		flowRequest, &flowResponse,
+		FlowWorkflowID(workflowID), temporalEnums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	)
+	if proxyErr != nil {
+		return nil, proxyErr
 	}
 
 	return &flowResponse, nil
 }
 
-// ExecuteFirmwareUpdateWorkflow builds an UpgradeFirmwareRequest, executes the UpgradeFirmware
-// workflow via Temporal, and returns the raw SubmitTaskResponse.
+// ExecuteFirmwareUpdateWorkflow builds an UpgradeFirmwareRequest, proxies it to
+// Flow's UpgradeFirmware, and returns the raw SubmitTaskResponse.
 //
 // targets, when non-empty, restricts the upgrade to the listed firmware
 // sub-parts within each targeted tray (e.g. ["bmc", "nvos"] for switch
@@ -1822,32 +2230,15 @@ func ExecuteFirmwareUpdateWorkflow(
 		OverrideReadinessCheck: overrideReadinessCheck,
 	}
 
-	workflowOptions := tclient.StartWorkflowOptions{
-		ID:                       workflowID,
-		WorkflowIDReusePolicy:    temporalEnums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-		WorkflowIDConflictPolicy: temporalEnums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-		WorkflowExecutionTimeout: cutil.WorkflowExecutionTimeout,
-		TaskQueue:                queue.SiteTaskQueue,
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, cutil.WorkflowContextTimeout)
-	defer cancel()
-
-	we, err := stc.ExecuteWorkflow(ctx, workflowOptions, "UpgradeFirmware", flowRequest)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to execute UpgradeFirmware workflow")
-		return nil, cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to upgrade firmware for %s", entityName), nil)
-	}
-
 	var flowResponse flowv1.SubmitTaskResponse
-	err = we.Get(ctx, &flowResponse)
-	if err != nil {
-		var timeoutErr *tp.TimeoutError
-		if errors.As(err, &timeoutErr) || err == context.DeadlineExceeded || ctx.Err() != nil {
-			return nil, TerminateWorkflowOnTimeOut(c, logger, stc, workflowID, err, entityName, "UpgradeFirmware")
-		}
-		logger.Error().Err(err).Msg("failed to get result from UpgradeFirmware workflow")
-		return nil, cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to upgrade firmware for %s", entityName), nil)
+	proxyErr := ProxyFlowGRPC(
+		ctx, c, logger, stc,
+		flowv1.Flow_UpgradeFirmware_FullMethodName,
+		flowRequest, &flowResponse,
+		FlowWorkflowID(workflowID), temporalEnums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	)
+	if proxyErr != nil {
+		return nil, proxyErr
 	}
 
 	return &flowResponse, nil

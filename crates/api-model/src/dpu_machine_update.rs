@@ -27,18 +27,28 @@ pub struct DpuMachineUpdate {
     pub host_machine_id: MachineId,
     pub dpu_machine_id: MachineId,
     pub firmware_version: String,
+    /// Whether the owning host is ingested through DPF. DPF decides staleness
+    /// from the DPUDeployment's expected BFB, not from
+    /// `dpu_nic_firmware_update_versions`, so `firmware_version` on a
+    /// DPF-managed update is traceability only and must not be compared
+    /// against that config list. Defaults to `false` when the value is loaded
+    /// straight from a query that does not select it.
+    #[sqlx(default)]
+    pub dpf_managed: bool,
 }
 
-/// A DPU identified via DPF whose installed BFB no longer matches the
-/// expected one. Produced by the DPF query layer and joined to host snapshots
-/// by [`DpuMachineUpdate::find_outdated_dpus_dpf`].
+/// A DPU identified via DPF whose installed BFB or BlueFieldSoftware no longer
+/// matches the expected one. Produced by the DPF query layer and joined to host
+/// snapshots by [`DpuMachineUpdate::find_outdated_dpus_dpf`].
 #[derive(Debug, Clone)]
 pub struct OutdatedDpfDpu {
     pub dpu_machine_id: MachineId,
-    /// Expected BFB filename (e.g. `dpf-operator-system-bf-bundle-<hash>.bfb`).
-    /// Used as the `firmware_version` field for traceability when this DPU is
-    /// turned into a [`DpuMachineUpdate`].
-    pub target_bfb: String,
+    /// Expected provisioning source: a BFB filename (e.g.
+    /// `dpf-operator-system-bf-bundle-<hash>.bfb`) or a BlueFieldSoftware CR
+    /// name, depending on which one the owning DPUDeployment declares. Used as
+    /// the `firmware_version` field for traceability when this DPU is turned
+    /// into a [`DpuMachineUpdate`].
+    pub target_source: String,
 }
 
 impl DpuMachineUpdate {
@@ -122,10 +132,11 @@ impl DpuMachineUpdate {
                     .filter_map(|dpu| {
                         // TODO: implement the logic to find the outdated DPUs which are ingested
                         // using DPF.
-                        if managed_host.host_snapshot.dpf.used_for_ingestion {
+                        if managed_host.host_snapshot.config.dpf.used_for_ingestion {
                             return None;
                         }
                         let firmware_version = dpu
+                            .status
                             .hardware_info
                             .as_ref()
                             .and_then(|info| info.dpu_info.as_ref())
@@ -139,6 +150,7 @@ impl DpuMachineUpdate {
                             host_machine_id: *machine_id,
                             dpu_machine_id: dpu.id,
                             firmware_version,
+                            dpf_managed: false,
                         })
                     })
                     .collect();
@@ -180,7 +192,8 @@ impl DpuMachineUpdate {
             by_host.entry(host_id).or_default().push(DpuMachineUpdate {
                 host_machine_id: host_id,
                 dpu_machine_id: outdated.dpu_machine_id,
-                firmware_version: outdated.target_bfb.clone(),
+                firmware_version: outdated.target_source.clone(),
+                dpf_managed: true,
             });
         }
 

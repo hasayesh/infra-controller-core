@@ -21,12 +21,14 @@ edition.workspace = true
 description = "Authenticated HTTP proxy for talking to BMC's without sharing credentials"
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "carbide-bmc-proxy"
 path = "src/main.rs"
 
 [dependencies]
+carbide-instrument = { path = "../instrument" }
 # [local-dependencies]
 # DO NOT PUT DEPENDENCIES OTHER THAN LOCAL DEPS HERE, THEY SHOULD ALL HAVE 'path =' IN THEM.
 carbide-authn = { path = "../authn" }
@@ -36,6 +38,8 @@ carbide-tls = { path = "../tls" }
 logfmt = { path = "../logfmt" }
 metrics-endpoint = { path = "../metrics-endpoint" }
 carbide-utils = { path = "../utils" }
+trace-propagation = { path = "../trace-propagation" }
+libc = { workspace = true }
 # DO NOT PUT DEPENDENCIES OTHER THAN LOCAL DEPS HERE, THEY SHOULD ALL HAVE 'path =' IN THEM.
 
 #these are alphabetized
@@ -71,6 +75,8 @@ reqwest = { workspace = true, default-features = false, features = [
   "rustls",
   "stream",
 ] }
+reqwest-middleware = { workspace = true }
+reqwest-tracing = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 thiserror = { workspace = true }
@@ -102,6 +108,7 @@ serde = { features = ["derive"], workspace = true }
 carbide-version = { path = "../version" }
 
 [dev-dependencies]
+carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-test-support = { path = "../test-support" }
 
 [lints]

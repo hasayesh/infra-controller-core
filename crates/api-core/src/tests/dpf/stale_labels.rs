@@ -27,26 +27,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use carbide_dpf::DpuPhase;
+use carbide_dpf::{DpuDeploymentType, DpuPhase};
 use carbide_machine_controller::dpf::{DpfOperations, MockDpfOperations};
 use carbide_uuid::machine::MachineId;
 use model::machine::{DpfState, DpuInitState, FailureCause, FailureDetails, ManagedHostState};
 use tokio::time::timeout;
 
+use super::{dpf_config, get_host_state};
 use crate::tests::common::api_fixtures::{
-    TestEnvOverrides, TestManagedHost, create_managed_host_with_dpf,
-    create_test_env_with_overrides, get_config,
+    TestEnvOverrides, create_managed_host_with_dpf, create_test_env_with_overrides, get_config,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn dpf_config() -> crate::cfg::file::DpfConfig {
-    crate::cfg::file::DpfConfig {
-        enabled: true,
-        bfb_url: "http://example.com/test.bfb".to_string(),
-        ..Default::default()
-    }
-}
 
 fn provisioning_mock_with_labels_valid(labels_valid: Arc<AtomicBool>) -> MockDpfOperations {
     let mut mock = MockDpfOperations::new();
@@ -56,8 +48,10 @@ fn provisioning_mock_with_labels_valid(labels_valid: Arc<AtomicBool>) -> MockDpf
     mock.expect_is_reboot_required().returning(|_| Ok(false));
     mock.expect_get_dpu_phase()
         .returning(|_, _| Ok(DpuPhase::Ready));
+    mock.expect_deployment_type_for_dpu()
+        .returning(|_, _| Ok(DpuDeploymentType::Bf3));
     mock.expect_verify_node_labels()
-        .returning(move |_| Ok(labels_valid.load(Ordering::SeqCst)));
+        .returning(move |_, _| Ok(labels_valid.load(Ordering::SeqCst)));
     mock
 }
 
@@ -123,15 +117,6 @@ async fn reset_host_to_waiting_for_ready(
     .execute(pool)
     .await
     .unwrap();
-}
-
-async fn get_host_state(
-    env: &crate::tests::common::api_fixtures::TestEnv,
-    mh: &TestManagedHost,
-) -> ManagedHostState {
-    let mut txn = env.db_txn().await;
-    let machine = mh.host().db_machine(&mut txn).await;
-    machine.state.value
 }
 
 /// A node with stale labels during Provisioning transitions to Failed

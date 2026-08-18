@@ -84,11 +84,11 @@ impl DhcpEntryDisplay {
 }
 
 /// DHCP allocations page
-pub async fn dhcp_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
+pub(super) async fn dhcp_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     let interfaces = match fetch_interfaces(state).await {
         Ok(n) => n,
         Err(err) => {
-            tracing::error!(%err, "find_interfaces for DHCP");
+            tracing::error!(error = %err, "find_interfaces for DHCP");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading DHCP allocations",
@@ -110,11 +110,11 @@ pub async fn dhcp_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     (StatusCode::OK, Html(tmpl.render().unwrap())).into_response()
 }
 
-pub async fn dhcp_json(AxumState(state): AxumState<Arc<Api>>) -> Response {
+pub(super) async fn dhcp_json(AxumState(state): AxumState<Arc<Api>>) -> Response {
     let interfaces = match fetch_interfaces(state).await {
         Ok(n) => n,
         Err(err) => {
-            tracing::error!(%err, "find_interfaces for DHCP JSON");
+            tracing::error!(error = %err, "find_interfaces for DHCP JSON");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading DHCP allocations",
@@ -158,7 +158,7 @@ struct DnsRecordDisplay {
 }
 
 /// DNS records page
-pub async fn dns_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
+pub(super) async fn dns_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     // Fetch domains.
     let domains = match db::dns::domain::find_by(
         &state.database_connection,
@@ -168,7 +168,7 @@ pub async fn dns_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     {
         Ok(d) => d,
         Err(err) => {
-            tracing::error!(%err, "fetch domains for DNS");
+            tracing::error!(error = %err, "fetch domains for DNS");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Error loading DNS zones").into_response();
         }
     };
@@ -180,7 +180,7 @@ pub async fn dns_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
         {
             Ok(r) => r,
             Err(err) => {
-                tracing::error!(%err, "fetch DNS records");
+                tracing::error!(error = %err, "fetch DNS records");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error loading DNS records",
@@ -255,7 +255,7 @@ struct UnderlaySegmentDisplay {
 }
 
 /// Underlay Networks top-level.
-pub async fn underlay_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
+pub(super) async fn underlay_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     let query = r#"
         SELECT ns.id as segment_id, ns.name as segment_name,
                ns.network_segment_type::text as segment_type,
@@ -280,7 +280,7 @@ pub async fn underlay_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     {
         Ok(rows) => rows.into_iter().map(Into::into).collect(),
         Err(err) => {
-            tracing::error!(%err, "fetch underlay segments");
+            tracing::error!(error = %err, "fetch underlay segments");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading underlay segments",
@@ -349,7 +349,7 @@ struct UnderlayAddressDisplay {
 
 /// Underlay segment detail, which includes machine IPs
 /// allocated in a segment.
-pub async fn underlay_segment_html(
+pub(super) async fn underlay_segment_html(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(segment_id): AxumPath<String>,
 ) -> Response {
@@ -373,7 +373,7 @@ pub async fn underlay_segment_html(
         Ok(mut s) if s.len() == 1 => s.remove(0),
         Ok(_) => return super::not_found_response(segment_id),
         Err(err) => {
-            tracing::error!(%err, "find_network_segments_by_ids for underlay");
+            tracing::error!(error = %err, "find_network_segments_by_ids for underlay");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Error loading segment").into_response();
         }
     };
@@ -415,7 +415,7 @@ pub async fn underlay_segment_html(
         {
             Ok(rows) => rows.into_iter().map(Into::into).collect(),
             Err(err) => {
-                tracing::error!(%err, "fetch underlay segment addresses");
+                tracing::error!(error = %err, "fetch underlay segment addresses");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error loading segment addresses",
@@ -475,12 +475,12 @@ struct OverlayVpcPrefixDisplay {
 }
 
 /// Overlay Networks -- lists VNIs and their prefixes.
-pub async fn overlay_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
+pub(super) async fn overlay_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     // Fetch all VPCs.
     let rpc_vpcs = match fetch_vpcs(state.clone()).await {
         Ok(v) => v,
         Err(err) => {
-            tracing::error!(%err, "fetch_vpcs for overlay");
+            tracing::error!(error = %err, "fetch_vpcs for overlay");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Error loading VPCs").into_response();
         }
     };
@@ -497,7 +497,7 @@ pub async fn overlay_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
     {
         Ok(ids) => ids,
         Err(err) => {
-            tracing::error!(%err, "search_vpc_prefixes for overlay");
+            tracing::error!(error = %err, "search_vpc_prefixes for overlay");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading VPC prefixes",
@@ -519,7 +519,7 @@ pub async fn overlay_html(AxumState(state): AxumState<Arc<Api>>) -> Response {
         {
             Ok(p) => p,
             Err(err) => {
-                tracing::error!(%err, "get_vpc_prefixes for overlay");
+                tracing::error!(error = %err, "get_vpc_prefixes for overlay");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error loading VPC prefixes",
@@ -679,7 +679,7 @@ struct OverlaySegmentDisplay {
 
 /// Overlay prefix detail, which includes segments carved
 /// from a VPC prefix.
-pub async fn overlay_prefix_html(
+pub(super) async fn overlay_prefix_html(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(vpc_prefix_id): AxumPath<String>,
 ) -> Response {
@@ -706,7 +706,7 @@ pub async fn overlay_prefix_html(
         Ok(mut p) if p.len() == 1 => p.remove(0),
         Ok(_) => return super::not_found_response(vpc_prefix_id),
         Err(err) => {
-            tracing::error!(%err, "get_vpc_prefixes");
+            tracing::error!(error = %err, "get_vpc_prefixes");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading VPC prefix",
@@ -750,7 +750,7 @@ pub async fn overlay_prefix_html(
             None,
         ),
         Err(err) => {
-            tracing::error!(%err, "find_vpc_prefix_state_histories");
+            tracing::error!(error = %err, "find_vpc_prefix_state_histories");
             (Vec::new(), Some(err.to_string()))
         }
     };
@@ -813,7 +813,7 @@ pub async fn overlay_prefix_html(
     {
         Ok(rows) => rows.into_iter().map(Into::into).collect(),
         Err(err) => {
-            tracing::error!(%err, "fetch segments for VPC prefix");
+            tracing::error!(error = %err, "fetch segments for VPC prefix");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Error loading segments").into_response();
         }
     };
@@ -882,7 +882,7 @@ struct OverlayAddressDisplay {
 }
 
 /// Overlay segment detail (IPs allocated in a segment).
-pub async fn overlay_segment_html(
+pub(super) async fn overlay_segment_html(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(segment_id): AxumPath<String>,
 ) -> Response {
@@ -906,7 +906,7 @@ pub async fn overlay_segment_html(
         Ok(mut s) if s.len() == 1 => s.remove(0),
         Ok(_) => return super::not_found_response(segment_id),
         Err(err) => {
-            tracing::error!(%err, "find_network_segments_by_ids");
+            tracing::error!(error = %err, "find_network_segments_by_ids");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Error loading segment").into_response();
         }
     };
@@ -950,7 +950,7 @@ pub async fn overlay_segment_html(
         {
             Ok(addrs) => addrs,
             Err(err) => {
-                tracing::error!(%err, "find_by_segment_id");
+                tracing::error!(error = %err, "find_by_segment_id");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error loading segment addresses",

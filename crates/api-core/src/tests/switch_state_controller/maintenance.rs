@@ -45,6 +45,7 @@ fn cm_power_action(operation: SwitchMaintenanceOperation) -> SystemPowerControl 
         SwitchMaintenanceOperation::PowerOn => SystemPowerControl::On,
         SwitchMaintenanceOperation::PowerOff => SystemPowerControl::ForceOff,
         SwitchMaintenanceOperation::Reset => SystemPowerControl::ForceRestart,
+        SwitchMaintenanceOperation::ReconfigureCertificate => SystemPowerControl::On,
     }
 }
 
@@ -123,7 +124,13 @@ fn services_without_component_manager(env: &TestEnv) -> SwitchStateHandlerServic
         db_pool: env.pool.clone(),
         component_manager: None,
         credential_manager: env.test_credential_manager.clone(),
+        switch_mtls_services: super::default_switch_mtls_services(),
         per_object_metrics_registry: env.per_object_metrics_registry(),
+        redfish_client_pool: env.redfish_sim.clone(),
+        bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
+            db::credential_rotation::CredentialRotationType::Bmc,
+        ),
+        bmc_rotation_enabled: false,
     }
 }
 
@@ -133,7 +140,13 @@ async fn services_with_component_manager(env: &TestEnv) -> SwitchStateHandlerSer
         component_manager: super::build_test_component_manager(env, env.rms_sim.as_rms_client())
             .await,
         credential_manager: env.test_credential_manager.clone(),
+        switch_mtls_services: super::default_switch_mtls_services(),
         per_object_metrics_registry: env.per_object_metrics_registry(),
+        redfish_client_pool: env.redfish_sim.clone(),
+        bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
+            db::credential_rotation::CredentialRotationType::Bmc,
+        ),
+        bmc_rotation_enabled: false,
     }
 }
 
@@ -164,6 +177,7 @@ async fn ready_transitions_to_maintenance_when_request_is_set(
         StateHandlerOutcome::Transition {
             next_state: SwitchControllerState::Maintenance {
                 operation: SwitchMaintenanceOperation::PowerOff,
+                configure_certificate: None,
             },
             ..
         }

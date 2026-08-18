@@ -194,8 +194,11 @@ async fn resolve_http(
         tracing::debug!(credential_type = %credential_type_name(creds), "Using HTTP credentials");
     }
 
-    // Build the HTTP request with optional credentials.
-    let client = reqwest::Client::new();
+    // Build the HTTP request with optional credentials. The `reqwest-tracing` middleware injects
+    // the current span's W3C trace context into the outgoing request (#2438).
+    let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        .with(reqwest_tracing::TracingMiddleware::default())
+        .build();
     let mut request = client.get(url);
 
     if let Some(creds) = credentials {
@@ -236,8 +239,8 @@ async fn resolve_http(
     file.flush().await.map_err(FirmwareError::Io)?;
 
     tracing::info!(
-        dest = %dest_path.display(),
-        bytes = bytes.len(),
+        destination_path = %dest_path.display(),
+        file_size_bytes = bytes.len(),
         "HTTP download complete"
     );
 
@@ -334,8 +337,8 @@ async fn resolve_ssh(
         .map_err(FirmwareError::Io)?;
 
     tracing::info!(
-        dest = %dest_path.display(),
-        bytes = decoded.len(),
+        destination_path = %dest_path.display(),
+        file_size_bytes = decoded.len(),
         "SSH download complete"
     );
 
@@ -350,7 +353,7 @@ fn credential_type_name(cred: &Credentials) -> &'static str {
         Credentials::BasicAuth { .. } => "basic_auth",
         Credentials::Header { .. } => "header",
         Credentials::SshKey { .. } => "ssh_key",
-        Credentials::SshAgent => "ssh_agent",
+        Credentials::SshAgent {} => "ssh_agent",
     }
 }
 
@@ -484,7 +487,7 @@ mod tests {
 #[cfg(test)]
 mod coverage_tests {
     use carbide_test_support::Outcome::*;
-    use carbide_test_support::{Case, Check, scenarios, value_scenarios};
+    use carbide_test_support::{Case, Check, check_cases_async, scenarios, value_scenarios};
 
     use super::*;
 
@@ -558,6 +561,43 @@ mod coverage_tests {
             expect: Yields(()),
         }
         .check(|url| FirmwareSource::from_url(url).map(|_| ()).map_err(drop));
+    }
+
+    #[tokio::test]
+    async fn local_source_resolution_cases() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let work_dir = temp_dir.path().to_path_buf();
+        let present_path = work_dir.join("firmware.bin");
+        let missing_path = work_dir.join("missing.bin");
+        tokio::fs::write(&present_path, b"firmware").await.unwrap();
+
+        check_cases_async(
+            [
+                Case {
+                    scenario: "an existing local source resolves to itself",
+                    input: FirmwareSource::local(present_path.clone()),
+                    expect: Yields(present_path),
+                },
+                Case {
+                    scenario: "a missing local source reports its exact path",
+                    input: FirmwareSource::local(missing_path.clone()),
+                    expect: FailsWith(missing_path),
+                },
+            ],
+            |source| {
+                let work_dir = work_dir.clone();
+                async move {
+                    source
+                        .resolve(&work_dir)
+                        .await
+                        .map_err(|error| match error {
+                            FirmwareError::FileNotFound(path) => path,
+                            error => panic!("unexpected local source error: {error:?}"),
+                        })
+                }
+            },
+        )
+        .await;
     }
 
     // parse_ssh_url splits an SCP-style ssh:// URL into (host, username,

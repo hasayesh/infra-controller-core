@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::nvlink::NvLinkDomainId;
 use carbide_uuid::rack::RackId;
 use mac_address::MacAddress;
@@ -25,12 +27,33 @@ use nv_redfish::bmc_http::reqwest::Client as ReqwestClient;
 use url::Url;
 
 use crate::HealthError;
-use crate::bmc::{BmcClient, FixedCredentialProvider};
+use crate::bmc::{
+    BmcClient, BmcLatencyInstrumentation, FixedCredentialProvider, bmc_latency_endpoint_labels,
+};
 use crate::config::{StaticBmcEndpoint, StaticSwitchEndpointRole};
 use crate::endpoint::{
     BmcAddr, BmcCredentials, BmcEndpoint, BoxFuture, EndpointMetadata, EndpointSource, MachineData,
-    PowerShelfData, SwitchData, SwitchEndpointRole,
+    PowerShelfData, SharedSystemUuid, SwitchData, SwitchEndpointRole,
 };
+use crate::metrics::BmcLatencyMetrics;
+
+fn parse_static_nvlink_domain_uuid(
+    value: Option<&str>,
+    endpoint_kind: &str,
+) -> Option<NvLinkDomainId> {
+    value.and_then(|value| match NvLinkDomainId::from_str(value) {
+        Ok(domain_uuid) => Some(domain_uuid),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                nvlink_domain_uuid = ?value,
+                "Invalid {endpoint_kind}.nvlink_domain_uuid in static endpoint config"
+            );
+
+            None
+        }
+    })
+}
 
 pub struct StaticEndpointSource {
     endpoints: Vec<Arc<BmcEndpoint>>,
@@ -48,6 +71,25 @@ impl StaticEndpointSource {
         reqwest: &ReqwestClient,
         proxy_url: Option<&Url>,
         cache_size: usize,
+        bmc_latency_metrics: Option<Arc<BmcLatencyMetrics>>,
+    ) -> Self {
+        Self::from_config_with_request_concurrency(
+            configs,
+            reqwest,
+            proxy_url,
+            cache_size,
+            NonZeroUsize::MIN,
+            bmc_latency_metrics,
+        )
+    }
+
+    pub(crate) fn from_config_with_request_concurrency(
+        configs: &[StaticBmcEndpoint],
+        reqwest: &ReqwestClient,
+        proxy_url: Option<&Url>,
+        cache_size: usize,
+        bmc_request_concurrency: NonZeroUsize,
+        bmc_latency_metrics: Option<Arc<BmcLatencyMetrics>>,
     ) -> Self {
         let mut endpoints = Vec::with_capacity(configs.len());
 
@@ -55,7 +97,11 @@ impl StaticEndpointSource {
             let mac = match MacAddress::from_str(&cfg.mac) {
                 Ok(mac) => mac,
                 Err(error) => {
-                    tracing::warn!(?error, mac = ?cfg.mac, "Invalid MAC in static endpoint config");
+                    tracing::warn!(
+                        ?error,
+                        bmc_mac_address = ?cfg.mac,
+                        "Invalid MAC in static endpoint config"
+                    );
                     continue;
                 }
             };
@@ -96,10 +142,17 @@ impl StaticEndpointSource {
                     .clone()
                     .or_else(|| switch.id.clone())
                     .unwrap_or_else(|| cfg.mac.clone());
+
+                let nvlink_domain_uuid =
+                    parse_static_nvlink_domain_uuid(switch.nvlink_domain_uuid.as_deref(), "switch")
+                        .filter(|domain_uuid| domain_uuid != &NvLinkDomainId::nil());
+
                 let endpoint_role = match switch.endpoint_role {
                     StaticSwitchEndpointRole::Bmc => SwitchEndpointRole::Bmc,
                     StaticSwitchEndpointRole::Host => SwitchEndpointRole::Host,
                 };
+
+                let nmxc_enabled = switch.nmxc_enabled.unwrap_or(switch.is_primary);
                 let nmxt_enabled = switch.nmxt_enabled.unwrap_or(switch.is_primary);
 
                 Some(EndpointMetadata::Switch(SwitchData {
@@ -107,44 +160,42 @@ impl StaticEndpointSource {
                     serial,
                     slot_number: switch.slot_number,
                     tray_index: switch.tray_index,
+                    nvlink_domain_uuid,
                     endpoint_role,
                     is_primary: switch.is_primary,
+                    nmxc_enabled,
                     nmxt_enabled,
                 }))
             } else if let Some(machine) = &cfg.machine {
-                let machine_id = &machine.id;
-                let nvlink_domain_uuid =
-                    machine.nvlink_domain_uuid.as_ref().and_then(
-                        |id| match NvLinkDomainId::from_str(id) {
-                            Ok(id) => Some(id),
-                            Err(error) => {
-                                tracing::warn!(
-                                    ?error,
-                                    nvlink_domain_uuid = ?id,
-                                    "Invalid machine.nvlink_domain_uuid in static endpoint config"
-                                );
-                                None
-                            }
-                        },
-                    );
-
-                match machine_id.parse() {
-                    Ok(machine_id) => Some(EndpointMetadata::Machine(MachineData {
-                        machine_id,
-                        machine_serial: machine.serial.clone(),
-                        slot_number: machine.slot_number,
-                        tray_index: machine.tray_index,
-                        nvlink_domain_uuid,
-                    })),
+                let machine_id = machine.id.as_deref().and_then(|id| match id.parse() {
+                    Ok(machine_id) => Some(machine_id),
                     Err(error) => {
-                        tracing::warn!(
-                            ?error,
-                            ?machine_id,
-                            "Invalid machine.id in static endpoint config"
-                        );
+                        tracing::warn!(?error, ?id, "Invalid machine.id in static endpoint config");
                         None
                     }
-                }
+                });
+
+                let nvlink_domain_uuid = parse_static_nvlink_domain_uuid(
+                    machine.nvlink_domain_uuid.as_deref(),
+                    "machine",
+                );
+
+                let driver_version = machine
+                    .driver_version
+                    .as_deref()
+                    .map(str::trim)
+                    .none_if_empty()
+                    .map(str::to_string);
+
+                Some(EndpointMetadata::Machine(MachineData {
+                    machine_id,
+                    machine_serial: machine.serial.clone(),
+                    system_uuid: SharedSystemUuid::default(),
+                    slot_number: machine.slot_number,
+                    tray_index: machine.tray_index,
+                    nvlink_domain_uuid,
+                    driver_version,
+                }))
             } else {
                 None
             };
@@ -159,18 +210,27 @@ impl StaticEndpointSource {
                 password: cfg.password.clone(),
             };
             let provider = Arc::new(FixedCredentialProvider::new(credentials));
+            let rack_id = cfg.rack_id.as_ref().map(|id| RackId::new(id.as_str()));
+            let bmc_latency_instrumentation = bmc_latency_metrics.clone().map(|metrics| {
+                BmcLatencyInstrumentation::new(
+                    metrics,
+                    bmc_latency_endpoint_labels(metadata.as_ref(), rack_id.as_ref()),
+                )
+            });
             let bmc = match BmcClient::new(
                 reqwest.clone(),
                 addr.clone(),
                 provider,
                 proxy_url.cloned(),
                 cache_size,
+                bmc_request_concurrency,
+                bmc_latency_instrumentation,
             ) {
                 Ok(client) => Arc::new(client),
                 Err(error) => {
                     tracing::warn!(
                         ?error,
-                        ?addr,
+                        bmc_address = ?addr,
                         "Failed to construct BmcClient for static endpoint"
                     );
                     continue;
@@ -179,7 +239,8 @@ impl StaticEndpointSource {
             let endpoint = BmcEndpoint {
                 addr,
                 metadata,
-                rack_id: cfg.rack_id.as_ref().map(|id| RackId::new(id.as_str())),
+                rack_id,
+                labels: cfg.labels.clone(),
                 bmc,
             };
             endpoints.push(Arc::new(endpoint));
@@ -276,6 +337,7 @@ mod tests {
                 power_shelf: None,
                 switch: None,
                 rack_id: None,
+                labels: Default::default(),
             },
             StaticBmcEndpoint {
                 ip: ip("10.0.0.2"),
@@ -287,10 +349,11 @@ mod tests {
                 power_shelf: None,
                 switch: None,
                 rack_id: None,
+                labels: Default::default(),
             },
         ];
 
-        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10);
+        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10, None);
         let endpoints = source.fetch_bmc_hosts().await.expect("fetch should work");
 
         assert_eq!(endpoints.len(), 1);
@@ -303,6 +366,8 @@ mod tests {
     #[tokio::test]
     async fn test_static_endpoint_with_switch_serial_sets_metadata() {
         let switch_id = test_switch_id("switch-a");
+        let nvlink_domain_uuid = NvLinkDomainId::new();
+
         let configs = vec![StaticBmcEndpoint {
             ip: ip("10.0.1.1"),
             port: Some(443),
@@ -316,14 +381,17 @@ mod tests {
                 serial: Some("SN-001".to_string()),
                 slot_number: Some(7),
                 tray_index: Some(3),
+                nvlink_domain_uuid: Some(nvlink_domain_uuid.to_string()),
                 endpoint_role: StaticSwitchEndpointRole::Host,
                 is_primary: true,
+                nmxc_enabled: None,
                 nmxt_enabled: None,
             }),
             rack_id: None,
+            labels: Default::default(),
         }];
 
-        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10);
+        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10, None);
         let endpoints = source.fetch_bmc_hosts().await.unwrap();
 
         assert_eq!(endpoints.len(), 1);
@@ -333,12 +401,62 @@ mod tests {
                 assert_eq!(s.serial, "SN-001");
                 assert_eq!(s.slot_number, Some(7));
                 assert_eq!(s.tray_index, Some(3));
+                assert_eq!(s.nvlink_domain_uuid, Some(nvlink_domain_uuid));
                 assert_eq!(s.endpoint_role, SwitchEndpointRole::Host);
                 assert!(s.is_primary);
+                assert!(s.nmxc_enabled);
                 assert!(s.nmxt_enabled);
             }
             other => panic!("expected Switch metadata, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_static_switch_endpoint_omits_invalid_or_nil_domain_uuid() {
+        let nil_domain_uuid = NvLinkDomainId::nil().to_string();
+
+        let cases = [
+            ("10.0.1.2", "11:22:33:44:55:67", "not-a-uuid"),
+            ("10.0.1.3", "11:22:33:44:55:68", nil_domain_uuid.as_str()),
+        ];
+
+        let configs = cases
+            .iter()
+            .copied()
+            .map(|(ip_address, mac_address, domain_uuid)| StaticBmcEndpoint {
+                ip: ip(ip_address),
+                port: Some(443),
+                mac: mac_address.to_string(),
+                username: "cumulus".to_string(),
+                password: Some("pass".to_string()),
+                machine: None,
+                power_shelf: None,
+                switch: Some(StaticSwitchEndpoint {
+                    id: None,
+                    serial: Some(mac_address.to_string()),
+                    slot_number: None,
+                    tray_index: None,
+                    nvlink_domain_uuid: Some(domain_uuid.to_string()),
+                    endpoint_role: StaticSwitchEndpointRole::Host,
+                    is_primary: false,
+                    nmxc_enabled: None,
+                    nmxt_enabled: None,
+                }),
+                rack_id: None,
+                labels: Default::default(),
+            })
+            .collect::<Vec<_>>();
+
+        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10, None);
+        let endpoints = source.fetch_bmc_hosts().await.unwrap();
+
+        assert_eq!(endpoints.len(), cases.len());
+
+        assert!(endpoints.iter().all(|endpoint| {
+            endpoint
+                .switch_data()
+                .is_some_and(|switch| switch.nvlink_domain_uuid.is_none())
+        }));
     }
 
     #[tokio::test]
@@ -357,9 +475,10 @@ mod tests {
             }),
             switch: None,
             rack_id: None,
+            labels: Default::default(),
         }];
 
-        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10);
+        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10, None);
         let endpoints = source.fetch_bmc_hosts().await.unwrap();
 
         assert_eq!(endpoints.len(), 1);
@@ -387,18 +506,20 @@ mod tests {
             username: "admin".to_string(),
             password: Some("pass".to_string()),
             machine: Some(StaticMachineEndpoint {
-                id: "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0".to_string(),
+                id: Some("fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0".to_string()),
                 serial: Some("MN-001".to_string()),
                 slot_number: Some(15),
                 tray_index: Some(5),
                 nvlink_domain_uuid: Some("00000000-0000-0000-0000-000000000000".to_string()),
+                driver_version: Some(" 570.82 ".to_string()),
             }),
             power_shelf: None,
             switch: None,
             rack_id: Some("RACK_1".to_string()),
+            labels: std::collections::BTreeMap::from([("site".to_string(), "dev".to_string())]),
         }];
 
-        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10);
+        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10, None);
         let endpoints = source.fetch_bmc_hosts().await.unwrap();
 
         assert_eq!(endpoints.len(), 1);
@@ -409,13 +530,52 @@ mod tests {
                 .map(|rack_id| rack_id.as_str()),
             Some("RACK_1")
         );
+        assert_eq!(
+            endpoints[0].labels.get("site").map(String::as_str),
+            Some("dev")
+        );
         match &endpoints[0].metadata {
             Some(EndpointMetadata::Machine(machine)) => {
-                assert_eq!(machine.machine_id, machine_id);
+                assert_eq!(machine.machine_id, Some(machine_id));
                 assert_eq!(machine.machine_serial.as_deref(), Some("MN-001"));
                 assert_eq!(machine.slot_number, Some(15));
                 assert_eq!(machine.tray_index, Some(5));
                 assert_eq!(machine.nvlink_domain_uuid, Some(domain_uuid));
+                assert_eq!(machine.driver_version.as_deref(), Some("570.82"));
+            }
+            other => panic!("expected Machine metadata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_static_machine_endpoint_omits_empty_driver_version() {
+        let configs = vec![StaticBmcEndpoint {
+            ip: ip("10.0.1.3"),
+            port: Some(443),
+            mac: "11:22:33:44:55:12".to_string(),
+            username: "admin".to_string(),
+            password: Some("pass".to_string()),
+            machine: Some(StaticMachineEndpoint {
+                id: Some("fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0".to_string()),
+                serial: None,
+                slot_number: None,
+                tray_index: None,
+                nvlink_domain_uuid: None,
+                driver_version: Some("  ".to_string()),
+            }),
+            power_shelf: None,
+            switch: None,
+            rack_id: None,
+            labels: Default::default(),
+        }];
+
+        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10, None);
+        let endpoints = source.fetch_bmc_hosts().await.unwrap();
+
+        assert_eq!(endpoints.len(), 1);
+        match &endpoints[0].metadata {
+            Some(EndpointMetadata::Machine(machine)) => {
+                assert_eq!(machine.driver_version, None);
             }
             other => panic!("expected Machine metadata, got {other:?}"),
         }
@@ -433,9 +593,10 @@ mod tests {
             power_shelf: None,
             switch: None,
             rack_id: None,
+            labels: Default::default(),
         }];
 
-        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10);
+        let source = StaticEndpointSource::from_config(&configs, &reqwest(), None, 10, None);
         let endpoints = source.fetch_bmc_hosts().await.unwrap();
 
         assert_eq!(endpoints.len(), 1);

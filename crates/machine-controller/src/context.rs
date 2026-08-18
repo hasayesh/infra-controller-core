@@ -17,9 +17,12 @@
 
 use std::sync::Arc;
 
+use carbide_credential_rotation::RotationGate;
 use carbide_health_metrics::PerObjectMetricsRegistry;
 use carbide_ipmi::IPMITool;
 use carbide_redfish::libredfish::RedfishClientPool;
+use carbide_secrets::credentials::CredentialManager;
+use component_manager::component_manager::ComponentManager;
 use db::db_read::PgPoolReader;
 use libredfish::Redfish;
 use model::machine::Machine;
@@ -28,6 +31,7 @@ use state_controller::state_handler::{StateHandlerContextObjects, StateHandlerEr
 
 use crate::config::MachineStateHandlerSiteConfig;
 use crate::metrics::MachineMetrics;
+use crate::per_object::MachinePerObjectInfo;
 
 pub struct MachineStateHandlerContextObjects {}
 
@@ -48,8 +52,27 @@ pub struct MachineStateHandlerServices {
     pub ipmi_tool: Arc<dyn IPMITool>,
     /// Configuration used by MachineStateHandler.
     pub site_config: Arc<MachineStateHandlerSiteConfig>,
+    /// Optional Component Manager backend for rack-scale maintenance operations.
+    pub component_manager: Option<Arc<ComponentManager>>,
+    pub credential_manager: Arc<dyn CredentialManager>,
+    /// Short-TTL cache of the site-wide BMC rotation aggregate, shared across
+    /// this replica's per-object ticks so the steady state costs one aggregate
+    /// query per TTL window rather than a per-device query every sweep.
+    pub bmc_rotation_gate: RotationGate,
+    /// Short-TTL cache of the site-wide host-UEFI rotation aggregate, shared
+    /// across this replica's per-object ticks. Family-scoped and separate from
+    /// `bmc_rotation_gate` so a UEFI sweep never consults BMC counts.
+    pub host_uefi_rotation_gate: RotationGate,
+    /// Short-TTL cache of the site-wide DPU-UEFI rotation aggregate, shared
+    /// across this replica's per-object ticks. A `RotationGate` is single-family,
+    /// so DPU UEFI gets its own gate separate from `host_uefi_rotation_gate`: a
+    /// DPU sweep queries only `dpu_uefi` counts, keyed by each DPU's BMC MAC.
+    pub dpu_uefi_rotation_gate: RotationGate,
     /// Shared registry backing the generic per-object health metrics.
     pub per_object_metrics_registry: Arc<PerObjectMetricsRegistry>,
+    /// Trait/association info gauges for the per-object metrics endpoint,
+    /// present when per-object state metrics are enabled for machines.
+    pub per_object_info: Option<MachinePerObjectInfo>,
 }
 
 impl MachineStateHandlerServices {

@@ -59,7 +59,10 @@ async fn test_dns(pool: sqlx::PgPool) {
     let fqdn2 = interface2.fqdn;
     let ip2 = interface2.address;
 
-    tracing::info!("FQDN1: {}", fqdn1);
+    tracing::info!(
+        fqdn1 = %fqdn1,
+        "FQDN1",
+    );
     let dns_record = api
         .lookup_record(tonic::Request::new(
             rpc::protos::dns::DnsResourceRecordLookupRequest {
@@ -74,8 +77,14 @@ async fn test_dns(pool: sqlx::PgPool) {
         .await
         .unwrap()
         .into_inner();
-    tracing::info!("DNS Record: {:?}", dns_record);
-    tracing::info!("IP: {}", ip1);
+    tracing::info!(
+        dns_record = ?dns_record,
+        "DNS Record",
+    );
+    tracing::info!(
+        ip1 = %ip1,
+        "IP",
+    );
     assert_eq!(
         ip1.split('/').collect::<Vec<&str>>()[0],
         &*dns_record.records[0].content
@@ -227,7 +236,10 @@ async fn test_dns(pool: sqlx::PgPool) {
             .unwrap()
             .into_inner();
 
-        tracing::info!("Status: {:?}", status);
+        tracing::info!(
+            dns_lookup_response = ?status,
+            "Status",
+        );
         assert_eq!(status.records.len(), 0);
     }
 }
@@ -486,7 +498,7 @@ fn ip_to_arpa(addr: IpAddr) -> String {
 // TODO(chet): Find a common place for this and the same exact
 // function in api-test/tests/integration/main.rs to exist, instead
 // of it being in two places.
-pub async fn get_dns_record_count(pool: &sqlx::Pool<Postgres>) -> i64 {
+pub(in crate::tests) async fn get_dns_record_count(pool: &sqlx::Pool<Postgres>) -> i64 {
     let mut txn = pool.begin().await.unwrap();
     let query = "SELECT COUNT(*) as row_cnt FROM dns_records";
     let rows = sqlx::query::<_>(query).fetch_one(&mut *txn).await.unwrap();

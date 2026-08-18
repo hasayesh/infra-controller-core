@@ -76,6 +76,12 @@ pub enum DpaInterfaceControllerState {
     Assigned,
 }
 
+#[derive(Default)]
+pub struct DpaSearchConfig {
+    pub only_svpc: bool,
+    pub only_astra: bool,
+}
+
 impl Display for DpaInterfaceControllerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
@@ -294,8 +300,8 @@ impl DpaInterface {
         // If we haven't yet seen any observations, we are not synced
         let Some(spx_status_observation) = spx_status_observation else {
             tracing::info!(
-                "DPA interface {dpa_id} is not synced because no SPX status observation is available",
-                dpa_id = self.id
+                dpa_interface_id = %self.id,
+                "DPA interface is not synced because no SPX status observation is available",
             );
             return false;
         };
@@ -324,10 +330,10 @@ impl DpaInterface {
             {
                 if config_version != dpa_expected_version {
                     tracing::info!(
-                        "DPA interface {dpa_id} is not synced version mismatch: {config_version} != {dpa_expected_version}",
-                        dpa_id = self.id,
-                        config_version = config_version,
-                        dpa_expected_version = dpa_expected_version
+                        dpa_interface_id = %self.id,
+                        config_version = %config_version,
+                        dpa_expected_version = %dpa_expected_version,
+                        "DPA interface is not synced version mismatch!",
                     );
                     return false;
                 }
@@ -336,9 +342,9 @@ impl DpaInterface {
         }
 
         tracing::info!(
-            "DPA interface {dpa_id} is not synced verrsion mismatch: {dpa_expected_version}",
-            dpa_id = self.id,
-            dpa_expected_version = dpa_expected_version
+            dpa_interface_id = %self.id,
+            dpa_expected_version = %dpa_expected_version,
+            "DPA interface is not synced because no matching SPX status attachment was found",
         );
 
         false
@@ -351,10 +357,10 @@ impl DpaInterface {
 
 impl<'r> FromRow<'r, PgRow> for DpaInterface {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        let json: serde_json::value::Value = row.try_get(0)?;
-        DpaInterfaceSnapshotPgJson::deserialize(json)
-            .map_err(|err| sqlx::Error::Decode(err.into()))?
-            .try_into()
+        // Json<T> deserializes the row bytes straight into the snapshot
+        // struct, skipping the intermediate serde_json::Value DOM.
+        let json: sqlx::types::Json<DpaInterfaceSnapshotPgJson> = row.try_get(0)?;
+        json.0.try_into()
     }
 }
 

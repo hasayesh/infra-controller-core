@@ -89,7 +89,23 @@ async fn test_lookup_by_mac(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error
     let mut txn = pool.begin().await.unwrap();
     let switches = create_expected_switches(&mut txn).await;
 
-    assert_eq!(switches[0].serial_number, "SW-SN-001");
+    // This used to assert `switches[0].serial_number == "SW-SN-001"` -- the string the
+    // fixture had just built with `format!` -- so the finder this test is named for never
+    // ran at all.
+    let found = db::expected_switch::find_by_bmc_mac_address(&mut txn, switches[0].bmc_mac_address)
+        .await?
+        .expect("the switch we just created should be findable by its BMC MAC");
+    assert_eq!(found.bmc_mac_address, switches[0].bmc_mac_address);
+    assert_eq!(found.serial_number, switches[0].serial_number);
+
+    // 0xff is past the six switches the fixture creates.
+    let unknown_mac = mac_address::MacAddress::new([0x44, 0x44, 0x11, 0x11, 0x00, 0xff]);
+    assert!(
+        db::expected_switch::find_by_bmc_mac_address(&mut txn, unknown_mac)
+            .await?
+            .is_none()
+    );
+
     Ok(())
 }
 
@@ -122,6 +138,112 @@ async fn test_duplicate_fail_create(pool: sqlx::PgPool) -> Result<(), Box<dyn st
         new_switch,
         Err(DatabaseError::ExpectedHostDuplicateMacAddress(_))
     ));
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_create_rejects_nvos_mac_claimed_by_another_switch(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await.unwrap();
+    let switches = create_expected_switches(&mut txn).await;
+
+    let result = db::expected_switch::create(
+        &mut txn,
+        ExpectedSwitch {
+            expected_switch_id: None,
+            bmc_mac_address: expected_switch_bmc_mac_address(200),
+            nvos_mac_addresses: switches[0].nvos_mac_addresses.clone(),
+            bmc_username: "ADMIN".into(),
+            bmc_password: "hmm".into(),
+            serial_number: "NVOS-DUP".into(),
+            bmc_ip_address: None,
+            metadata: Metadata::default(),
+            rack_id: None,
+            bmc_retain_credentials: None,
+            nvos_ip_address: None,
+            nvos_username: None,
+            nvos_password: None,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(DatabaseError::ExpectedSwitchDuplicateNvosMacAddress(_))
+    ));
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_update_nvos_mac_conflicts_exclude_own_switch(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await.unwrap();
+    let switches = create_expected_switches(&mut txn).await;
+
+    // Re-asserting a switch's own NVOS MACs is not a conflict.
+    let mut own = switches[0].clone();
+    own.bmc_username = "NEWADMIN".into();
+    db::expected_switch::update(&mut txn, &own).await?;
+
+    // Claiming another switch's NVOS MAC is.
+    own.nvos_mac_addresses = switches[1].nvos_mac_addresses.clone();
+    let result = db::expected_switch::update(&mut txn, &own).await;
+
+    assert!(matches!(
+        result,
+        Err(DatabaseError::ExpectedSwitchDuplicateNvosMacAddress(_))
+    ));
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_update_missing_switch_reports_not_found(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await.unwrap();
+    let switches = create_expected_switches(&mut txn).await;
+
+    // A target that doesn't exist reports NotFound even when the payload's
+    // NVOS MACs are claimed by some existing switch.
+    let mut ghost = switches[0].clone();
+    ghost.expected_switch_id = None;
+    ghost.bmc_mac_address = expected_switch_bmc_mac_address(201);
+    let result = db::expected_switch::update(&mut txn, &ghost).await;
+
+    assert!(matches!(result, Err(DatabaseError::NotFoundError { .. })));
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_update_tolerates_preexisting_nvos_mac_overlap(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await.unwrap();
+    let switches = create_expected_switches(&mut txn).await;
+
+    // site-explorer's hardware-truth path can record an overlap that predates
+    // the conflict guard: switch 0 ends up holding switch 1's MAC too.
+    let mut overlapped = switches[0].nvos_mac_addresses.clone();
+    overlapped.extend(switches[1].nvos_mac_addresses.iter().copied());
+    db::expected_switch::update_nvos_mac_addresses(
+        &mut txn,
+        switches[0].bmc_mac_address,
+        &overlapped,
+    )
+    .await?;
+
+    // Re-sending the list the row already holds must stay updatable -- only
+    // newly claimed MACs are checked.
+    let mut own = switches[0].clone();
+    own.nvos_mac_addresses = overlapped;
+    own.bmc_username = "NEWADMIN".into();
+    db::expected_switch::update(&mut txn, &own).await?;
 
     Ok(())
 }

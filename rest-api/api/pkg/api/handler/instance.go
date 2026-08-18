@@ -35,8 +35,8 @@ import (
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	swe "github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/error"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 )
 
@@ -61,15 +61,112 @@ type CreateInstanceHandler struct {
 // per-interface configs built earlier in the handler. When auto is
 // true the explicit interface list is intentionally omitted: NICo
 // resolves interfaces from the host's HostInband segments, so
-// sending an explicit list alongside auto=true is contradictory
-// (rejected by Core, and on update could otherwise carry forward
-// the instance's previously-persisted interfaces).
-func buildInstanceNetworkConfig(auto bool, interfaceConfigs []*cwssaws.InstanceInterfaceConfig) *cwssaws.InstanceNetworkConfig {
-	nc := &cwssaws.InstanceNetworkConfig{Auto: auto}
-	if !auto {
+// sending an explicit list alongside auto=true or auto_config=...
+// is contradictory (rejected by Core, and on update could otherwise
+// carry forward the instance's previously-persisted interfaces).
+func buildInstanceNetworkConfig(auto bool, interfaceConfigs []*corev1.InstanceInterfaceConfig, controllerVpcID *uuid.UUID) *corev1.InstanceNetworkConfig {
+	nc := &corev1.InstanceNetworkConfig{Auto: auto}
+	if auto {
+		nc.AutoConfig = &corev1.InstanceNetworkAutoConfig{}
+		if controllerVpcID != nil {
+			nc.AutoConfig.VpcId = &corev1.VpcId{Value: controllerVpcID.String()}
+		}
+	} else {
 		nc.Interfaces = interfaceConfigs
 	}
+
 	return nc
+}
+
+// loadInstanceInterfaceVpcs validates VPC-selection intent and returns each
+// requested REST VPC keyed by its REST ID.
+func loadInstanceInterfaceVpcs(ctx context.Context, logger *zerolog.Logger, dbSession *cdb.Session, interfaces []model.APIInterfaceCreateOrUpdateRequest, tenantID, siteID uuid.UUID) (map[uuid.UUID]*cdbm.Vpc, *cutil.APIError) {
+	requestedVpcIDs := make([]uuid.UUID, 0, len(interfaces))
+	seenVpcIDs := make(map[uuid.UUID]struct{}, len(interfaces))
+	for _, ifc := range interfaces {
+		if ifc.VpcID == nil {
+			continue
+		}
+
+		vpcID, err := uuid.Parse(*ifc.VpcID)
+		if err != nil {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC ID: %s specified in interfaces data in request is not valid", *ifc.VpcID), nil)
+		}
+		if _, ok := seenVpcIDs[vpcID]; !ok {
+			seenVpcIDs[vpcID] = struct{}{}
+			requestedVpcIDs = append(requestedVpcIDs, vpcID)
+		}
+	}
+
+	if len(requestedVpcIDs) == 0 {
+		return map[uuid.UUID]*cdbm.Vpc{}, nil
+	}
+
+	// A REST-side VPC or prefix lock was considered, but it would be held
+	// across the synchronous Core call. Core owns ordering, capacity, and locks.
+	vpcDAO := cdbm.NewVpcDAO(dbSession)
+	vpcs, _, err := vpcDAO.GetAll(ctx, nil, cdbm.VpcFilterInput{VpcIDs: requestedVpcIDs}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to retrieve VPCs from DB by IDs")
+		return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve VPCs from DB by IDs", nil)
+	}
+
+	vpcByID := make(map[uuid.UUID]*cdbm.Vpc, len(vpcs))
+	for i := range vpcs {
+		vpcByID[vpcs[i].ID] = &vpcs[i]
+	}
+
+	for _, vpcID := range requestedVpcIDs {
+		vpc, ok := vpcByID[vpcID]
+		if !ok {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request data is not found in DB", vpcID), nil)
+		}
+		if vpc.TenantID != tenantID {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request is not owned by Tenant", vpcID), nil)
+		}
+		if vpc.SiteID != siteID {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request does not belong to Site", vpcID), nil)
+		}
+		if vpc.ControllerVpcID == nil || vpc.Status != cdbm.VpcStatusReady {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request data is not in Ready state", vpcID), nil)
+		}
+		if vpc.NetworkVirtualizationType == nil || *vpc.NetworkVirtualizationType != cdbm.VpcFNN {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request must have FNN network virtualization type", vpcID), nil)
+		}
+	}
+
+	return vpcByID, nil
+}
+
+// instanceInterfaceVpcSelection converts persisted REST VPC intent to the
+// Controller request shape and returns nil for non-VPC-selection interfaces.
+func instanceInterfaceVpcSelection(ifc *cdbm.Interface) (*corev1.InstanceInterfaceVpcSelection, error) {
+	if ifc.VpcID == nil {
+		return nil, nil
+	}
+	if ifc.Vpc == nil || ifc.Vpc.ControllerVpcID == nil {
+		return nil, fmt.Errorf("interface %s is missing its Controller VPC relation", ifc.ID)
+	}
+	if ifc.VpcIPFamilyMode == nil {
+		return nil, fmt.Errorf("interface %s is missing its VPC IP family mode", ifc.ID)
+	}
+
+	var familyMode corev1.InstanceInterfaceIpFamilyMode
+	switch *ifc.VpcIPFamilyMode {
+	case cdbm.InterfaceVpcIPFamilyModeIPv4Only:
+		familyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY
+	case cdbm.InterfaceVpcIPFamilyModeIPv6Only:
+		familyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV6_ONLY
+	case cdbm.InterfaceVpcIPFamilyModeDualStack:
+		familyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_DUAL_STACK
+	default:
+		return nil, fmt.Errorf("interface %s has unsupported VPC IP family mode %q", ifc.ID, *ifc.VpcIPFamilyMode)
+	}
+
+	return &corev1.InstanceInterfaceVpcSelection{
+		VpcId:      &corev1.VpcId{Value: ifc.Vpc.ControllerVpcID.String()},
+		FamilyMode: familyMode,
+	}, nil
 }
 
 // NewCreateInstanceHandler initializes and returns a new handler for creating Instance
@@ -83,11 +180,50 @@ func NewCreateInstanceHandler(dbSession *cdb.Session, tc temporalClient.Client, 
 	}
 }
 
+// validateTemplatedIpxeOsForSite guards the Templated iPXE Operating System
+// selection paths (Instance create / update / batch-create) before the OS ID is
+// sent to Core. Caller authorization and tenant/OS access are already enforced
+// by the handlers (ValidateOrgMembership / ValidateUserRoles) and the per-request
+// usability check, so this enforces the site-availability contract specific to
+// templated OSes: the OS definition must be synchronized to the Instance's Site
+// (a Synced OperatingSystemSiteAssociation) so the Site can render the template
+// at provisioning time.
+//
+// This is intentionally independent of how the OS was created or which side owns
+// its definition: single-site OSes sync bidirectionally with nico-core, while
+// multi-site OSes are REST-owned and pushed out to their Sites. In every case a
+// Synced association is the signal that the definition is actually available at
+// the Site, so we gate on that alone.
+func validateTemplatedIpxeOsForSite(ctx context.Context, dbSession *cdb.Session, logger *zerolog.Logger, os *cdbm.OperatingSystem, siteID uuid.UUID) *cutil.APIError {
+	ossaDAO := cdbm.NewOperatingSystemSiteAssociationDAO(dbSession)
+	_, ossaCount, err := ossaDAO.GetAll(
+		ctx,
+		nil,
+		cdbm.OperatingSystemSiteAssociationFilterInput{
+			OperatingSystemIDs: []uuid.UUID{os.ID},
+			SiteIDs:            []uuid.UUID{siteID},
+			Statuses:           []string{cdbm.OperatingSystemSiteAssociationStatusSynced},
+		},
+		cdbp.PageInput{Limit: cutil.GetPtr(1)},
+		nil,
+	)
+	if err != nil {
+		logger.Error().Err(err).Str("operatingSystemId", os.ID.String()).Msg("error retrieving OperatingSystemSiteAssociations for Templated iPXE OS")
+		return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve OperatingSystem site associations, DB error", nil)
+	}
+	if ossaCount == 0 {
+		logger.Warn().Str("operatingSystemId", os.ID.String()).Str("siteId", siteID.String()).Msg("Templated iPXE Operating System is not synchronized to the Instance's Site")
+		return cutil.NewAPIError(http.StatusBadRequest, "Templated iPXE Operating System specified in request is not synchronized to the Instance's Site", nil)
+	}
+
+	return nil
+}
+
 // Returns either a default OS or an existing instance OS config.
-// apiRequest will be mutated for use in createFromParams.
+// apiRequest will be mutated for use in create.
 // osConfig will hold the struct/data for use with Temporal/NICo calls.
 // Errors should be returned in the form of cutil.NewAPIErrorResponse
-func (cih CreateInstanceHandler) buildInstanceCreateRequestOsConfig(c echo.Context, logger *zerolog.Logger, apiRequest *model.APIInstanceCreateRequest, site *cdbm.Site) (*cwssaws.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
+func (cih CreateInstanceHandler) buildInstanceCreateRequestOsConfig(c echo.Context, logger *zerolog.Logger, apiRequest *model.APIInstanceCreateRequest, site *cdbm.Site) (*corev1.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
 
 	ctx := c.Request().Context()
 
@@ -99,11 +235,11 @@ func (cih CreateInstanceHandler) buildInstanceCreateRequestOsConfig(c echo.Conte
 			return nil, nil, cutil.NewAPIError(http.StatusBadRequest, "Failed to validate OperatingSystem data", err)
 		}
 
-		return &cwssaws.InstanceOperatingSystemConfig{
+		return &corev1.InstanceOperatingSystemConfig{
 			RunProvisioningInstructionsOnEveryBoot: *apiRequest.AlwaysBootWithCustomIpxe, // Set by the earlier call to ValidateAndSetOperatingSystemData
 			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled,         // Set by the earlier call to ValidateAndSetOperatingSystemData
-			Variant: &cwssaws.InstanceOperatingSystemConfig_Ipxe{
-				Ipxe: &cwssaws.InlineIpxe{
+			Variant: &corev1.InstanceOperatingSystemConfig_Ipxe{
+				Ipxe: &corev1.InlineIpxe{
 					IpxeScript: *apiRequest.IpxeScript,
 				},
 			},
@@ -145,9 +281,10 @@ func (cih CreateInstanceHandler) buildInstanceCreateRequestOsConfig(c echo.Conte
 		return c.Str("OperatingSystem ID", os.ID.String())
 	})
 
-	// Confirm ownership between tenant and OS.
-	if os.TenantID.String() != apiRequest.TenantID {
-		logger.Error().Msg("OperatingSystem in request is not owned by tenant")
+	// Confirm the Tenant can use the OS. Provider-owned Templated iPXE OSes are
+	// shared through synchronized Site associations validated below.
+	if !os.IsTenantUsable(apiRequest.TenantID) {
+		logger.Error().Msg("OperatingSystem in request is not usable by tenant")
 		return nil, nil, cutil.NewAPIError(http.StatusBadRequest, "OperatingSystem specified in request is not owned by Tenant", nil)
 	}
 
@@ -197,21 +334,35 @@ func (cih CreateInstanceHandler) buildInstanceCreateRequestOsConfig(c echo.Conte
 	// earlier call to ValidateAndSetOperatingSystemData
 
 	if os.Type == cdbm.OperatingSystemTypeIPXE {
-		return &cwssaws.InstanceOperatingSystemConfig{
+		return &corev1.InstanceOperatingSystemConfig{
 			RunProvisioningInstructionsOnEveryBoot: *apiRequest.AlwaysBootWithCustomIpxe,
 			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled,
-			Variant: &cwssaws.InstanceOperatingSystemConfig_Ipxe{
-				Ipxe: &cwssaws.InlineIpxe{
+			Variant: &corev1.InstanceOperatingSystemConfig_Ipxe{
+				Ipxe: &corev1.InlineIpxe{
 					IpxeScript: *apiRequest.IpxeScript,
 				},
 			},
 			UserData: apiRequest.UserData,
 		}, osID, nil
+	} else if os.Type == cdbm.OperatingSystemTypeTemplatedIPXE {
+		if apiErr := validateTemplatedIpxeOsForSite(ctx, cih.dbSession, logger, os, site.ID); apiErr != nil {
+			return nil, nil, apiErr
+		}
+		return &corev1.InstanceOperatingSystemConfig{
+			RunProvisioningInstructionsOnEveryBoot: *apiRequest.AlwaysBootWithCustomIpxe,
+			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled,
+			Variant: &corev1.InstanceOperatingSystemConfig_OperatingSystemId{
+				OperatingSystemId: &corev1.OperatingSystemId{
+					Value: os.ID.String(),
+				},
+			},
+			UserData: apiRequest.UserData,
+		}, osID, nil
 	} else {
-		return &cwssaws.InstanceOperatingSystemConfig{
+		return &corev1.InstanceOperatingSystemConfig{
 			PhoneHomeEnabled: *apiRequest.PhoneHomeEnabled,
-			Variant: &cwssaws.InstanceOperatingSystemConfig_OsImageId{
-				OsImageId: &cwssaws.UUID{
+			Variant: &corev1.InstanceOperatingSystemConfig_OsImageId{
+				OsImageId: &corev1.UUID{
 					Value: os.ID.String(),
 				},
 			},
@@ -240,7 +391,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 	// 2. Request Validation
 	//    - Bind and validate request data
 	//    - Validate tenant, VPC, site
-	//    - Load and validate Interfaces (Subnets, VPC Prefixes)
+	//    - Load and validate Interfaces (Subnets, VPC Prefixes, or VPC selection)
 	//    - Load and validate DPU Extension Service Deployments
 	//    - Load and validate Network Security Groups
 	//    - Load and validate SSH Key Groups
@@ -398,7 +549,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 	}
 
 	// Begin validating interfaces
-	// Fetch and validate Subnet or VPC Prefixes
+	// Fetch and validate Subnets, VPC Prefixes, and VPC selections
 	sbDAO := cdbm.NewSubnetDAO(cih.dbSession)
 	vpDAO := cdbm.NewVpcPrefixDAO(cih.dbSession)
 
@@ -454,10 +605,18 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		}
 	}
 
+	// Load VPCs only for interfaces using Core-managed prefix selection.
+	interfaceVpcIDMap, interfaceVpcErr := loadInstanceInterfaceVpcs(ctx, &logger, cih.dbSession, apiRequest.Interfaces, tenant.ID, site.ID)
+	if interfaceVpcErr != nil {
+		logger.Warn().Err(interfaceVpcErr).Msg("failed to validate VPCs specified by Instance interfaces")
+		return cutil.NewAPIErrorResponse(c, interfaceVpcErr.Code, interfaceVpcErr.Message, interfaceVpcErr.Data)
+	}
+
 	dbInterfaces := []cdbm.Interface{}
 	isInterfaceDeviceInfoPresent := false
 
 	pfWithinVPC := []uuid.UUID{}
+	primaryPhysicalInterfaceUsesVpcSelection := false
 	allFoundVpcIds := goset.NewSet[uuid.UUID]()
 
 	// Prepare the unique set of all VPC IDs for this instance.
@@ -610,8 +769,10 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				// is by definition not the primary.
 				if !isInterfaceDeviceInfoPresent {
 					pfWithinVPC = append(pfWithinVPC, vpcPrefix.VpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
 					pfWithinVPC = []uuid.UUID{vpcPrefix.VpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				}
 			}
 
@@ -644,6 +805,46 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				Status:               cdbm.InterfaceStatusPending,
 			})
 		}
+
+		if ifc.VpcID != nil {
+			interfaceVpcID := uuid.MustParse(*ifc.VpcID)
+			interfaceVpc := interfaceVpcIDMap[interfaceVpcID]
+			if vpc.NetworkVirtualizationType == nil || *vpc.NetworkVirtualizationType != cdbm.VpcFNN {
+				logger.Warn().Msg(fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", vpc.ID))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", vpc.ID), nil)
+			}
+
+			if !allRequestedVpcIds.Contains(interfaceVpcID) {
+				logger.Error().Msgf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID)
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID), nil)
+			}
+
+			allFoundVpcIds.Add(interfaceVpcID)
+			if ifc.Device != nil && ifc.DeviceInstance != nil {
+				isInterfaceDeviceInfoPresent = true
+			}
+			if ifc.IsPhysical {
+				if !isInterfaceDeviceInfoPresent {
+					pfWithinVPC = append(pfWithinVPC, interfaceVpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
+					pfWithinVPC = []uuid.UUID{interfaceVpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				}
+			}
+
+			dbInterfaces = append(dbInterfaces, cdbm.Interface{
+				VpcID:                &interfaceVpcID,
+				Vpc:                  interfaceVpc,
+				VpcIPFamilyMode:      cutil.GetPtr(ifc.VpcIPFamilyMode()),
+				InlineRoutingProfile: ifc.InlineRoutingProfile.ToDB(),
+				Device:               ifc.Device,
+				DeviceInstance:       ifc.DeviceInstance,
+				VirtualFunctionID:    ifc.VirtualFunctionID,
+				IsPhysical:           ifc.IsPhysical,
+				Status:               cdbm.InterfaceStatusPending,
+			})
+		}
 	}
 
 	// If there are ethernet interfaces for this Instance,
@@ -655,6 +856,17 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		// be possible at this point), or if the VPC of the first
 		// PF doesn't match the (primary) VPC of the instance.
 		if len(pfWithinVPC) == 0 || pfWithinVPC[0] != vpc.ID {
+			// Use the VPC-selection response when the primary physical Interface selects a VPC
+			// by ID. If no primary physical Interface was found, any Interface selecting a VPC
+			// by ID is enough to prefer this response over the legacy VPC Prefix response.
+			if primaryPhysicalInterfaceUsesVpcSelection || (len(pfWithinVPC) == 0 && len(interfaceVpcIDMap) > 0) {
+				logger.Error().Msg("the primary physical interface must use the Instance VPC")
+				if !isInterfaceDeviceInfoPresent {
+					return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The primary physical Interface must use the VPC specified in `vpcId`", nil)
+				}
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The primary physical Interface for deviceInstance: 0 must use the VPC specified in `vpcId`", nil)
+			}
+
 			logger.Error().Msg("the primary physical interface must use a VPC prefix that matches with Instance VPC")
 
 			if !isInterfaceDeviceInfoPresent {
@@ -667,6 +879,12 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		// the reality of the VPC associations found based on interface
 		// definitions.
 		if allRequestedVpcIds.Cardinality() != allFoundVpcIds.Cardinality() {
+			// If any Interface selects a VPC by ID, use the generalized error because
+			// either VPC IDs or VPC Prefixes can account for a mismatch with `vpcId` or `secondaryVpcIds`.
+			if len(interfaceVpcIDMap) > 0 {
+				logger.Error().Msg("one or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data")
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data", nil)
+			}
 			logger.Error().Msg("one or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`")
 			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`", nil)
 		}
@@ -875,6 +1093,20 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 	var nvlifcs []cdbm.NVLinkInterface
 	var ssd *cdbm.StatusDetail
 
+	// Validate the targeted instance creation capability before opening the
+	// transaction so no writes or locks happen for an unauthorized request.
+	if apiRequest.MachineID != nil {
+		privilegedAccess, derr := common.TenantHasTargetedInstanceCreation(ctx, nil, cih.dbSession, tenant, &common.TenantPrivilegeScope{SiteID: &site.ID})
+		if derr != nil {
+			logger.Error().Err(derr).Msg("error checking effective targeted instance creation for Site")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to verify capability for Site", nil)
+		}
+		if !privilegedAccess {
+			logger.Warn().Msg("tenant does not have capability to create instances from specific machine")
+			return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "Tenant does not have capability to create Instances using specific Machine ID", nil)
+		}
+	}
+
 	// timeoutResp lets the closure signal a post-rollback handler — the
 	// TerminateWorkflow call has to run after the closure returns so that
 	// the DB tx unwinds before we make the second remote call. nil means
@@ -886,11 +1118,6 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 
 		// Begin validating Machine ID
 		if apiRequest.MachineID != nil {
-			if tenant.Config == nil || !tenant.Config.TargetedInstanceCreation {
-				logger.Warn().Msg("tenant does not have capability to create instances from specific machine")
-				return cutil.NewAPIError(http.StatusForbidden, "Tenant does not have capability to create Instances using specific Machine ID", nil)
-			}
-
 			mDAO := cdbm.NewMachineDAO(cih.dbSession)
 
 			// Acquire a lock on the MachineID
@@ -1072,11 +1299,16 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			}
 
 			// Select unallocated Machine for the requested instance type
-			machine, err = common.GetUnallocatedMachineForInstanceType(ctx, tx, cih.dbSession, instanceType)
+			machine, err = common.GetUnallocatedMachineForInstanceType(ctx, logger, tx, cih.dbSession, instanceType, &apiRequest)
 			if err != nil {
+				var ibSelErr *common.InfiniBandMachineSelectionError
+				if errors.As(err, &ibSelErr) {
+					return cutil.NewAPIError(http.StatusBadRequest, ibSelErr.Error(), ibSelErr.ValidationError())
+				}
 				if err == common.ErrInstanceTypeMachineNotFound {
 					return cutil.NewAPIError(http.StatusBadRequest,
 						"No Machines are available for specified Instance Type", nil)
+
 				}
 				logger.Error().Err(err).Msg("error retrieving Machine from DB for Instance Type")
 				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve available baremetal Machines for specified Instance Type", nil)
@@ -1115,7 +1347,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				return cutil.NewAPIError(http.StatusBadRequest, "InfiniBand Interfaces cannot be specified if Instance Type or Machine doesn't have InfiniBand Capability", nil)
 			}
 
-			// Validate InfiniBand Interfaces if Instance Type has InfiniBand Capability
+			// Validate InfiniBand Interfaces against the selected Machine's InfiniBand Capabilities
 			err = apiRequest.ValidateInfiniBandInterfaces(ibCaps)
 			if err != nil {
 				logger.Error().Err(err).Msg("Failed to validate InfiniBand interfaces in request data")
@@ -1381,7 +1613,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		// Prepare interface details to pass to nico call
-		interfaceConfigs := []*cwssaws.InstanceInterfaceConfig{}
+		interfaceConfigs := []*corev1.InstanceInterfaceConfig{}
 
 		// Create the instance subnet record in the db from info gathered earlier
 		// The first Subnet is automatically added to the physical interface
@@ -1391,6 +1623,8 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			input := cdbm.InterfaceCreateInput{
 				InstanceID:           instance.ID,
 				SubnetID:             dbifc.SubnetID,
+				VpcID:                dbifc.VpcID,
+				VpcIPFamilyMode:      dbifc.VpcIPFamilyMode,
 				VpcPrefixID:          dbifc.VpcPrefixID,
 				Device:               dbifc.Device,
 				DeviceInstance:       dbifc.DeviceInstance,
@@ -1409,34 +1643,42 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			}
 
 			ifc := *retifc
+			ifc.Vpc = dbifc.Vpc
 			ifc.VpcPrefix = dbifc.VpcPrefix // We created the interface in the DB based on the values in dbifc, so we can populate this as well.
 			ifcs = append(ifcs, ifc)
 
-			interfaceConfig := &cwssaws.InstanceInterfaceConfig{
-				FunctionType: cwssaws.InterfaceFunctionType_VIRTUAL_FUNCTION,
+			interfaceConfig := &corev1.InstanceInterfaceConfig{
+				FunctionType: corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
 			}
 
 			// Assign InstanceInterfaceConfig_SegmentId in case of Subnet
 			if dbifc.SubnetID != nil {
-				interfaceConfig.NetworkSegmentId = &cwssaws.NetworkSegmentId{
+				interfaceConfig.NetworkSegmentId = &corev1.NetworkSegmentId{
 					Value: subnetIDMap[*dbifc.SubnetID].ControllerNetworkSegmentID.String(),
 				}
-				interfaceConfig.NetworkDetails = &cwssaws.InstanceInterfaceConfig_SegmentId{
-					SegmentId: &cwssaws.NetworkSegmentId{
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_SegmentId{
+					SegmentId: &corev1.NetworkSegmentId{
 						Value: subnetIDMap[*dbifc.SubnetID].ControllerNetworkSegmentID.String(),
 					},
 				}
 			}
 
-			// Assign InstanceInterfaceConfig_VpcPrefixId in case of VpcPrefix
-			if dbifc.VpcPrefixID != nil {
-				interfaceConfig.NetworkDetails = &cwssaws.InstanceInterfaceConfig_VpcPrefixId{
-					VpcPrefixId: &cwssaws.VpcPrefixId{Value: dbifc.VpcPrefixID.String()},
+			// Preserve unresolved VPC intent; otherwise use the explicit prefix.
+			vpcSelection, serr := instanceInterfaceVpcSelection(&dbifc)
+			if serr != nil {
+				logger.Error().Err(serr).Msg("failed to build VPC selection for Instance Interface")
+				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to build VPC selection for Instance Interface", nil)
+			}
+			if vpcSelection != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_Vpc{Vpc: vpcSelection}
+			} else if dbifc.VpcPrefixID != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_VpcPrefixId{
+					VpcPrefixId: &corev1.VpcPrefixId{Value: dbifc.VpcPrefixID.String()},
 				}
 			}
 
 			if dbifc.IsPhysical {
-				interfaceConfig.FunctionType = cwssaws.InterfaceFunctionType_PHYSICAL_FUNCTION
+				interfaceConfig.FunctionType = corev1.InterfaceFunctionType_PHYSICAL_FUNCTION
 			}
 
 			// Assign Device and DeviceInstance in case of Multi DPU Interface
@@ -1463,7 +1705,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		//We'll need this later for the nico call
-		ibInterfaceConfigs := []*cwssaws.InstanceIBInterfaceConfig{}
+		ibInterfaceConfigs := []*corev1.InstanceIBInterfaceConfig{}
 
 		// Create the instance infiniband interface record in the db from info gathered earlier IF instance type was used
 		ibifcs = []cdbm.InfiniBandInterface{}
@@ -1494,17 +1736,17 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			ifc := *retibifc
 			ibifcs = append(ibifcs, ifc)
 
-			ibInterfaceConfig := &cwssaws.InstanceIBInterfaceConfig{
+			ibInterfaceConfig := &corev1.InstanceIBInterfaceConfig{
 				Device:         ifc.Device,
 				Vendor:         ifc.Vendor,
 				DeviceInstance: uint32(ifc.DeviceInstance),
-				FunctionType:   cwssaws.InterfaceFunctionType_PHYSICAL_FUNCTION,
-				IbPartitionId:  &cwssaws.IBPartitionId{Value: ifc.InfiniBandPartitionID.String()},
+				FunctionType:   corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+				IbPartitionId:  &corev1.IBPartitionId{Value: ifc.InfiniBandPartitionID.String()},
 			}
 			ibInterfaceConfigs = append(ibInterfaceConfigs, ibInterfaceConfig)
 
 			if !ifc.IsPhysical {
-				ibInterfaceConfig.FunctionType = cwssaws.InterfaceFunctionType_VIRTUAL_FUNCTION
+				ibInterfaceConfig.FunctionType = corev1.InterfaceFunctionType_VIRTUAL_FUNCTION
 
 				if ifc.VirtualFunctionID != nil {
 					vfID := uint32(*ifc.VirtualFunctionID)
@@ -1516,7 +1758,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		// Create the instance NVLink Interface record in the db from info gathered earlier IF instance type was used
 		nvlifcs = []cdbm.NVLinkInterface{}
 		nvlifcDAO := cdbm.NewNVLinkInterfaceDAO(cih.dbSession)
-		nvlInterfaceConfigs := []*cwssaws.InstanceNVLinkGpuConfig{}
+		nvlInterfaceConfigs := []*corev1.InstanceNVLinkGpuConfig{}
 		for _, nvlifc := range dbnvlic {
 			retnvlifc, serr := nvlifcDAO.Create(
 				ctx,
@@ -1539,15 +1781,15 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			nvlfc := *retnvlifc
 			nvlifcs = append(nvlifcs, nvlfc)
 
-			nvlInterfaceConfig := &cwssaws.InstanceNVLinkGpuConfig{
+			nvlInterfaceConfig := &corev1.InstanceNVLinkGpuConfig{
 				DeviceInstance:     uint32(nvlifc.DeviceInstance),
-				LogicalPartitionId: &cwssaws.NVLinkLogicalPartitionId{Value: nvlfc.NVLinkLogicalPartitionID.String()},
+				LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvlfc.NVLinkLogicalPartitionID.String()},
 			}
 			nvlInterfaceConfigs = append(nvlInterfaceConfigs, nvlInterfaceConfig)
 		}
 
 		// Create the DpuExtensionServiceDeployment records in DB
-		desdConfigs := []*cwssaws.InstanceDpuExtensionServiceConfig{}
+		desdConfigs := []*corev1.InstanceDpuExtensionServiceConfig{}
 
 		desdDAO := cdbm.NewDpuExtensionServiceDeploymentDAO(cih.dbSession)
 		desds = []cdbm.DpuExtensionServiceDeployment{}
@@ -1577,7 +1819,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 
 			desds = append(desds, *desd)
 
-			desdConfigs = append(desdConfigs, &cwssaws.InstanceDpuExtensionServiceConfig{
+			desdConfigs = append(desdConfigs, &corev1.InstanceDpuExtensionServiceConfig{
 				ServiceId: desd.DpuExtensionServiceID.String(),
 				Version:   desd.Version,
 			})
@@ -1586,14 +1828,13 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		// Create the status detail record
 		sdDAO := cdbm.NewStatusDetailDAO(cih.dbSession)
 		var serr error
-		ssd, serr = sdDAO.CreateFromParams(ctx, tx, instance.ID.String(), *cutil.GetPtr(cdbm.InstanceStatusPending),
-			cutil.GetPtr("received instance creation request, pending"))
+		ssd, serr = sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: instance.ID.String(), Status: *cutil.GetPtr(cdbm.InstanceStatusPending), Message: cutil.GetPtr("received instance creation request, pending")})
 		if serr != nil {
 			logger.Error().Err(serr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for Instance, DB error", nil)
 		}
 		if ssd == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for Instance", nil)
 		}
 
@@ -1614,29 +1855,29 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		// Prepare the create request workflow object
-		createInstanceRequest := &cwssaws.InstanceAllocationRequest{
-			InstanceId: &cwssaws.InstanceId{Value: instance.GetSiteID().String()},
-			MachineId:  &cwssaws.MachineId{Id: *instance.MachineID},
-			Metadata: &cwssaws.Metadata{
+		createInstanceRequest := &corev1.InstanceAllocationRequest{
+			InstanceId: &corev1.InstanceId{Value: instance.GetSiteID().String()},
+			MachineId:  &corev1.MachineId{Id: *instance.MachineID},
+			Metadata: &corev1.Metadata{
 				Name:        instance.Name,
 				Description: description,
 				Labels:      createLabels,
 			},
-			Config: &cwssaws.InstanceConfig{
+			Config: &corev1.InstanceConfig{
 				NetworkSecurityGroupId: instance.NetworkSecurityGroupID,
-				Tenant: &cwssaws.TenantConfig{
+				Tenant: &corev1.TenantConfig{
 					TenantOrganizationId: tenant.Org,
 					TenantKeysetIds:      instanceSshKeyGroupIds,
 				},
 				Os:      osConfig,
-				Network: buildInstanceNetworkConfig(instance.AutoNetwork, interfaceConfigs),
-				Infiniband: &cwssaws.InstanceInfinibandConfig{
+				Network: buildInstanceNetworkConfig(instance.AutoNetwork, interfaceConfigs, vpc.ControllerVpcID),
+				Infiniband: &corev1.InstanceInfinibandConfig{
 					IbInterfaces: ibInterfaceConfigs,
 				},
-				DpuExtensionServices: &cwssaws.InstanceDpuExtensionServicesConfig{
+				DpuExtensionServices: &corev1.InstanceDpuExtensionServicesConfig{
 					ServiceConfigs: desdConfigs,
 				},
-				Nvlink: &cwssaws.InstanceNVLinkConfig{
+				Nvlink: &corev1.InstanceNVLinkConfig{
 					GpuConfigs: nvlInterfaceConfigs,
 				},
 			},
@@ -1799,7 +2040,7 @@ func (uih UpdateInstanceHandler) handleReboot(c echo.Context, logger *zerolog.Lo
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to update Instance", nil)
 		}
 
-		_, serr := sdDAO.CreateFromParams(ctx, tx, instance.ID.String(), *cutil.GetPtr(cdbm.InstancePowerStatusRebooting), powerStatusMessage)
+		_, serr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: instance.ID.String(), Status: *cutil.GetPtr(cdbm.InstancePowerStatusRebooting), Message: powerStatusMessage})
 		if serr != nil {
 			logger.Error().Err(serr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for Instance reboot", nil)
@@ -1829,16 +2070,16 @@ func (uih UpdateInstanceHandler) handleReboot(c echo.Context, logger *zerolog.Lo
 		}
 
 		// Get status details
-		ssds, _, derr = sdDAO.GetAllByEntityID(ctx, tx, ui.ID.String(), nil, nil, nil)
+		ssds, _, derr = sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{ui.ID.String()}}, cdbp.PageInput{})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Status Details for Instance from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Status Details for Instance", nil)
 		}
 
 		// Prepare the config update request workflow object
-		rebootInstanceRequest := &cwssaws.InstancePowerRequest{
-			MachineId:            &cwssaws.MachineId{Id: *instance.MachineID},
-			Operation:            cwssaws.InstancePowerRequest_POWER_RESET,
+		rebootInstanceRequest := &corev1.InstancePowerRequest{
+			InstanceId:           &corev1.InstanceId{Value: instance.GetSiteID().String()},
+			Operation:            corev1.InstancePowerRequest_POWER_RESET,
 			BootWithCustomIpxe:   rebootWithCustomIpxe,
 			ApplyUpdatesOnReboot: applyUpdatesOnReboot,
 		}
@@ -1921,7 +2162,7 @@ func (uih UpdateInstanceHandler) handleReboot(c echo.Context, logger *zerolog.Lo
 // apiRequest will be mutated for use in UpdateFromParams.
 // osConfig will hold the struct/data for use with Temporal/NICo calls.
 // Errors should be returned in the form of cutil.NewAPIErrorResponse
-func (uih UpdateInstanceHandler) buildInstanceUpdateRequestOsConfig(c echo.Context, logger *zerolog.Logger, apiRequest *model.APIInstanceUpdateRequest, instance *cdbm.Instance, site *cdbm.Site) (*cwssaws.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
+func (uih UpdateInstanceHandler) buildInstanceUpdateRequestOsConfig(c echo.Context, logger *zerolog.Logger, apiRequest *model.APIInstanceUpdateRequest, instance *cdbm.Instance, site *cdbm.Site) (*corev1.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
 
 	var os *cdbm.OperatingSystem
 	var osID *uuid.UUID
@@ -1936,11 +2177,11 @@ func (uih UpdateInstanceHandler) buildInstanceUpdateRequestOsConfig(c echo.Conte
 			return nil, nil, cutil.NewAPIError(http.StatusBadRequest, "Failed to validate OperatingSystem data", err)
 		}
 
-		return &cwssaws.InstanceOperatingSystemConfig{
+		return &corev1.InstanceOperatingSystemConfig{
 			RunProvisioningInstructionsOnEveryBoot: instance.AlwaysBootWithCustomIpxe,
 			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled, // Set by the earlier call to ValidateAndSetOperatingSystemData
-			Variant: &cwssaws.InstanceOperatingSystemConfig_Ipxe{
-				Ipxe: &cwssaws.InlineIpxe{
+			Variant: &corev1.InstanceOperatingSystemConfig_Ipxe{
+				Ipxe: &corev1.InlineIpxe{
 					IpxeScript: *apiRequest.IpxeScript,
 				},
 			},
@@ -1992,9 +2233,10 @@ func (uih UpdateInstanceHandler) buildInstanceUpdateRequestOsConfig(c echo.Conte
 			return c.Str("OperatingSystem ID", os.ID.String())
 		})
 
-		// Confirm ownership between tenant and OS.
-		if os.TenantID.String() != instance.Tenant.ID.String() {
-			logger.Error().Msg("OperatingSystem in request is not owned by tenant")
+		// Confirm the Tenant can use the OS. Provider-owned Templated iPXE OSes
+		// are shared through synchronized Site associations validated below.
+		if !os.IsTenantUsable(instance.Tenant.ID.String()) {
+			logger.Error().Msg("OperatingSystem in request is not usable by tenant")
 			return nil, nil, cutil.NewAPIError(http.StatusBadRequest, "Operating system specified in request is not owned by Tenant", nil)
 		}
 
@@ -2078,21 +2320,35 @@ func (uih UpdateInstanceHandler) buildInstanceUpdateRequestOsConfig(c echo.Conte
 
 	if os != nil {
 		if os.Type == cdbm.OperatingSystemTypeIPXE {
-			return &cwssaws.InstanceOperatingSystemConfig{
+			return &corev1.InstanceOperatingSystemConfig{
 				RunProvisioningInstructionsOnEveryBoot: alwaysBootWithCustomIpxe,
 				PhoneHomeEnabled:                       phoneHomeEnabled,
-				Variant: &cwssaws.InstanceOperatingSystemConfig_Ipxe{
-					Ipxe: &cwssaws.InlineIpxe{
+				Variant: &corev1.InstanceOperatingSystemConfig_Ipxe{
+					Ipxe: &corev1.InlineIpxe{
 						IpxeScript: *ipxeScript,
 					},
 				},
 				UserData: userData,
 			}, osID, nil
+		} else if os.Type == cdbm.OperatingSystemTypeTemplatedIPXE {
+			if apiErr := validateTemplatedIpxeOsForSite(ctx, uih.dbSession, logger, os, site.ID); apiErr != nil {
+				return nil, nil, apiErr
+			}
+			return &corev1.InstanceOperatingSystemConfig{
+				RunProvisioningInstructionsOnEveryBoot: alwaysBootWithCustomIpxe,
+				PhoneHomeEnabled:                       phoneHomeEnabled,
+				Variant: &corev1.InstanceOperatingSystemConfig_OperatingSystemId{
+					OperatingSystemId: &corev1.OperatingSystemId{
+						Value: os.ID.String(),
+					},
+				},
+				UserData: userData,
+			}, osID, nil
 		} else if os.Type == cdbm.OperatingSystemTypeImage {
-			return &cwssaws.InstanceOperatingSystemConfig{
+			return &corev1.InstanceOperatingSystemConfig{
 				PhoneHomeEnabled: phoneHomeEnabled,
-				Variant: &cwssaws.InstanceOperatingSystemConfig_OsImageId{
-					OsImageId: &cwssaws.UUID{
+				Variant: &corev1.InstanceOperatingSystemConfig_OsImageId{
+					OsImageId: &corev1.UUID{
 						Value: os.ID.String(),
 					},
 				},
@@ -2101,11 +2357,11 @@ func (uih UpdateInstanceHandler) buildInstanceUpdateRequestOsConfig(c echo.Conte
 		}
 	}
 
-	return &cwssaws.InstanceOperatingSystemConfig{
+	return &corev1.InstanceOperatingSystemConfig{
 		RunProvisioningInstructionsOnEveryBoot: alwaysBootWithCustomIpxe,
 		PhoneHomeEnabled:                       phoneHomeEnabled,
-		Variant: &cwssaws.InstanceOperatingSystemConfig_Ipxe{
-			Ipxe: &cwssaws.InlineIpxe{
+		Variant: &corev1.InstanceOperatingSystemConfig_Ipxe{
+			Ipxe: &corev1.InlineIpxe{
 				IpxeScript: *ipxeScript,
 			},
 		},
@@ -2375,6 +2631,13 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		}
 	}
 
+	// Load VPCs only for interfaces using Core-managed prefix selection.
+	interfaceVpcIDMap, interfaceVpcErr := loadInstanceInterfaceVpcs(ctx, &logger, uih.dbSession, apiRequest.Interfaces, tenant.ID, site.ID)
+	if interfaceVpcErr != nil {
+		logger.Warn().Err(interfaceVpcErr).Msg("failed to validate VPCs specified by Instance interfaces")
+		return cutil.NewAPIErrorResponse(c, interfaceVpcErr.Code, interfaceVpcErr.Message, interfaceVpcErr.Data)
+	}
+
 	existingSubnetIfcMap := map[uuid.UUID]int{}
 	existingVpcPrefixIfcMap := map[uuid.UUID]int{}
 	if len(apiRequest.Interfaces) > 0 {
@@ -2399,6 +2662,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 	dbInterfaces := []cdbm.Interface{}
 	isDeviceInfoPresent := false
 	pfWithinVPC := []uuid.UUID{}
+	primaryPhysicalInterfaceUsesVpcSelection := false
 	allFoundVpcIds := goset.NewSet[uuid.UUID]()
 
 	// Prepare the unique set of all VPC IDs for this instance update.
@@ -2549,8 +2813,10 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				// is by definition not the primary.
 				if !isDeviceInfoPresent {
 					pfWithinVPC = append(pfWithinVPC, vpcPrefix.VpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
 					pfWithinVPC = []uuid.UUID{vpcPrefix.VpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				}
 			}
 
@@ -2560,7 +2826,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 			}
 
 			// Check if VPC Prefix is exhausted
-			incomingInterfaceIPs := vpcPrefixIfcMap[vpcPrefixID] - existingVpcPrefixIfcMap[vpcPrefixID]
+			incomingInterfaceIPs := max(vpcPrefixIfcMap[vpcPrefixID]-existingVpcPrefixIfcMap[vpcPrefixID], 0)
 			vpUsage := vpcPrefixUsageMap[vpcPrefixID]
 			if vpUsage != nil && vpUsage.AvailableIPs > 0 && vpUsage.AcquiredIPs+uint64(incomingInterfaceIPs)*2 > vpUsage.AvailableIPs {
 				msg := fmt.Sprintf(
@@ -2582,6 +2848,46 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				IsPhysical:           ifc.IsPhysical,
 				Status:               cdbm.InterfaceStatusPending})
 		}
+
+		if ifc.VpcID != nil {
+			interfaceVpcID := uuid.MustParse(*ifc.VpcID)
+			interfaceVpc := interfaceVpcIDMap[interfaceVpcID]
+			if vpc.NetworkVirtualizationType == nil || *vpc.NetworkVirtualizationType != cdbm.VpcFNN {
+				logger.Warn().Msg(fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", instance.VpcID))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", instance.VpcID), nil)
+			}
+
+			if !allRequestedVpcIds.Contains(interfaceVpcID) {
+				logger.Error().Msgf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID)
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID), nil)
+			}
+
+			allFoundVpcIds.Add(interfaceVpcID)
+			if ifc.Device != nil && ifc.DeviceInstance != nil {
+				isDeviceInfoPresent = true
+			}
+			if ifc.IsPhysical {
+				if !isDeviceInfoPresent {
+					pfWithinVPC = append(pfWithinVPC, interfaceVpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
+					pfWithinVPC = []uuid.UUID{interfaceVpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				}
+			}
+
+			dbInterfaces = append(dbInterfaces, cdbm.Interface{
+				VpcID:                &interfaceVpcID,
+				Vpc:                  interfaceVpc,
+				VpcIPFamilyMode:      cutil.GetPtr(ifc.VpcIPFamilyMode()),
+				InlineRoutingProfile: ifc.InlineRoutingProfile.ToDB(),
+				Device:               ifc.Device,
+				DeviceInstance:       ifc.DeviceInstance,
+				VirtualFunctionID:    ifc.VirtualFunctionID,
+				IsPhysical:           ifc.IsPhysical,
+				Status:               cdbm.InterfaceStatusPending,
+			})
+		}
 	}
 
 	// If there are ethernet interfaces for this Instance,
@@ -2590,6 +2896,17 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		vpc.NetworkVirtualizationType != nil &&
 		*vpc.NetworkVirtualizationType == cdbm.VpcFNN {
 		if len(pfWithinVPC) == 0 || pfWithinVPC[0] != vpc.ID {
+			// Use the VPC-selection response when the primary physical Interface selects a VPC
+			// by ID. If no primary physical Interface was found, any Interface selecting a VPC
+			// by ID is enough to prefer this response over the legacy VPC Prefix response.
+			if primaryPhysicalInterfaceUsesVpcSelection || (len(pfWithinVPC) == 0 && len(interfaceVpcIDMap) > 0) {
+				logger.Error().Msg("the physical interface must use the Instance VPC")
+				if !isDeviceInfoPresent {
+					return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The physical Interface must use the VPC specified in `vpcId`", nil)
+				}
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The physical Interface for deviceInstance: 0 must use the VPC specified in `vpcId`", nil)
+			}
+
 			logger.Error().Msg("the primary physical interface must use a VPC prefix that matches with Instance VPC")
 
 			if !isDeviceInfoPresent {
@@ -2599,6 +2916,12 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 			}
 		}
 		if allRequestedVpcIds.Cardinality() != allFoundVpcIds.Cardinality() {
+			// If any Interface selects a VPC by ID, use the generalized error because
+			// either VPC IDs or VPC Prefixes can account for a mismatch with `vpcId` or `secondaryVpcIds`.
+			if len(interfaceVpcIDMap) > 0 {
+				logger.Error().Msg("one or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data")
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data", nil)
+			}
 			logger.Error().Msg("one or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`")
 			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`", nil)
 		}
@@ -2987,7 +3310,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		// Create status detail for instance based on updates requested
 		statusMessage := cutil.GetPtr("received Instance config update request, processing")
 
-		_, serr := sdDAO.CreateFromParams(ctx, tx, ui.ID.String(), *cutil.GetPtr(cdbm.InstanceStatusConfiguring), statusMessage)
+		_, serr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: ui.ID.String(), Status: *cutil.GetPtr(cdbm.InstanceStatusConfiguring), Message: statusMessage})
 		if serr != nil {
 			logger.Error().Err(serr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create status detail for Instance update", nil)
@@ -3123,7 +3446,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		// OrderAscending is our best-effort to make sure we send
 		// NICo the interfaces in the order it originally received them
 		// so the config doesn't get rejected.
-		existingIfcs, _, derr = ifcDAO.GetAll(ctx, tx, cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}}, cdbp.PageInput{OrderBy: &cdbp.OrderBy{Field: cdbm.InterfaceOrderByCreated, Order: cdbp.OrderAscending}}, []string{cdbm.SubnetRelationName, cdbm.VpcPrefixRelationName})
+		existingIfcs, _, derr = ifcDAO.GetAll(ctx, tx, cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}}, cdbp.PageInput{OrderBy: &cdbp.OrderBy{Field: cdbm.InterfaceOrderByCreated, Order: cdbp.OrderAscending}}, []string{cdbm.SubnetRelationName, cdbm.VpcRelationName, cdbm.VpcPrefixRelationName})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("failed to retrieve current Ethernet Interfaces details for Instance")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve current Ethernet Interfaces for Instance, DB error", nil)
@@ -3157,6 +3480,8 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				input := cdbm.InterfaceCreateInput{
 					InstanceID:           instance.ID,
 					SubnetID:             dbifc.SubnetID,
+					VpcID:                dbifc.VpcID,
+					VpcIPFamilyMode:      dbifc.VpcIPFamilyMode,
 					VpcPrefixID:          dbifc.VpcPrefixID,
 					Device:               dbifc.Device,
 					DeviceInstance:       dbifc.DeviceInstance,
@@ -3175,6 +3500,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				}
 
 				ifc := *newDbifc
+				ifc.Vpc = dbifc.Vpc
 				ifc.VpcPrefix = dbifc.VpcPrefix // We created the interface in the DB based on the values in dbifc, so we can populate this as well.
 				// Add the new Interface to the list of new Interfaces
 				newdbIfcs = append(newdbIfcs, ifc)
@@ -3520,7 +3846,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		// Get Status Details
-		ssds, _, derr = sdDAO.GetAllByEntityID(ctx, tx, ui.ID.String(), nil, nil, nil)
+		ssds, _, derr = sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{ui.ID.String()}}, cdbp.PageInput{})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Status Details for Instance from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Status Details for Instance", nil)
@@ -3540,32 +3866,40 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 			description = *ui.Description
 		}
 
-		interfaceConfigs := make([]*cwssaws.InstanceInterfaceConfig, len(newdbIfcs))
-		for i, ifc := range newdbIfcs {
+		interfaceConfigs := make([]*corev1.InstanceInterfaceConfig, len(newdbIfcs))
+		for i := range newdbIfcs {
+			ifc := &newdbIfcs[i]
 			if ifc.Status == cdbm.InterfaceStatusDeleting {
 				// NOTE: Don't send any Interfaces that are being deleted
 				continue
 			}
 
-			interfaceConfig := &cwssaws.InstanceInterfaceConfig{
-				FunctionType: cwssaws.InterfaceFunctionType_VIRTUAL_FUNCTION,
+			interfaceConfig := &corev1.InstanceInterfaceConfig{
+				FunctionType: corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
 			}
 
 			if ifc.SubnetID != nil {
-				interfaceConfig.NetworkSegmentId = &cwssaws.NetworkSegmentId{Value: ifc.SubnetID.String()}
-				interfaceConfig.NetworkDetails = &cwssaws.InstanceInterfaceConfig_SegmentId{
-					SegmentId: &cwssaws.NetworkSegmentId{Value: ifc.SubnetID.String()},
+				interfaceConfig.NetworkSegmentId = &corev1.NetworkSegmentId{Value: ifc.SubnetID.String()}
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_SegmentId{
+					SegmentId: &corev1.NetworkSegmentId{Value: ifc.SubnetID.String()},
 				}
 			}
 
-			if ifc.VpcPrefixID != nil {
-				interfaceConfig.NetworkDetails = &cwssaws.InstanceInterfaceConfig_VpcPrefixId{
-					VpcPrefixId: &cwssaws.VpcPrefixId{Value: ifc.VpcPrefixID.String()},
+			vpcSelection, serr := instanceInterfaceVpcSelection(ifc)
+			if serr != nil {
+				logger.Error().Err(serr).Msg("failed to build VPC selection for Instance Interface")
+				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to build VPC selection for Instance Interface", nil)
+			}
+			if vpcSelection != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_Vpc{Vpc: vpcSelection}
+			} else if ifc.VpcPrefixID != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_VpcPrefixId{
+					VpcPrefixId: &corev1.VpcPrefixId{Value: ifc.VpcPrefixID.String()},
 				}
 			}
 
 			if ifc.IsPhysical {
-				interfaceConfig.FunctionType = cwssaws.InterfaceFunctionType_PHYSICAL_FUNCTION
+				interfaceConfig.FunctionType = corev1.InterfaceFunctionType_PHYSICAL_FUNCTION
 			}
 
 			// Assign Device and DeviceInstance in case of Multi DPU Interface
@@ -3594,7 +3928,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		// Populate InfiniBand Interface details for Site Controller request
 		// This loop accommodates both cases where InfiniBand Interfaces for updated or no update was requested
 		// IF there are any new InfiniBand Interfaces, that means all existing InfiniBand Interfaces will be in Deleting state
-		ibInterfaceConfigs := []*cwssaws.InstanceIBInterfaceConfig{}
+		ibInterfaceConfigs := []*corev1.InstanceIBInterfaceConfig{}
 		newOrExistingIbIfcs = append(newIbIfcs, existingIbIfcs...)
 		for _, newIbIfc := range newOrExistingIbIfcs {
 			if newIbIfc.Status == cdbm.InfiniBandInterfaceStatusDeleting {
@@ -3602,17 +3936,17 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				continue
 			}
 
-			ibInterfaceConfig := &cwssaws.InstanceIBInterfaceConfig{
+			ibInterfaceConfig := &corev1.InstanceIBInterfaceConfig{
 				Device:         newIbIfc.Device,
 				Vendor:         newIbIfc.Vendor,
 				DeviceInstance: uint32(newIbIfc.DeviceInstance),
-				FunctionType:   cwssaws.InterfaceFunctionType_PHYSICAL_FUNCTION,
-				IbPartitionId:  &cwssaws.IBPartitionId{Value: newIbIfc.InfiniBandPartitionID.String()},
+				FunctionType:   corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+				IbPartitionId:  &corev1.IBPartitionId{Value: newIbIfc.InfiniBandPartitionID.String()},
 			}
 
 			// NOTE: Not supported yet, but ensures future compatibility
 			if !newIbIfc.IsPhysical {
-				ibInterfaceConfig.FunctionType = cwssaws.InterfaceFunctionType_VIRTUAL_FUNCTION
+				ibInterfaceConfig.FunctionType = corev1.InterfaceFunctionType_VIRTUAL_FUNCTION
 
 				if newIbIfc.VirtualFunctionID != nil {
 					vfID := uint32(*newIbIfc.VirtualFunctionID)
@@ -3624,14 +3958,14 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		// Populate DPU Extension Service Deployment details for Site Controller request
-		desdConfigs := []*cwssaws.InstanceDpuExtensionServiceConfig{}
+		desdConfigs := []*corev1.InstanceDpuExtensionServiceConfig{}
 		for _, desd := range updateDesds {
 			// Skip deployments that are being deleted
 			if desd.Status == cdbm.DpuExtensionServiceDeploymentStatusTerminating {
 				continue
 			}
 
-			desdConfig := &cwssaws.InstanceDpuExtensionServiceConfig{
+			desdConfig := &corev1.InstanceDpuExtensionServiceConfig{
 				ServiceId: desd.DpuExtensionServiceID.String(),
 				Version:   desd.Version,
 			}
@@ -3642,7 +3976,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		// Populate NVLink Interface details for Site Controller request
 		// IF there are any new NVLink Interfaces, that means all existing NVLink Interfaces will be in Deleting state
 		// This loop accommodates both cases where NVLink Interfaces for updated or no update was requested
-		nvlInterfaceConfigs := []*cwssaws.InstanceNVLinkGpuConfig{}
+		nvlInterfaceConfigs := []*corev1.InstanceNVLinkGpuConfig{}
 		newOrExistingNvlIfcs = append(newNvlIfcs, existingNvlIfcs...)
 		for _, newNvlIfc := range newOrExistingNvlIfcs {
 			if newNvlIfc.Status == cdbm.NVLinkInterfaceStatusDeleting {
@@ -3650,36 +3984,36 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				continue
 			}
 
-			nvlInterfaceConfig := &cwssaws.InstanceNVLinkGpuConfig{
+			nvlInterfaceConfig := &corev1.InstanceNVLinkGpuConfig{
 				DeviceInstance:     uint32(newNvlIfc.DeviceInstance),
-				LogicalPartitionId: &cwssaws.NVLinkLogicalPartitionId{Value: newNvlIfc.NVLinkLogicalPartitionID.String()},
+				LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: newNvlIfc.NVLinkLogicalPartitionID.String()},
 			}
 			nvlInterfaceConfigs = append(nvlInterfaceConfigs, nvlInterfaceConfig)
 		}
 
 		// Prepare the config update request workflow object
-		updateInstanceRequest := &cwssaws.InstanceConfigUpdateRequest{
-			InstanceId: &cwssaws.InstanceId{Value: instance.GetSiteID().String()},
-			Metadata: &cwssaws.Metadata{
+		updateInstanceRequest := &corev1.InstanceConfigUpdateRequest{
+			InstanceId: &corev1.InstanceId{Value: instance.GetSiteID().String()},
+			Metadata: &corev1.Metadata{
 				Name:        ui.Name,
 				Description: description,
 				Labels:      labels,
 			},
-			Config: &cwssaws.InstanceConfig{
+			Config: &corev1.InstanceConfig{
 				NetworkSecurityGroupId: ui.NetworkSecurityGroupID,
-				Tenant: &cwssaws.TenantConfig{
+				Tenant: &corev1.TenantConfig{
 					TenantOrganizationId: tenant.Org,
 					TenantKeysetIds:      instanceSshKeyGroupIds,
 				},
 				Os:      osConfig,
-				Network: buildInstanceNetworkConfig(ui.AutoNetwork, interfaceConfigs),
-				Infiniband: &cwssaws.InstanceInfinibandConfig{
+				Network: buildInstanceNetworkConfig(ui.AutoNetwork, interfaceConfigs, vpc.ControllerVpcID),
+				Infiniband: &corev1.InstanceInfinibandConfig{
 					IbInterfaces: ibInterfaceConfigs,
 				},
-				DpuExtensionServices: &cwssaws.InstanceDpuExtensionServicesConfig{
+				DpuExtensionServices: &corev1.InstanceDpuExtensionServicesConfig{
 					ServiceConfigs: desdConfigs,
 				},
-				Nvlink: &cwssaws.InstanceNVLinkConfig{
+				Nvlink: &corev1.InstanceNVLinkConfig{
 					GpuConfigs: nvlInterfaceConfigs,
 				},
 			},
@@ -3784,7 +4118,9 @@ func AttachVpcNsgPropagationDetailsToApiInstance(c echo.Context, ctx context.Con
 	// the list with that.
 	vpcIDs := goset.NewSet[uuid.UUID]()
 	for _, ifc := range interfaces {
-		if ifc.VpcPrefix != nil {
+		if ifc.VpcID != nil {
+			vpcIDs.Add(*ifc.VpcID)
+		} else if ifc.VpcPrefix != nil {
 			vpcIDs.Add(ifc.VpcPrefix.VpcID)
 		}
 
@@ -3958,7 +4294,7 @@ func (gih GetInstanceHandler) Handle(c echo.Context) error {
 	// Get Tenant for this org
 	tnDAO := cdbm.NewTenantDAO(gih.dbSession)
 
-	tenants, err := tnDAO.GetAllByOrg(ctx, nil, org, nil)
+	tenants, _, err := tnDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{Orgs: []string{org}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving Tenant for this org")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant", nil)
@@ -4115,7 +4451,7 @@ func NewGetAllInstanceHandler(dbSession *cdb.Session, tc temporalClient.Client, 
 // @Produce json
 // @Security ApiKeyAuth
 // @Param org path string true "Name of NGC organization"
-// @Param infrastructureProviderId query string true "Infrastructure Provider ID"
+// @Param infrastructureProviderId query string false "Deprecated: Instances will no longer be filtered by Infrastructure Provider; results are scoped to the org's Tenant. Use siteId to scope results to a specific Infrastructure Provider's Sites."
 // @Param siteId query string true "ID of Site"
 // @Param vpcId query string true "ID of Vpc"
 // @Param instanceTypeId query string false "ID of Instance Type"
@@ -4203,7 +4539,7 @@ func (gaih GetAllInstanceHandler) Handle(c echo.Context) error {
 	// Get Tenant for this org
 	tnDAO := cdbm.NewTenantDAO(gaih.dbSession)
 
-	tenants, err := tnDAO.GetAllByOrg(ctx, nil, org, nil)
+	tenants, _, err := tnDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{Orgs: []string{org}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving Tenant for this org")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant for org", nil)
@@ -4382,7 +4718,7 @@ func (gaih GetAllInstanceHandler) Handle(c echo.Context) error {
 	if machineIDs := qParams["machineId"]; len(machineIDs) != 0 {
 		gaih.tracerSpan.SetAttribute(handlerSpan, attribute.StringSlice("machineId", machineIDs), logger)
 		machineDAO := cdbm.NewMachineDAO(gaih.dbSession)
-		machines, _, err := machineDAO.GetAll(ctx, nil, cdbm.MachineFilterInput{MachineIDs: machineIDs}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+		machines, _, err := machineDAO.GetAll(ctx, nil, cdbm.MachineFilterInput{MachineIDs: machineIDs, ExcludeMetadata: true}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 		if err != nil {
 			logger.Error().Err(err).Msg("error retrieving machines from DB")
 			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to retrieve machines with IDs %v specified in query", strings.Join(machineIDs, ", ")), nil)
@@ -4530,7 +4866,10 @@ func (gaih GetAllInstanceHandler) Handle(c echo.Context) error {
 
 			// Collect the sets of _all_ VPC IDs for the instances so we can use
 			// it later for determining NSG propagation.
-			if ifc.VpcPrefix != nil {
+			if ifc.VpcID != nil {
+				vpcsByInstance[ifc.InstanceID].Add(*ifc.VpcID)
+				inheritVpcIDs.Add(*ifc.VpcID)
+			} else if ifc.VpcPrefix != nil {
 				vpcsByInstance[ifc.InstanceID].Add(ifc.VpcPrefix.VpcID)
 				inheritVpcIDs.Add(ifc.VpcPrefix.VpcID)
 			}
@@ -4643,11 +4982,15 @@ func (gaih GetAllInstanceHandler) Handle(c echo.Context) error {
 		}
 	}
 
+	// Advertise the deprecated infrastructureProviderId query param this endpoint still accepts.
+	queryParamDeprecations := model.InstanceListQueryParamDeprecations()
+
 	apiInstances := []model.APIInstance{}
 	for _, ins := range dbInstances {
 		// Create response
 		dbInstance := ins
 		apiInstance := model.NewAPIInstance(&dbInstance, sitesByID[dbInstance.SiteID], ifcMap[dbInstance.ID], ibifcMap[dbInstance.ID], desdsMap[dbInstance.ID], nvlifcMap[dbInstance.ID], skgiasMap[dbInstance.ID], ssdMap[ins.ID.String()])
+		apiInstance.Deprecations = queryParamDeprecations
 
 		// If the instance has no NSG applied directly, and there
 		// were ethernet interfaces attached to VPCs (vpcsByInstance),
@@ -4857,6 +5200,24 @@ func (dih DeleteInstanceHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Error validating Instance deletion request data", verr)
 	}
 
+	// Authorization stays in the handler: setting `IsRepairTenant` requires the
+	// tenant to carry the TargetedInstanceCreation capability. Validate before
+	// opening the transaction so no writes or locks happen for an unauthorized
+	// request. By the time `ToProto` runs the request is safe to trust.
+	if apiRequest.IsRepairTenant != nil && *apiRequest.IsRepairTenant {
+		enabledForSite, derr := common.TenantHasTargetedInstanceCreation(ctx, nil, dih.dbSession, instance.Tenant, &common.TenantPrivilegeScope{
+			SiteID: &instance.SiteID,
+		})
+		if derr != nil {
+			logger.Error().Err(derr).Msg("error checking effective targeted instance creation for Instance's Site")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to verify capability for Instance's Site", nil)
+		}
+		if !enabledForSite {
+			logger.Warn().Msg("tenant does not have capability to set IsRepairTenant for the Instance's Site")
+			return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "Tenant does not have capability to set IsRepairTenant", nil)
+		}
+	}
+
 	// timeoutResp lets the closure signal a post-rollback handler — the
 	// TerminateWorkflow call has to run after the closure returns so that
 	// the DB tx unwinds before we make the second remote call. nil means
@@ -4873,8 +5234,7 @@ func (dih DeleteInstanceHandler) Handle(c echo.Context) error {
 
 		// Create status detail
 		sdDAO := cdbm.NewStatusDetailDAO(dih.dbSession)
-		_, derr = sdDAO.CreateFromParams(ctx, tx, instance.ID.String(), *cutil.GetPtr(cdbm.InstanceStatusTerminating),
-			cutil.GetPtr("Instance deletion successfully initiated on Site"))
+		_, derr = sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: instance.ID.String(), Status: *cutil.GetPtr(cdbm.InstanceStatusTerminating), Message: cutil.GetPtr("Instance deletion successfully initiated on Site")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 		}
@@ -4886,19 +5246,8 @@ func (dih DeleteInstanceHandler) Handle(c echo.Context) error {
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve client for Site", nil)
 		}
 
-		// Authorization stays in the handler: setting `IsRepairTenant`
-		// requires the tenant to carry the TargetedInstanceCreation
-		// capability. By the time `ToProto` runs the request is safe
-		// to trust.
-		if apiRequest.IsRepairTenant != nil && *apiRequest.IsRepairTenant {
-			if instance.Tenant.Config == nil || !instance.Tenant.Config.TargetedInstanceCreation {
-				logger.Warn().Msg("tenant does not have capability to set IsRepairTenant")
-				return cutil.NewAPIError(http.StatusForbidden, "Tenant does not have capability to set IsRepairTenant", nil)
-			}
-		}
-
 		// Prepare the delete/release request workflow object
-		releaseInstanceRequest := apiRequest.ToProto(instance)
+		releaseInstanceRequest := apiRequest.ToProto(instance, dbUser)
 
 		workflowOptions := temporalClient.StartWorkflowOptions{
 			ID:                       "instance-delete-" + instance.ID.String(),
@@ -4979,7 +5328,7 @@ func (dih DeleteInstanceHandler) Handle(c echo.Context) error {
 	// Return response
 	logger.Info().Msg("finishing API handler")
 
-	return c.String(http.StatusAccepted, "Deletion request was accepted")
+	return c.JSON(http.StatusAccepted, model.NewAPIDeletionAcceptedResponse())
 }
 
 // GetInstanceStatusDetailsHandler is the API Handler for getting Instance StatusDetail records
@@ -5064,7 +5413,7 @@ func (gisdh GetInstanceStatusDetailsHandler) Handle(c echo.Context) error {
 
 	// Get Tenant for this org
 	tnDAO := cdbm.NewTenantDAO(gisdh.dbSession)
-	tenants, err := tnDAO.GetAllByOrg(ctx, nil, org, nil)
+	tenants, _, err := tnDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{Orgs: []string{org}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving Tenant for this org")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant", nil)

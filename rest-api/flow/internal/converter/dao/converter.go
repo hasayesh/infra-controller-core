@@ -54,6 +54,10 @@ func powerStateFromDAO(ps *nicoapi.PowerState) string {
 		return "off"
 	case nicoapi.PowerStateDisabled:
 		return "disabled"
+	case nicoapi.PowerStateHibernating:
+		return "hibernating"
+	case nicoapi.PowerStateSleeping:
+		return "sleeping"
 	default:
 		return "unknown"
 	}
@@ -187,6 +191,7 @@ func TaskFrom(dao *model.Task) *taskdef.Task {
 		StartedAt:      dao.StartedAt,
 		FinishedAt:     dao.FinishedAt,
 		QueueExpiresAt: dao.QueueExpiresAt,
+		IdempotencyKey: dao.IdempotencyKey,
 	}
 }
 
@@ -319,6 +324,7 @@ func TaskTo(task *taskdef.Task) *model.Task {
 		Report:         task.Report,
 		AppliedRuleID:  task.AppliedRuleID,
 		QueueExpiresAt: task.QueueExpiresAt,
+		IdempotencyKey: task.IdempotencyKey,
 	}
 }
 
@@ -335,6 +341,7 @@ func OperationRunFrom(dao *model.OperationRun) *operationrun.OperationRun {
 		Status:            dao.Status,
 		StatusReason:      dao.StatusReason,
 		StatusMessage:     dao.StatusMessage,
+		CurrentPhaseIndex: dao.CurrentPhaseIndex,
 		Selector:          dao.Selector,
 		Options:           dao.Options,
 		OperationTemplate: dao.OperationTemplate,
@@ -360,6 +367,7 @@ func OperationRunTo(run *operationrun.OperationRun) *model.OperationRun {
 		Status:            run.Status,
 		StatusReason:      run.StatusReason,
 		StatusMessage:     run.StatusMessage,
+		CurrentPhaseIndex: run.CurrentPhaseIndex,
 		Selector:          run.Selector,
 		Options:           run.Options,
 		OperationTemplate: run.OperationTemplate,
@@ -380,19 +388,19 @@ func OperationRunTargetFrom(dao *model.OperationRunTarget) *operationrun.Operati
 	}
 
 	return &operationrun.OperationRunTarget{
-		ID:              dao.ID,
-		OperationRunID:  dao.OperationRunID,
-		RackID:          dao.RackID,
-		SequenceIndex:   dao.SequenceIndex,
-		PhaseIndex:      dao.PhaseIndex,
-		ComponentFilter: dao.ComponentFilter,
-		TaskID:          dao.TaskID,
-		Status:          dao.Status,
-		Message:         dao.Message,
-		RetryAfter:      dao.RetryAfter,
-		RetryState:      dao.RetryState,
-		CreatedAt:       dao.CreatedAt,
-		UpdatedAt:       dao.UpdatedAt,
+		ID:               dao.ID,
+		OperationRunID:   dao.OperationRunID,
+		RackID:           dao.RackID,
+		SequenceIndex:    dao.SequenceIndex,
+		PhaseIndex:       dao.PhaseIndex,
+		ComponentsByType: dao.ComponentsByType.Clone(),
+		TaskID:           dao.TaskID,
+		Status:           dao.Status,
+		Message:          dao.Message,
+		RetryAfter:       dao.RetryAfter,
+		RetryState:       dao.RetryState,
+		CreatedAt:        dao.CreatedAt,
+		UpdatedAt:        dao.UpdatedAt,
 	}
 }
 
@@ -404,19 +412,19 @@ func OperationRunTargetTo(target *operationrun.OperationRunTarget) *model.Operat
 	}
 
 	return &model.OperationRunTarget{
-		ID:              target.ID,
-		OperationRunID:  target.OperationRunID,
-		RackID:          target.RackID,
-		SequenceIndex:   target.SequenceIndex,
-		PhaseIndex:      target.PhaseIndex,
-		ComponentFilter: target.ComponentFilter,
-		TaskID:          target.TaskID,
-		Status:          target.Status,
-		Message:         target.Message,
-		RetryAfter:      target.RetryAfter,
-		RetryState:      target.RetryState,
-		CreatedAt:       target.CreatedAt,
-		UpdatedAt:       target.UpdatedAt,
+		ID:               target.ID,
+		OperationRunID:   target.OperationRunID,
+		RackID:           target.RackID,
+		SequenceIndex:    target.SequenceIndex,
+		PhaseIndex:       target.PhaseIndex,
+		ComponentsByType: target.ComponentsByType.Clone(),
+		TaskID:           target.TaskID,
+		Status:           target.Status,
+		Message:          target.Message,
+		RetryAfter:       target.RetryAfter,
+		RetryState:       target.RetryState,
+		CreatedAt:        target.CreatedAt,
+		UpdatedAt:        target.UpdatedAt,
 	}
 }
 

@@ -86,7 +86,7 @@ fn resolve_firmware_upgrade_source(
     Ok((firmware_version, access_token))
 }
 
-pub async fn on_demand_rack_maintenance(
+pub(super) async fn on_demand_rack_maintenance(
     api_client: &ApiClient,
     args: MaintenanceOptions,
 ) -> CarbideCliResult<()> {
@@ -121,7 +121,7 @@ pub async fn on_demand_rack_maintenance(
                     rpc::PowerSequenceActivity {},
                 )),
                 other => Err(eyre::eyre!(
-                    "Unknown activity '{}'. Valid values: firmware-upgrade, nvos-update, configure-nmx-cluster, power-sequence",
+                    "unknown activity '{}'. valid values: firmware-upgrade, nvos-update, configure-nmx-cluster, power-sequence",
                     other
                 )),
             }?;

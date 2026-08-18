@@ -34,6 +34,7 @@ use prometheus::proto::LabelPair;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder, proto,
 };
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::HealthError;
@@ -45,6 +46,138 @@ pub fn operation_duration_buckets_seconds() -> Vec<f64> {
     vec![
         1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0, 300.0,
     ]
+}
+
+pub fn bmc_latency_buckets_ms() -> Vec<f64> {
+    vec![
+        5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+        60_000.0,
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BmcLatencyAttribute {
+    HttpResponseStatusCode,
+    HttpRequestMethod,
+    HttpPath,
+    ServerAddress,
+    UrlScheme,
+    BmcVendor,
+    BmcModel,
+    EntityType,
+    MachineId,
+    RackId,
+}
+
+impl BmcLatencyAttribute {
+    pub const ATTRIBUTES: [Self; 10] = [
+        Self::HttpResponseStatusCode,
+        Self::HttpRequestMethod,
+        Self::HttpPath,
+        Self::ServerAddress,
+        Self::UrlScheme,
+        Self::BmcVendor,
+        Self::BmcModel,
+        Self::EntityType,
+        Self::MachineId,
+        Self::RackId,
+    ];
+
+    pub fn label_name(self) -> &'static str {
+        match self {
+            Self::HttpResponseStatusCode => "http_response_status_code",
+            Self::HttpRequestMethod => "http_request_method",
+            Self::HttpPath => "http_path",
+            Self::ServerAddress => "server_address",
+            Self::UrlScheme => "url_scheme",
+            Self::BmcVendor => "bmc_vendor",
+            Self::BmcModel => "bmc_model",
+            Self::EntityType => "entity_type",
+            Self::MachineId => "machine_id",
+            Self::RackId => "rack_id",
+        }
+    }
+
+    pub fn from_label_name(label_name: &str) -> Option<Self> {
+        Self::ATTRIBUTES
+            .iter()
+            .copied()
+            .find(|attribute| attribute.label_name() == label_name)
+    }
+}
+
+#[derive(Clone)]
+pub struct BmcLatencyMetrics {
+    latency_ms: HistogramVec,
+    attributes: Vec<BmcLatencyAttribute>,
+}
+
+pub struct BmcLatencyObservation<'a> {
+    pub status_code: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub server_address: &'a str,
+    pub url_scheme: &'a str,
+    pub bmc_vendor: Option<&'a str>,
+    pub bmc_model: Option<&'a str>,
+    pub entity_type: &'a str,
+    pub machine_id: Option<&'a str>,
+    pub rack_id: Option<&'a str>,
+    pub duration: std::time::Duration,
+}
+
+impl BmcLatencyMetrics {
+    pub fn new(registry: &Registry, prefix: &str) -> Result<Self, prometheus::Error> {
+        Self::new_with_attributes(registry, prefix, &BmcLatencyAttribute::ATTRIBUTES)
+    }
+
+    pub fn new_with_attributes(
+        registry: &Registry,
+        prefix: &str,
+        attributes: &[BmcLatencyAttribute],
+    ) -> Result<Self, prometheus::Error> {
+        let label_names = attributes
+            .iter()
+            .map(|attribute| attribute.label_name())
+            .collect::<Vec<_>>();
+        let latency_ms = HistogramVec::new(
+            HistogramOpts::new(
+                format!("{prefix}_bmc_latency_ms"),
+                "Duration of outbound Redfish HTTP requests to BMCs, in milliseconds",
+            )
+            .buckets(bmc_latency_buckets_ms()),
+            &label_names,
+        )?;
+        registry.register(Box::new(latency_ms.clone()))?;
+
+        Ok(Self {
+            latency_ms,
+            attributes: attributes.to_vec(),
+        })
+    }
+
+    pub fn observe(&self, observation: BmcLatencyObservation<'_>) {
+        let labels = self
+            .attributes
+            .iter()
+            .map(|attribute| match attribute {
+                BmcLatencyAttribute::HttpResponseStatusCode => observation.status_code,
+                BmcLatencyAttribute::HttpRequestMethod => observation.method,
+                BmcLatencyAttribute::HttpPath => observation.path,
+                BmcLatencyAttribute::ServerAddress => observation.server_address,
+                BmcLatencyAttribute::UrlScheme => observation.url_scheme,
+                BmcLatencyAttribute::BmcVendor => observation.bmc_vendor.unwrap_or("unknown"),
+                BmcLatencyAttribute::BmcModel => observation.bmc_model.unwrap_or("unknown"),
+                BmcLatencyAttribute::EntityType => observation.entity_type,
+                BmcLatencyAttribute::MachineId => observation.machine_id.unwrap_or("unknown"),
+                BmcLatencyAttribute::RackId => observation.rack_id.unwrap_or("unknown"),
+            })
+            .collect::<Vec<_>>();
+        self.latency_ms
+            .with_label_values(&labels)
+            .observe(observation.duration.as_secs_f64() * 1_000.0);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +208,7 @@ impl ComponentMetrics {
         let failures_total = IntCounterVec::new(
             prometheus::Opts::new(
                 format!("{prefix}_component_failures_total"),
-                "Count of component operation failures",
+                "Number of component operation failures",
             ),
             &["component_kind", "component_name"],
         )?;
@@ -118,6 +251,10 @@ pub struct MetricsManager {
     global_registry: Registry,
     telemetry_registry: Registry,
     component_metrics: Arc<ComponentMetrics>,
+    /// The instrumentation framework's registry, exposed through the same
+    /// /metrics response so its events are scrapeable without migrating this
+    /// server off its raw prometheus pipeline. Set once at startup.
+    framework_registry: std::sync::OnceLock<Registry>,
 }
 
 impl MetricsManager {
@@ -130,6 +267,7 @@ impl MetricsManager {
             global_registry,
             telemetry_registry,
             component_metrics,
+            framework_registry: std::sync::OnceLock::new(),
         })
     }
 
@@ -157,8 +295,18 @@ impl MetricsManager {
         CollectorRegistry::new(id, self.telemetry_registry.clone(), prefix)
     }
 
+    /// Makes the instrumentation framework's registry part of every
+    /// subsequent /metrics response. A second call is ignored.
+    pub fn expose_framework_registry(&self, registry: Registry) {
+        let _ = self.framework_registry.set(registry);
+    }
+
     pub fn export_metrics(&self) -> Result<String, HealthError> {
-        export_registry(&self.global_registry)
+        let mut exposition = export_registry(&self.global_registry)?;
+        if let Some(framework) = self.framework_registry.get() {
+            exposition.push_str(&export_registry(framework)?);
+        }
+        Ok(exposition)
     }
 
     pub fn export_telemetry(&self) -> Result<String, HealthError> {
@@ -258,7 +406,11 @@ impl Collector for SubRegistry {
 impl Drop for CollectorRegistry {
     fn drop(&mut self) {
         if let Err(e) = self.parent.unregister(self.registry.clone()) {
-            tracing::error!(e=?e, "Could not properly drop registry for collector {}", self.prefix())
+            tracing::error!(
+                error = ?e,
+                collector_prefix = self.prefix().as_str(),
+                "Could not properly drop registry for collector"
+            )
         }
     }
 }
@@ -450,8 +602,8 @@ pub async fn run_metrics_server(
         .map_err(|e| Box::new(e) as BoxedErr)?;
 
     tracing::info!(
-        "Metrics server listening on {} (paths: /metrics, /telemetry, /livez)",
-        metrics_endpoint
+        %metrics_endpoint,
+        "Metrics server listening (paths: /metrics, /telemetry, /livez)"
     );
 
     loop {
@@ -543,6 +695,8 @@ pub fn sanitize_unit(unit: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::{Check, check_values};
+
     use super::*;
 
     #[test]
@@ -567,5 +721,79 @@ mod tests {
             assert_eq!(registry.registry.desc.fq_name, expected_fq_name);
             assert_eq!(registry.registry.desc.help, id);
         }
+    }
+
+    #[test]
+    fn sanitize_unit_cases() {
+        check_values(
+            [
+                Check {
+                    scenario: "percent symbol",
+                    input: "%",
+                    expect: "percent".to_string(),
+                },
+                Check {
+                    scenario: "degree Celsius",
+                    input: "°C",
+                    expect: "celsius".to_string(),
+                },
+                Check {
+                    scenario: "Celsius abbreviation",
+                    input: "c",
+                    expect: "celsius".to_string(),
+                },
+                Check {
+                    scenario: "Redfish Celsius unit",
+                    input: "CEL",
+                    expect: "celsius".to_string(),
+                },
+                Check {
+                    scenario: "degree Fahrenheit",
+                    input: "°F",
+                    expect: "fahrenheit".to_string(),
+                },
+                Check {
+                    scenario: "Fahrenheit abbreviation",
+                    input: "f",
+                    expect: "fahrenheit".to_string(),
+                },
+                Check {
+                    scenario: "volts",
+                    input: "V",
+                    expect: "volts".to_string(),
+                },
+                Check {
+                    scenario: "amperes",
+                    input: "A",
+                    expect: "amperes".to_string(),
+                },
+                Check {
+                    scenario: "amps alias",
+                    input: "Amps",
+                    expect: "amperes".to_string(),
+                },
+                Check {
+                    scenario: "watts",
+                    input: "W",
+                    expect: "watts".to_string(),
+                },
+                Check {
+                    scenario: "hertz",
+                    input: "Hz",
+                    expect: "hertz".to_string(),
+                },
+                Check {
+                    scenario: "revolutions per minute",
+                    input: "RPM",
+                    expect: "rpm".to_string(),
+                },
+                Check {
+                    scenario: "punctuation is normalized",
+                    input: "J/s",
+                    expect: "j_s".to_string(),
+                },
+            ],
+            sanitize_unit,
+        );
     }
 }

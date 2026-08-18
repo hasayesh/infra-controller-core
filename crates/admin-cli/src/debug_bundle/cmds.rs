@@ -494,35 +494,35 @@ impl LogEntry {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaResponse {
-    pub results: GrafanaResults,
+struct GrafanaResponse {
+    results: GrafanaResults,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaResults {
+struct GrafanaResults {
     #[serde(rename = "A")]
-    pub a: GrafanaFrameResult,
+    a: GrafanaFrameResult,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaFrameResult {
-    pub status: u16,
-    pub frames: Vec<GrafanaFrame>,
+struct GrafanaFrameResult {
+    status: u16,
+    frames: Vec<GrafanaFrame>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaFrame {
-    pub data: GrafanaFrameData,
+struct GrafanaFrame {
+    data: GrafanaFrameData,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaFrameData {
-    pub values: Vec<Vec<GrafanaValue>>,
+struct GrafanaFrameData {
+    values: Vec<Vec<GrafanaValue>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
-pub enum GrafanaValue {
+enum GrafanaValue {
     Int(i64),       // For timestamps (values[1])
     String(String), // For log messages (values[2]) and nanosecond timestamps (values[3])
     Object(serde_json::Value),
@@ -559,10 +559,10 @@ struct LokiDatasource {
 // Grafana Datasource API Response Structs
 #[derive(Deserialize, Debug)]
 struct GrafanaDatasource {
-    pub uid: String,
-    pub name: String,
+    uid: String,
+    name: String,
     #[serde(rename = "type")]
-    pub datasource_type: String,
+    datasource_type: String,
 }
 
 // Site Controller Details - Holds BMC endpoint exploration data
@@ -580,6 +580,7 @@ struct MachineAnalysis {
 }
 
 /// Helper function to get BMC IP and MAC address from machine_id
+#[allow(deprecated)]
 async fn get_bmc_ip_from_host_id(
     api_client: &ApiClient,
     host_id: &str,
@@ -783,7 +784,7 @@ async fn get_machine_analysis(
 /// let api_client = ApiClient::new(config).await?;
 /// handle_debug_bundle(bundle_config, &api_client).await?;
 /// ```
-pub async fn handle_debug_bundle(
+pub(crate) async fn handle_debug_bundle(
     debug_bundle: DebugBundle,
     api_client: &ApiClient,
 ) -> CarbideCliResult<()> {
@@ -1698,6 +1699,7 @@ impl<'a> ZipBundleCreator<'a> {
         Ok(())
     }
 
+    #[allow(deprecated)]
     fn add_machine_analysis_json(
         &self,
         zip: &mut ZipWriter<File>,
@@ -1801,6 +1803,7 @@ impl<'a> ZipBundleCreator<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
     fn add_metadata(
         &self,
         zip: &mut ZipWriter<File>,

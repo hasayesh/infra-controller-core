@@ -38,6 +38,7 @@ pub enum MachineValidationTestSelectionMode {
 /// latency, SSD I/O, etc.) run after ingestion to verify
 /// hardware health.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineValidationConfig {
     /// Enables machine validation testing.
     #[serde(default)]
@@ -79,6 +80,7 @@ pub struct MachineValidationConfig {
 /// ]
 /// ```
 #[derive(Default, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineValidationTestConfig {
     /// Unique test identifier (e.g., "MmMemLatency").
     pub id: String,
@@ -87,6 +89,12 @@ pub struct MachineValidationTestConfig {
 }
 
 impl MachineValidationConfig {
+    /// Minimum allowed stale timeout.
+    ///
+    /// Scout sends machine validation heartbeats every 30 seconds. Keep the timeout above three
+    /// missed beats so a low configured value cannot fail healthy active runs between heartbeats.
+    pub const MIN_STALE_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
     const fn default_run_interval() -> std::time::Duration {
         std::time::Duration::from_secs(60)
     }

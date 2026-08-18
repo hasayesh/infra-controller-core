@@ -22,13 +22,13 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use axum::routing::any;
+use carbide_axum_utils::router::call_router_with_new_request;
 use tracing::instrument;
 
 use crate::Callbacks;
-use crate::http::call_router_with_new_request;
 use crate::injection::InjectionStore;
 
-pub fn append(
+pub(super) fn append(
     mat_host_id: String,
     router: Router,
     injection: Arc<InjectionStore>,
@@ -58,7 +58,12 @@ async fn process(State(mut state): State<Middleware>, request: Request<Body>) ->
     let response = state.injection.post_handle(&path, response).await;
 
     if !response.status().is_success() {
-        tracing::warn!(method = %method, path, status = %response.status());
+        tracing::warn!(
+            method = %method,
+            path,
+            http_status = %response.status(),
+            "BMC mock request returned unsuccessful response"
+        );
     }
     if !is_safe && response.status().is_success() {
         state.callbacks.state_refresh_indication();

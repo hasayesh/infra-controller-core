@@ -36,10 +36,12 @@ use serde::Deserialize;
 use super::pagination::{self, PageContext, PaginationParams};
 use super::{Base, filters};
 use crate::action_status::{self, ActionStatus};
+use crate::site_explorer_run_status::SiteExplorerLastRunDisplay;
 
 #[derive(Template)]
 #[template(path = "explored_endpoints_show.html")]
 struct ExploredEndpointsShow {
+    last_run: Option<SiteExplorerLastRunDisplay>,
     vendors: Vec<String>,
     endpoints: Vec<ExploredEndpointDisplay>,
     filter_name: &'static str,
@@ -52,9 +54,14 @@ struct ExploredEndpointsShow {
 #[derive(Template)]
 #[template(path = "explored_endpoints_show_paired.html")]
 struct ExploredEndpointsShowPaired {
+    last_run: Option<SiteExplorerLastRunDisplay>,
     managed_hosts: Vec<ExploredManagedHostDisplay>,
     page: PageContext,
     missing_default_credentials: Vec<DefaultCredential>,
+}
+
+fn last_run_from_report(report: &SiteExplorationReport) -> Option<SiteExplorerLastRunDisplay> {
+    report.last_run.as_ref().map(Into::into)
 }
 
 fn managed_hosts_from_report(report: &SiteExplorationReport) -> Vec<ExploredManagedHostDisplay> {
@@ -157,14 +164,14 @@ impl From<&ExploredEndpoint> for ExploredEndpointDisplay {
                 .map(|report| report.endpoint_type.clone())
                 .unwrap_or_default(),
             last_exploration_error: report_ref
-                .and_then(|report| report.last_exploration_error.clone())
+                .map(|report| report.last_exploration_error_display())
                 .unwrap_or_default(),
             last_exploration_latency: report_ref
                 .and_then(|report| report.last_exploration_latency.as_ref())
                 .map(|latency| latency.seconds),
             has_exploration_error: report_ref
-                .and_then(|report| report.last_exploration_error.as_ref())
-                .is_some(),
+                .map(|report| report.has_last_exploration_error())
+                .unwrap_or_default(),
             bmc_mac_addrs: report_ref
                 .map(|report| {
                     report
@@ -208,14 +215,14 @@ impl From<&ExploredEndpoint> for ExploredEndpointDisplay {
 }
 
 /// List explored endpoints
-pub async fn show_html_all(
+pub(super) async fn show_html_all(
     AxumState(state): AxumState<Arc<Api>>,
     Query(mut params): Query<HashMap<String, String>>,
 ) -> Response {
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -253,6 +260,7 @@ pub async fn show_html_all(
     let (info, endpoints) = pagination::paginate_vec(filtered, &pagination_params);
 
     let tmpl = ExploredEndpointsShow {
+        last_run: last_run_from_report(&report),
         filter_name: "All",
         vendors,
         endpoints,
@@ -265,14 +273,14 @@ pub async fn show_html_all(
     (StatusCode::OK, Html(tmpl.render().unwrap())).into_response()
 }
 
-pub async fn show_html_paired(
+pub(super) async fn show_html_paired(
     AxumState(state): AxumState<Arc<Api>>,
     Query(params): Query<PaginationParams>,
 ) -> Response {
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -285,6 +293,7 @@ pub async fn show_html_paired(
     let (info, managed_hosts) = pagination::paginate_vec(all_hosts, &params);
 
     let tmpl = ExploredEndpointsShowPaired {
+        last_run: last_run_from_report(&report),
         managed_hosts,
         page: PageContext::new(info, "/admin/explored-endpoint/paired"),
         missing_default_credentials: state.missing_default_credentials().await,
@@ -292,14 +301,14 @@ pub async fn show_html_paired(
     (StatusCode::OK, Html(tmpl.render().unwrap())).into_response()
 }
 
-pub async fn show_html_unpaired(
+pub(super) async fn show_html_unpaired(
     AxumState(state): AxumState<Arc<Api>>,
     Query(mut params): Query<HashMap<String, String>>,
 ) -> Response {
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -337,7 +346,7 @@ pub async fn show_html_unpaired(
             .map(|pair| pair.bmc_ip)
             .collect(),
         Err(err) => {
-            tracing::error!(%err, "find_machine_ids_by_bmc_ips");
+            tracing::error!(error = %err, "find_machine_ids_by_bmc_ips");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error find_machine_ids_by_bmc_ips",
@@ -374,6 +383,7 @@ pub async fn show_html_unpaired(
     let (info, endpoints) = pagination::paginate_vec(filtered, &pagination_params);
 
     let tmpl = ExploredEndpointsShow {
+        last_run: last_run_from_report(&report),
         filter_name: "Unpaired",
         vendors,
         endpoints,
@@ -386,11 +396,11 @@ pub async fn show_html_unpaired(
     (StatusCode::OK, Html(tmpl.render().unwrap())).into_response()
 }
 
-pub async fn show_all_json(AxumState(state): AxumState<Arc<Api>>) -> Response {
+pub(super) async fn show_all_json(AxumState(state): AxumState<Arc<Api>>) -> Response {
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -467,11 +477,11 @@ impl From<ExploredEndpointInfo> for ExploredEndpointDetail<'_> {
 
         Self {
             last_exploration_error: report_ref
-                .and_then(|report| report.last_exploration_error.clone())
+                .map(|report| report.last_exploration_error_display())
                 .unwrap_or_default(),
             has_exploration_error: report_ref
-                .and_then(|report| report.last_exploration_error.as_ref())
-                .is_some(),
+                .map(|report| report.has_last_exploration_error())
+                .unwrap_or_default(),
             machine_setup_status: machine_setup_status_to_string(
                 report_ref.and_then(|report| report.machine_setup_status.as_ref()),
             ),
@@ -495,14 +505,14 @@ impl From<ExploredEndpointInfo> for ExploredEndpointDetail<'_> {
 
 /// Fetch a single explored endpoint
 /// TODO: The API is rather inefficient since it loads all of them and filters client side
-pub async fn fetch_explored_endpoint(
+async fn fetch_explored_endpoint(
     api: &Api,
     endpoint_ip: String,
 ) -> Result<ExploredEndpoint, Response> {
     let report = match fetch_explored_endpoints(api).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -525,7 +535,7 @@ pub async fn fetch_explored_endpoint(
     Ok(endpoint)
 }
 /// View details of an explored endpoint
-pub async fn detail(
+pub(super) async fn detail(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
     Query(params): Query<HashMap<String, String>>,
@@ -554,7 +564,7 @@ pub async fn detail(
     {
         Ok(response) => response.into_inner().in_managed_host,
         Err(err) => {
-            tracing::error!(%err, "is_bmc_in_managed_host check failed");
+            tracing::error!(error = %err, "is_bmc_in_managed_host check failed");
             // Default to true if we can't determine the status so we can't delete the endpoint
             true
         }
@@ -579,7 +589,7 @@ pub async fn detail(
                 }
             }
             Err(err) => {
-                tracing::error!(%err, "find_machine_ids_by_bmc_ips");
+                tracing::error!(error = %err, "find_machine_ids_by_bmc_ips");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error find_machine_ids_by_bmc_ips",
@@ -617,7 +627,7 @@ pub async fn detail(
                 }
             }
             Err(err) => {
-                tracing::error!(%err, endpoint_ip = %endpoint_ip, "bmc_credential_status");
+                tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "bmc_credential_status");
                 "Not Configured".to_string()
             }
         }
@@ -636,7 +646,7 @@ pub async fn detail(
     (StatusCode::OK, Html(display.render().unwrap())).into_response()
 }
 
-pub async fn re_explore(
+pub(super) async fn re_explore(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
     Form(form): Form<ReExploreEndpointAction>,
@@ -651,14 +661,14 @@ pub async fn re_explore(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip, "re_explore_endpoint");
+        tracing::error!(error = %err, bmc_ip_address = endpoint_ip, "re_explore_endpoint");
         return Redirect::to(&view_url);
     }
 
     Redirect::to(&view_url)
 }
 
-pub async fn refresh_endpoint(
+pub(super) async fn refresh_endpoint(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> impl IntoResponse {
@@ -675,8 +685,8 @@ pub async fn refresh_endpoint(
             let has_error = ep
                 .report
                 .as_ref()
-                .and_then(|r| r.last_exploration_error.as_ref())
-                .is_some();
+                .map(|report| report.has_last_exploration_error())
+                .unwrap_or_default();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "has_exploration_error": has_error })),
@@ -687,9 +697,10 @@ pub async fn refresh_endpoint(
             let status_code = match err.code() {
                 tonic::Code::AlreadyExists => StatusCode::CONFLICT,
                 tonic::Code::NotFound => StatusCode::NOT_FOUND,
+                tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            tracing::error!(%err, endpoint_ip, "refresh_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = endpoint_ip, "refresh_endpoint");
             (
                 status_code,
                 Json(serde_json::json!({ "error": err.message() })),
@@ -699,7 +710,7 @@ pub async fn refresh_endpoint(
     }
 }
 
-pub async fn pause_remediation(
+pub(super) async fn pause_remediation(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
     Form(form): Form<PauseRemediationAction>,
@@ -716,7 +727,7 @@ pub async fn pause_remediation(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip, "pause_explored_endpoint_remediation");
+        tracing::error!(error = %err, bmc_ip_address = endpoint_ip, "pause_explored_endpoint_remediation");
         return Redirect::to(&view_url);
     }
 
@@ -724,12 +735,12 @@ pub async fn pause_remediation(
 }
 
 #[derive(Deserialize, Debug)]
-pub struct ReExploreEndpointAction {
+pub(super) struct ReExploreEndpointAction {
     if_version_match: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct PauseRemediationAction {
+pub(super) struct PauseRemediationAction {
     pause: bool,
 }
 
@@ -759,14 +770,14 @@ fn query_filter_for(
         .and_then(|v| v.parse::<bool>().ok())
         .unwrap_or(false)
     {
-        Box::new(|ep: &ExploredEndpointDisplay| !ep.last_exploration_error.is_empty())
+        Box::new(|ep: &ExploredEndpointDisplay| ep.has_exploration_error)
     } else {
         Box::new(|_| true)
     };
     Box::new(move |x| vf(x) && ef(x))
 }
 
-pub async fn power_control(
+pub(super) async fn power_control(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
     Form(form): Form<PowerControlEndpointAction>,
@@ -780,7 +791,7 @@ pub async fn power_control(
     };
 
     let Some(act) = admin_power_control_request::SystemPowerControl::from_str_name(&action) else {
-        tracing::error!(endpoint_ip = %endpoint_ip, action = %action, "power_control_endpoint invalid action");
+        tracing::error!(bmc_ip_address = %endpoint_ip, action = %action, "power_control_endpoint invalid action");
         let redirect_url = ActionStatus {
             action: action_status::Type::Power,
             class: action_status::Class::Error,
@@ -830,7 +841,7 @@ pub async fn power_control(
             Redirect::to(&redirect_url).into_response()
         }
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, action = %action, "power_control_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, action = %action, "power_control_endpoint");
             let redirect_url = ActionStatus {
                 action: action_status::Type::Power,
                 class: action_status::Class::Error,
@@ -843,12 +854,12 @@ pub async fn power_control(
 }
 
 #[derive(Deserialize, Debug)]
-pub struct PowerControlEndpointAction {
+pub(super) struct PowerControlEndpointAction {
     action: Option<String>,
     redirect_to: Option<String>,
 }
 
-pub async fn bmc_reset(
+pub(super) async fn bmc_reset(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
     Form(form): Form<BmcResetEndpointAction>,
@@ -885,7 +896,7 @@ pub async fn bmc_reset(
             Redirect::to(&redirect_url).into_response()
         }
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, use_ipmi = %use_ipmi, "bmc_reset_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, use_ipmi = %use_ipmi, "bmc_reset_endpoint");
             let redirect_url = ActionStatus {
                 action: action_status::Type::ResetBmc,
                 class: action_status::Class::Error,
@@ -898,22 +909,22 @@ pub async fn bmc_reset(
 }
 
 #[derive(Deserialize, Debug)]
-pub struct BmcResetEndpointAction {
+pub(super) struct BmcResetEndpointAction {
     use_ipmi: Option<String>,
     redirect_to: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct MachineSetupAction {
+pub(super) struct MachineSetupAction {
     boot_interface_mac: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct DpuFirstBootOrderAction {
+pub(super) struct DpuFirstBootOrderAction {
     boot_interface_mac: Option<String>,
 }
 
-pub async fn clear_last_exploration_error(
+pub(super) async fn clear_last_exploration_error(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> Response {
@@ -928,14 +939,14 @@ pub async fn clear_last_exploration_error(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip = %endpoint_ip, "clear_last_exploration_error_endpoint");
+        tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "clear_last_exploration_error_endpoint");
         return (StatusCode::INTERNAL_SERVER_ERROR, err.message().to_owned()).into_response();
     }
 
     Redirect::to(&view_url).into_response()
 }
 
-pub async fn clear_bmc_credentials(
+pub(super) async fn clear_bmc_credentials(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> Response {
@@ -947,7 +958,7 @@ pub async fn clear_bmc_credentials(
     let mac_address = match state.find_mac_address_by_bmc_ip(req).await {
         Ok(res) => res.into_inner().mac_address,
         Err(err) => {
-            tracing::error!(%err, "find_mac_address_by_bmc_ip");
+            tracing::error!(error = %err, "find_mac_address_by_bmc_ip");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error find_mac_address_by_bmc_ip",
@@ -965,14 +976,14 @@ pub async fn clear_bmc_credentials(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip = %endpoint_ip, "clear_bmc_credentials");
+        tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "clear_bmc_credentials");
         return (StatusCode::INTERNAL_SERVER_ERROR, err.message().to_owned()).into_response();
     }
 
     Redirect::to(&view_url).into_response()
 }
 
-pub async fn disable_secure_boot(
+pub(super) async fn disable_secure_boot(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> Response {
@@ -993,7 +1004,7 @@ pub async fn disable_secure_boot(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "disable_secure_boot");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "disable_secure_boot");
             ActionStatus {
                 action: action_status::Type::DisableSecureBoot,
                 class: action_status::Class::Error,
@@ -1006,7 +1017,7 @@ pub async fn disable_secure_boot(
     Redirect::to(&redirect_url).into_response()
 }
 
-pub async fn disable_lockdown(
+pub(super) async fn disable_lockdown(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> Response {
@@ -1031,7 +1042,7 @@ pub async fn disable_lockdown(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "disable_lockdown");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "disable_lockdown");
             ActionStatus {
                 action: action_status::Type::DisableLockdown,
                 class: action_status::Class::Error,
@@ -1044,7 +1055,7 @@ pub async fn disable_lockdown(
     Redirect::to(&redirect_url).into_response()
 }
 
-pub async fn enable_lockdown(
+pub(super) async fn enable_lockdown(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> Response {
@@ -1069,7 +1080,7 @@ pub async fn enable_lockdown(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "enable_lockdown");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "enable_lockdown");
             ActionStatus {
                 action: action_status::Type::EnableLockdown,
                 class: action_status::Class::Error,
@@ -1082,7 +1093,7 @@ pub async fn enable_lockdown(
     Redirect::to(&redirect_url).into_response()
 }
 
-pub async fn machine_setup(
+pub(super) async fn machine_setup(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
     Form(form): Form<MachineSetupAction>,
@@ -1098,7 +1109,7 @@ pub async fn machine_setup(
     if let Some(ref mac) = boot_interface_mac
         && mac.parse::<mac_address::MacAddress>().is_err()
     {
-        tracing::error!(endpoint_ip = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
+        tracing::error!(bmc_ip_address = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
         let status = ActionStatus {
             action: action_status::Type::MachineSetup,
             class: action_status::Class::Error,
@@ -1122,11 +1133,11 @@ pub async fn machine_setup(
         Ok(_) => ActionStatus {
             action: action_status::Type::MachineSetup,
             class: action_status::Class::Success,
-            message: "Machine setup completed successfully".into(),
+            message: "Machine setup request accepted".into(),
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "bmc_machine_setup");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "bmc_machine_setup");
             ActionStatus {
                 action: action_status::Type::MachineSetup,
                 class: action_status::Class::Error,
@@ -1139,7 +1150,7 @@ pub async fn machine_setup(
     Redirect::to(&redirect_url).into_response()
 }
 
-pub async fn set_dpu_first_boot_order(
+pub(super) async fn set_dpu_first_boot_order(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
     Form(form): Form<DpuFirstBootOrderAction>,
@@ -1156,7 +1167,7 @@ pub async fn set_dpu_first_boot_order(
     if let Some(ref mac) = boot_interface_mac
         && mac.parse::<mac_address::MacAddress>().is_err()
     {
-        tracing::error!(endpoint_ip = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
+        tracing::error!(bmc_ip_address = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
         let redirect_url = ActionStatus {
             action: action_status::Type::SetFirstBootOrder,
             class: action_status::Class::Error,
@@ -1183,11 +1194,11 @@ pub async fn set_dpu_first_boot_order(
         Ok(_) => ActionStatus {
             action: action_status::Type::SetFirstBootOrder,
             class: action_status::Class::Success,
-            message: "Boot order updated successfully".into(),
+            message: "Boot-interface request accepted".into(),
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "set_dpu_first_boot_order");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "set_dpu_first_boot_order");
             ActionStatus {
                 action: action_status::Type::SetFirstBootOrder,
                 class: action_status::Class::Error,
@@ -1200,17 +1211,16 @@ pub async fn set_dpu_first_boot_order(
     Redirect::to(&redirect_url).into_response()
 }
 
-/// Re-applies the host's resolved boot interface on demand.
+/// Requests another pass for the host's resolved boot interface.
 ///
 /// This takes no MAC from the operator: it reuses `set_dpu_first_boot_order`
 /// with `boot_interface_mac: None`, which makes the backend resolve the boot
 /// interface the same way every other flow does -- the owning machine's
 /// designated interface (`primary_interface` + its captured Redfish interface
 /// id) once a machine owns this endpoint, or site-explorer's automatic default
-/// for a not-yet-managed endpoint -- and set it boot-first via the usual
-/// MAC-first / interface-id fallback. One click to put the BMC's boot order
-/// back in line with what Carbide would target.
-pub async fn restore_boot_interface(
+/// for a not-yet-managed endpoint. Managed hosts persist a fresh generation
+/// for machine-controller; unowned endpoints still apply it directly.
+pub(super) async fn restore_boot_interface(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> Response {
@@ -1233,11 +1243,11 @@ pub async fn restore_boot_interface(
         Ok(_) => ActionStatus {
             action: action_status::Type::RestoreBootInterface,
             class: action_status::Class::Success,
-            message: "Boot order re-applied from the resolved boot interface".into(),
+            message: "Boot-interface reconciliation request accepted".into(),
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "restore_boot_interface");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "restore_boot_interface");
             ActionStatus {
                 action: action_status::Type::RestoreBootInterface,
                 class: action_status::Class::Error,
@@ -1250,7 +1260,7 @@ pub async fn restore_boot_interface(
     Redirect::to(&redirect_url).into_response()
 }
 
-pub async fn delete_endpoint(
+pub(super) async fn delete_endpoint(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
 ) -> Response {
@@ -1267,13 +1277,13 @@ pub async fn delete_endpoint(
     {
         Ok(response) => {
             if response.deleted {
-                tracing::info!(endpoint_ip = %endpoint_ip, "Successfully deleted explored endpoint");
+                tracing::info!(bmc_ip_address = %endpoint_ip, "Successfully deleted explored endpoint");
             } else {
-                tracing::warn!(endpoint_ip = %endpoint_ip, message = ?response.message, "Failed to delete explored endpoint");
+                tracing::warn!(bmc_ip_address = %endpoint_ip, reason = ?response.message, "Failed to delete explored endpoint");
             }
         }
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "delete_explored_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "delete_explored_endpoint");
             return (StatusCode::INTERNAL_SERVER_ERROR, err.message().to_owned()).into_response();
         }
     }
@@ -1331,3 +1341,65 @@ fn lockdown_status_to_string(status: Option<&LockdownStatus>) -> String {
 impl super::Base for ExploredEndpointsShow {}
 impl super::Base for ExploredEndpointsShowPaired {}
 impl<'a> super::Base for ExploredEndpointDetail<'a> {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use askama::Template;
+    use rpc::site_explorer::{EndpointExplorationReport, ExploredEndpoint, OperatorErrorSchema};
+
+    use super::{ExploredEndpointDisplay, ExploredEndpointsShow, query_filter_for};
+    use crate::pagination::PageContext;
+
+    fn endpoint(address: &str, schema: Option<OperatorErrorSchema>) -> ExploredEndpoint {
+        ExploredEndpoint {
+            address: address.to_string(),
+            report: Some(EndpointExplorationReport {
+                last_exploration_error_schema: schema,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn endpoint_error_html_and_filter_render_structured_and_clear_reports() {
+        let error = endpoint(
+            "192.0.2.20",
+            Some(OperatorErrorSchema {
+                error_code: "NICO-SITEEXPLORER-122".to_string(),
+                mitigation: Some("Check the HCL".to_string()),
+                text: "BMC vendor missing".to_string(),
+            }),
+        );
+        let clear = endpoint("192.0.2.21", None);
+        let error = ExploredEndpointDisplay::from(&error);
+        let clear = ExploredEndpointDisplay::from(&clear);
+
+        let errors_only = query_filter_for(HashMap::from([(
+            "errors-only".to_string(),
+            "true".to_string(),
+        )]));
+        assert!(errors_only(&error));
+        assert!(!errors_only(&clear));
+
+        let rendered = ExploredEndpointsShow {
+            last_run: None,
+            vendors: Vec::new(),
+            endpoints: vec![error, clear],
+            filter_name: "All",
+            active_vendor_filter: "all".to_string(),
+            is_errors_only: false,
+            page: PageContext::all(2, "/admin/explored-endpoint"),
+            missing_default_credentials: Vec::new(),
+        }
+        .render()
+        .expect("template renders");
+
+        assert!(rendered.contains("NICO-SITEEXPLORER-122"));
+        assert!(rendered.contains("192.0.2.20"));
+        assert!(rendered.contains("192.0.2.21"));
+        assert_eq!(rendered.matches("clearlasterror_action").count(), 1);
+    }
+}

@@ -27,12 +27,13 @@ use sqlx::postgres::PgRow;
 use sqlx::{FromRow, Row};
 
 use crate::StateSla;
+use crate::bmc_info::BmcInfo;
 use crate::controller_outcome::PersistentStateHandlerOutcome;
 use crate::health::HealthReportSources;
 use crate::metadata::Metadata;
 
 pub mod power_shelf_id;
-pub mod slas;
+mod slas;
 
 #[derive(Debug, Clone)]
 pub struct NewPowerShelf {
@@ -73,10 +74,36 @@ pub struct PowerShelf {
 
     pub bmc_mac_address: Option<MacAddress>,
 
+    /// Operator "force-converge this power shelf PMC now" request. When
+    /// `true`, the power-shelf state controller enters `RotatingBmc` and
+    /// force-converges the PMC on its next sweep, bypassing the passive
+    /// site-wide gate and the device's backoff quarantine. A power shelf has
+    /// exactly one BMC, so the flag's presence on the row names the target
+    /// device.
+    pub bmc_credential_rotation_requested: bool,
+
+    /// BMC/PMC endpoint (MAC/IP + machine-interface id) resolved from the `Bmc`
+    /// machine_interface linked back to this power shelf. Populated by the
+    /// standard power-shelf load query, so every consumer (handlers, state
+    /// machines) gets it without re-resolving. `None` when no BMC interface is
+    /// linked yet.
+    pub bmc_info: Option<BmcInfo>,
+
     /// The rack that this power shelf is associated with.
     pub rack_id: Option<RackId>,
 
     pub power_shelf_maintenance_requested: Option<PowerShelfMaintenanceRequest>,
+
+    /// Set by rack maintenance to request power-shelf participation in a
+    /// rack-level firmware upgrade. When the power shelf is Ready and
+    /// rack-firmware reprovisioning is enabled on the controller, it
+    /// transitions to `ReProvisioning`.
+    pub power_shelf_reprovisioning_requested: Option<PowerShelfReprovisionRequest>,
+
+    /// Per-device firmware upgrade status written by the rack state machine
+    /// during rack-level firmware upgrades. Read by
+    /// `ReProvisioning::WaitingForRackFirmwareUpgrade`.
+    pub firmware_upgrade_status: Option<crate::rack::RackFirmwareUpgradeStatus>,
 
     // Columns for these exist, but are unused in rust code
     // pub created: DateTime<Utc>,
@@ -97,6 +124,12 @@ impl<'r> FromRow<'r, PgRow> for PowerShelf {
         let power_shelf_maintenance_requested: Option<
             sqlx::types::Json<PowerShelfMaintenanceRequest>,
         > = row.try_get("power_shelf_maintenance_requested").ok();
+        let power_shelf_reprovisioning_requested: Option<
+            sqlx::types::Json<PowerShelfReprovisionRequest>,
+        > = row.try_get("power_shelf_reprovisioning_requested").ok();
+        let firmware_upgrade_status: Option<
+            sqlx::types::Json<crate::rack::RackFirmwareUpgradeStatus>,
+        > = row.try_get("firmware_upgrade_status").ok();
 
         let health_reports: HealthReportSources = row
             .try_get::<sqlx::types::Json<HealthReportSources>, _>("health_reports")
@@ -108,12 +141,21 @@ impl<'r> FromRow<'r, PgRow> for PowerShelf {
             description: row.try_get("description")?,
             labels: labels.0,
         };
+        let bmc_info = row
+            .try_get::<Option<sqlx::types::Json<BmcInfo>>, _>("bmc_info")
+            .ok()
+            .flatten()
+            .map(|j| j.0);
         Ok(PowerShelf {
             id: row.try_get("id")?,
             config: config.0,
             status: status.map(|s| s.0),
             deleted: row.try_get("deleted")?,
             bmc_mac_address: row.try_get("bmc_mac_address").ok().flatten(),
+            bmc_credential_rotation_requested: row
+                .try_get("bmc_credential_rotation_requested")
+                .unwrap_or(false),
+            bmc_info,
             controller_state: Versioned {
                 value: controller_state.0,
                 version: row.try_get("controller_state_version")?,
@@ -123,6 +165,8 @@ impl<'r> FromRow<'r, PgRow> for PowerShelf {
             version: row.try_get("version")?,
             rack_id: row.try_get("rack_id").ok().flatten(),
             power_shelf_maintenance_requested: power_shelf_maintenance_requested.map(|r| r.0),
+            power_shelf_reprovisioning_requested: power_shelf_reprovisioning_requested.map(|r| r.0),
+            firmware_upgrade_status: firmware_upgrade_status.map(|j| j.0),
             health_reports,
         })
     }
@@ -165,6 +209,30 @@ pub struct PowerShelfMaintenanceRequest {
     pub operation: PowerShelfMaintenanceOperation,
 }
 
+/// Set by an external entity (typically rack maintenance) to request power-shelf
+/// participation in rack-level reprovisioning. When the power shelf is Ready and
+/// rack-firmware reprovisioning is enabled, the controller transitions to
+/// `ReProvisioning`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerShelfReprovisionRequest {
+    pub requested_at: DateTime<Utc>,
+    pub initiator: String,
+    /// Rack maintenance activities that initiated this request. The power shelf
+    /// controller uses these to decide whether to wait for firmware. Empty means
+    /// all activities.
+    #[serde(default)]
+    pub activities: Vec<crate::rack::MaintenanceActivity>,
+}
+
+/// Sub-state for PowerShelfControllerState::ReProvisioning
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
+pub enum ReProvisioningState {
+    /// Rack-level firmware upgrade in progress; the rack state machine manages the
+    /// upgrade and clears `power_shelf_reprovisioning_requested` when done.
+    WaitingForRackFirmwareUpgrade,
+}
+
 /// State of a PowerShelf as tracked by the controller
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
@@ -178,8 +246,22 @@ pub enum PowerShelfControllerState {
     /// The PowerShelf is ready for use.
     Ready,
 
+    /// The PowerShelf's BMC (PMC) credential is being converged to the staged
+    /// site-wide rotation target, entered from `Ready` at lowest
+    /// precedence. The shared engine owns crash-safety and per-device backoff,
+    /// so this state carries only a retry budget for transient handler failures.
+    RotatingBmc {
+        #[serde(default)]
+        retry_count: u32,
+    },
+
     Maintenance {
         operation: PowerShelfMaintenanceOperation,
+    },
+
+    /// Rack-driven firmware wait in progress.
+    ReProvisioning {
+        reprovisioning_state: ReProvisioningState,
     },
     /// There is error in PowerShelf; PowerShelf can not be used if it's in error.
     Error { cause: String },
@@ -208,8 +290,16 @@ pub fn state_sla(state: &PowerShelfControllerState, state_version: &ConfigVersio
             time_in_state,
         ),
         PowerShelfControllerState::Ready => StateSla::no_sla(),
+        PowerShelfControllerState::RotatingBmc { .. } => StateSla::with_sla(
+            std::time::Duration::from_secs(slas::ROTATING_BMC),
+            time_in_state,
+        ),
         PowerShelfControllerState::Maintenance { .. } => StateSla::with_sla(
             std::time::Duration::from_secs(slas::MAINTENANCE),
+            time_in_state,
+        ),
+        PowerShelfControllerState::ReProvisioning { .. } => StateSla::with_sla(
+            std::time::Duration::from_secs(slas::REPROVISIONING),
             time_in_state,
         ),
         PowerShelfControllerState::Error { .. } => StateSla::no_sla(),
@@ -276,6 +366,13 @@ mod tests {
                 )),
             }
 
+            "rotatingbmc carries its retry count" {
+                PowerShelfControllerState::RotatingBmc { retry_count: 4 } => Yields((
+                    r#"{"state":"rotatingbmc","retry_count":4}"#.to_string(),
+                    PowerShelfControllerState::RotatingBmc { retry_count: 4 },
+                )),
+            }
+
             "error with cause" {
                 PowerShelfControllerState::Error {
                     cause: "cause goes here".to_string(),
@@ -314,6 +411,18 @@ mod tests {
                         .to_string(),
                     PowerShelfControllerState::Maintenance {
                         operation: PowerShelfMaintenanceOperation::PowerOff,
+                    },
+                )),
+            }
+
+            "reprovisioning waiting for rack firmware" {
+                PowerShelfControllerState::ReProvisioning {
+                    reprovisioning_state: ReProvisioningState::WaitingForRackFirmwareUpgrade,
+                } => Yields((
+                    r#"{"state":"reprovisioning","reprovisioning_state":"WaitingForRackFirmwareUpgrade"}"#
+                        .to_string(),
+                    PowerShelfControllerState::ReProvisioning {
+                        reprovisioning_state: ReProvisioningState::WaitingForRackFirmwareUpgrade,
                     },
                 )),
             }
@@ -409,6 +518,18 @@ mod tests {
                 r#"{"state":"ready"}"# => Yields(PowerShelfControllerState::Ready),
             }
 
+            "rotatingbmc round-trips its retry count" {
+                r#"{"state":"rotatingbmc","retry_count":4}"# => Yields(PowerShelfControllerState::RotatingBmc {
+                    retry_count: 4,
+                }),
+            }
+
+            "rotatingbmc absent retry_count defaults to 0" {
+                r#"{"state":"rotatingbmc"}"# => Yields(PowerShelfControllerState::RotatingBmc {
+                    retry_count: 0,
+                }),
+            }
+
             "deleting tag" {
                 r#"{"state":"deleting"}"# => Yields(PowerShelfControllerState::Deleting),
             }
@@ -435,6 +556,14 @@ mod tests {
                 r#"{"state":"maintenance","operation":{"operation":"poweroff"}}"# => Yields(PowerShelfControllerState::Maintenance {
                     operation: PowerShelfMaintenanceOperation::PowerOff,
                 }),
+            }
+
+            "reprovisioning waiting for rack firmware" {
+                r#"{"state":"reprovisioning","reprovisioning_state":"WaitingForRackFirmwareUpgrade"}"# => Yields(
+                    PowerShelfControllerState::ReProvisioning {
+                        reprovisioning_state: ReProvisioningState::WaitingForRackFirmwareUpgrade,
+                    },
+                ),
             }
 
             "unknown tag is rejected" {
@@ -653,6 +782,16 @@ mod tests {
                 PowerShelfControllerState::Maintenance {
                     operation: PowerShelfMaintenanceOperation::PowerOff,
                 } => (secs(slas::MAINTENANCE), true),
+            }
+
+            "reprovisioning has the reprovisioning SLA" {
+                PowerShelfControllerState::ReProvisioning {
+                    reprovisioning_state: ReProvisioningState::WaitingForRackFirmwareUpgrade,
+                } => (secs(slas::REPROVISIONING), true),
+            }
+
+            "rotatingbmc has the rotating-bmc SLA" {
+                PowerShelfControllerState::RotatingBmc { retry_count: 0 } => (secs(slas::ROTATING_BMC), true),
             }
 
             "ready carries no SLA" {

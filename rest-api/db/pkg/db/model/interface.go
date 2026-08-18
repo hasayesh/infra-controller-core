@@ -12,7 +12,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 	"github.com/uptrace/bun"
 )
@@ -42,6 +42,18 @@ const (
 	InterfaceOrderByDefault = InterfaceOrderByCreated
 )
 
+// InterfaceVpcIPFamilyMode is the requested IP family mode for Core-managed VPC prefix selection.
+type InterfaceVpcIPFamilyMode string
+
+const (
+	// InterfaceVpcIPFamilyModeIPv4Only requests an IPv4 VPC prefix.
+	InterfaceVpcIPFamilyModeIPv4Only InterfaceVpcIPFamilyMode = "IPv4Only"
+	// InterfaceVpcIPFamilyModeIPv6Only requests an IPv6 VPC prefix.
+	InterfaceVpcIPFamilyModeIPv6Only InterfaceVpcIPFamilyMode = "IPv6Only"
+	// InterfaceVpcIPFamilyModeDualStack requests both IPv4 and IPv6 VPC prefixes.
+	InterfaceVpcIPFamilyModeDualStack InterfaceVpcIPFamilyMode = "DualStack"
+)
+
 var (
 	// InterfaceOrderByFields is a list of valid order by fields for the Interface model
 	InterfaceOrderByFields = []string{"status", "created", "updated"}
@@ -63,21 +75,21 @@ type InterfaceInlineRoutingProfile struct {
 }
 
 // ToProto converts this interface routing profile into its workflow proto representation.
-func (irp *InterfaceInlineRoutingProfile) ToProto() *cwssaws.InstanceInterfaceRoutingProfile {
+func (irp *InterfaceInlineRoutingProfile) ToProto() *corev1.InstanceInterfaceRoutingProfile {
 	if irp == nil {
 		return nil
 	}
-	profile := &cwssaws.InstanceInterfaceRoutingProfile{
-		AllowedAnycastPrefixes: make([]*cwssaws.PrefixFilterPolicyEntry, 0, len(irp.AllowedAnycastPrefixes)),
+	profile := &corev1.InstanceInterfaceRoutingProfile{
+		AllowedAnycastPrefixes: make([]*corev1.PrefixFilterPolicyEntry, 0, len(irp.AllowedAnycastPrefixes)),
 	}
 	for _, prefix := range irp.AllowedAnycastPrefixes {
-		profile.AllowedAnycastPrefixes = append(profile.AllowedAnycastPrefixes, &cwssaws.PrefixFilterPolicyEntry{Prefix: prefix})
+		profile.AllowedAnycastPrefixes = append(profile.AllowedAnycastPrefixes, &corev1.PrefixFilterPolicyEntry{Prefix: prefix})
 	}
 	return profile
 }
 
 // FromProto populates this routing profile from its workflow proto representation.
-func (irp *InterfaceInlineRoutingProfile) FromProto(proto *cwssaws.InstanceInterfaceRoutingProfile) {
+func (irp *InterfaceInlineRoutingProfile) FromProto(proto *corev1.InstanceInterfaceRoutingProfile) {
 	if proto == nil {
 		*irp = InterfaceInlineRoutingProfile{}
 		return
@@ -88,7 +100,7 @@ func (irp *InterfaceInlineRoutingProfile) FromProto(proto *cwssaws.InstanceInter
 	}
 }
 
-// Interface table maintains association between an instance and a subnet
+// Interface table maintains an Instance network association and its resolved state.
 type Interface struct {
 	bun.BaseModel `bun:"table:interface,alias:ifc"`
 
@@ -97,6 +109,9 @@ type Interface struct {
 	Instance             *Instance                      `bun:"rel:belongs-to,join:instance_id=id"`
 	SubnetID             *uuid.UUID                     `bun:"subnet_id,type:uuid"`
 	Subnet               *Subnet                        `bun:"rel:belongs-to,join:subnet_id=id"`
+	VpcID                *uuid.UUID                     `bun:"vpc_id,type:uuid"`
+	Vpc                  *Vpc                           `bun:"rel:belongs-to,join:vpc_id=id"`
+	VpcIPFamilyMode      *InterfaceVpcIPFamilyMode      `bun:"vpc_ip_family_mode"`
 	VpcPrefixID          *uuid.UUID                     `bun:"vpc_prefix_id,type:uuid"`
 	VpcPrefix            *VpcPrefix                     `bun:"rel:belongs-to,join:vpc_prefix_id=id"`
 	MachineInterfaceID   *uuid.UUID                     `bun:"machine_interface_id,type:uuid"`
@@ -120,6 +135,8 @@ type Interface struct {
 type InterfaceCreateInput struct {
 	InstanceID           uuid.UUID
 	SubnetID             *uuid.UUID
+	VpcID                *uuid.UUID
+	VpcIPFamilyMode      *InterfaceVpcIPFamilyMode
 	VpcPrefixID          *uuid.UUID
 	IsPhysical           bool
 	Device               *string
@@ -136,6 +153,8 @@ type InterfaceUpdateInput struct {
 	InterfaceID          uuid.UUID
 	InstanceID           *uuid.UUID
 	SubnetID             *uuid.UUID
+	VpcID                *uuid.UUID
+	VpcIPFamilyMode      *InterfaceVpcIPFamilyMode
 	VpcPrefixID          *uuid.UUID
 	Device               *string
 	DeviceInstance       *int
@@ -162,6 +181,7 @@ type InterfaceFilterInput struct {
 // InterfaceClearInput input parameters for Clear method
 type InterfaceClearInput struct {
 	InterfaceID          uuid.UUID
+	VpcPrefixID          bool
 	RequestedIpAddress   bool
 	InlineRoutingProfile bool
 }
@@ -186,6 +206,7 @@ var _ bun.BeforeCreateTableHook = (*Interface)(nil)
 func (it *Interface) BeforeCreateTable(ctx context.Context, query *bun.CreateTableQuery) error {
 	query.ForeignKey(`("instance_id") REFERENCES "instance" ("id")`).
 		ForeignKey(`("subnet_id") REFERENCES "subnet" ("id")`).
+		ForeignKey(`("vpc_id") REFERENCES "vpc" ("id")`).
 		ForeignKey(`("machine_interface_id") REFERENCES "machine_interface" ("id")`)
 	return nil
 }
@@ -384,7 +405,7 @@ func (ifcd InterfaceSQLDAO) GetAll(ctx context.Context, tx *db.Tx, filter Interf
 // The updated fields are assumed to be set to non-null values
 func (ifcd InterfaceSQLDAO) Update(ctx context.Context, tx *db.Tx, input InterfaceUpdateInput) (*Interface, error) {
 	// Create a child span and set the attributes for current request
-	ctx, interfaceDAOSpan := ifcd.tracerSpan.CreateChildInCurrentContext(ctx, "InterfaceDAO.UpdateFromParams")
+	ctx, interfaceDAOSpan := ifcd.tracerSpan.CreateChildInCurrentContext(ctx, "InterfaceDAO.Update")
 	if interfaceDAOSpan != nil {
 		defer interfaceDAOSpan.End()
 	}
@@ -409,6 +430,22 @@ func (ifcd InterfaceSQLDAO) Update(ctx context.Context, tx *db.Tx, input Interfa
 
 		if interfaceDAOSpan != nil {
 			ifcd.tracerSpan.SetAttribute(interfaceDAOSpan, "subnet_id", input.SubnetID.String())
+		}
+	}
+	if input.VpcID != nil {
+		is.VpcID = input.VpcID
+		updatedFields = append(updatedFields, "vpc_id")
+
+		if interfaceDAOSpan != nil {
+			ifcd.tracerSpan.SetAttribute(interfaceDAOSpan, "vpc_id", input.VpcID.String())
+		}
+	}
+	if input.VpcIPFamilyMode != nil {
+		is.VpcIPFamilyMode = input.VpcIPFamilyMode
+		updatedFields = append(updatedFields, "vpc_ip_family_mode")
+
+		if interfaceDAOSpan != nil {
+			ifcd.tracerSpan.SetAttribute(interfaceDAOSpan, "vpc_ip_family_mode", string(*input.VpcIPFamilyMode))
 		}
 	}
 	if input.VpcPrefixID != nil {
@@ -582,6 +619,8 @@ func (ifcd InterfaceSQLDAO) CreateMultiple(ctx context.Context, tx *db.Tx, input
 			ID:                   uuid.New(),
 			InstanceID:           input.InstanceID,
 			SubnetID:             input.SubnetID,
+			VpcID:                input.VpcID,
+			VpcIPFamilyMode:      input.VpcIPFamilyMode,
 			VpcPrefixID:          input.VpcPrefixID,
 			Device:               input.Device,
 			DeviceInstance:       input.DeviceInstance,
@@ -650,6 +689,10 @@ func (ifcd InterfaceSQLDAO) Clear(ctx context.Context, tx *db.Tx, input Interfac
 
 	updatedFields := []string{}
 
+	if input.VpcPrefixID {
+		i.VpcPrefixID = nil
+		updatedFields = append(updatedFields, "vpc_prefix_id")
+	}
 	if input.RequestedIpAddress {
 		i.RequestedIpAddress = nil
 		updatedFields = append(updatedFields, "requested_ip_address")

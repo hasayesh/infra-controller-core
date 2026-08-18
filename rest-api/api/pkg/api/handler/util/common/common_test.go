@@ -17,7 +17,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun/extra/bundebug"
+	tclient "go.temporal.io/sdk/client"
+	tmocks "go.temporal.io/sdk/mocks"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -49,6 +52,9 @@ func testCommonSetupSchema(t *testing.T, dbSession *cdb.Session) {
 	assert.Nil(t, err)
 	// create Tenant table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.Tenant)(nil))
+	assert.Nil(t, err)
+	// create TenantAccount table
+	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.TenantAccount)(nil))
 	assert.Nil(t, err)
 	// create TenantSite table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.TenantSite)(nil))
@@ -129,7 +135,12 @@ func testCommonSetupSchema(t *testing.T, dbSession *cdb.Session) {
 
 func testCommonBuildInfrastructureProvider(t *testing.T, dbSession *cdb.Session, name string, org string, user *cdbm.User) *cdbm.InfrastructureProvider {
 	ipDAO := cdbm.NewInfrastructureProviderDAO(dbSession)
-	ip, err := ipDAO.CreateFromParams(context.Background(), nil, name, cutil.GetPtr("Test Infrastructure Provider"), org, nil, user)
+	ip, err := ipDAO.Create(context.Background(), nil, cdbm.InfrastructureProviderCreateInput{
+		Name:        name,
+		DisplayName: cutil.GetPtr("Test Infrastructure Provider"),
+		Org:         org,
+		CreatedBy:   user.ID,
+	})
 	assert.Nil(t, err)
 	assert.NotNil(t, ip)
 	return ip
@@ -263,7 +274,10 @@ func testCommonBuildInstanceType(t *testing.T, dbSession *cdb.Session, name stri
 
 func testCommonBuildMachineInstanceType(t *testing.T, dbSession *cdb.Session, machineID string, instanceTypeID uuid.UUID) *cdbm.MachineInstanceType {
 	mitDAO := cdbm.NewMachineInstanceTypeDAO(dbSession)
-	mit, err := mitDAO.CreateFromParams(context.Background(), nil, machineID, instanceTypeID)
+	mit, err := mitDAO.Create(context.Background(), nil, cdbm.MachineInstanceTypeCreateInput{
+		MachineID:      machineID,
+		InstanceTypeID: instanceTypeID,
+	})
 	assert.Nil(t, err)
 	return mit
 }
@@ -345,17 +359,53 @@ func TestGetInfrastructureProviderForOrg(t *testing.T) {
 	}
 }
 
+func TestGRPCStatusMessage(t *testing.T) {
+	grpcInvalid := status.Error(codes.InvalidArgument, "model is required")
+	plainErr := errors.New("plain error")
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "nil error",
+			err:  nil,
+			want: "",
+		},
+		{
+			name: "gRPC status message",
+			err:  grpcInvalid,
+			want: "model is required",
+		},
+		{
+			name: "plain error",
+			err:  plainErr,
+			want: "plain error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, GRPCStatusMessage(tt.err))
+		})
+	}
+}
+
 func TestUnwrapWorkflowError(t *testing.T) {
 	plainErr := errors.New("plain")
 	causeErr := errors.New("other error")
 	grpcPerm := status.Error(codes.PermissionDenied, "forbidden")
 	grpcInvalid := status.Error(codes.InvalidArgument, "Maximum Limit of Infiniband partitions had been reached")
+	grpcResourceExhausted := status.Error(codes.ResourceExhausted, "VPC prefix capacity exhausted")
+	wrappedResourceExhausted := swe.WrapErr(grpcResourceExhausted)
 
 	tests := []struct {
-		name     string
-		err      error
-		wantCode int
-		wantErr  error
+		name                     string
+		err                      error
+		wantCode                 int
+		wantErr                  error
+		wantApplicationErrorType string
 	}{
 		{
 			name:     "unwraps Temporal cause",
@@ -382,10 +432,23 @@ func TestUnwrapWorkflowError(t *testing.T) {
 			wantErr:  grpcInvalid,
 		},
 		{
+			name:     "maps gRPC resource exhausted",
+			err:      temporal.NewApplicationErrorWithCause("wrapper", "error", grpcResourceExhausted),
+			wantCode: http.StatusTooManyRequests,
+			wantErr:  grpcResourceExhausted,
+		},
+		{
 			name:     "maps non-gRPC error with collected invalid argument (nvbugs 5778658)",
 			err:      temporal.NewApplicationErrorWithCause("wrapper", swe.ErrTypeNICoInvalidArgument, causeErr),
 			wantCode: http.StatusBadRequest,
 			wantErr:  causeErr,
+		},
+		{
+			name:                     "maps wrapped gRPC resource exhausted",
+			err:                      wrappedResourceExhausted,
+			wantCode:                 http.StatusTooManyRequests,
+			wantErr:                  grpcResourceExhausted,
+			wantApplicationErrorType: swe.ErrTypeNICoResourceExhausted,
 		},
 		{
 			name:     "unwraps ApplicationError wrapped in generic error chain",
@@ -397,6 +460,13 @@ func TestUnwrapWorkflowError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.wantApplicationErrorType != "" {
+				var applicationErr *temporal.ApplicationError
+				require.ErrorAs(t, tt.err, &applicationErr)
+				assert.Equal(t, tt.wantApplicationErrorType, applicationErr.Type())
+				assert.True(t, applicationErr.NonRetryable())
+			}
+
 			code, gotErr := UnwrapWorkflowError(tt.err)
 			assert.Equal(t, tt.wantCode, code)
 			assert.Equal(t, tt.wantErr, gotErr)
@@ -564,6 +634,99 @@ func TestGetSiteFromIDString(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuthorizeProviderSiteForCore(t *testing.T) {
+	ctx := context.Background()
+	dbSession := TestInitDB(t)
+	defer dbSession.Close()
+
+	TestSetupSchema(t, dbSession)
+
+	logger := zerolog.New(os.Stdout)
+
+	org := "test-provider-org"
+	user := TestBuildUser(t, dbSession, uuid.NewString(), org, []string{authz.ProviderAdminRole})
+	assert.NotNil(t, user)
+	ip := TestBuildInfrastructureProvider(t, dbSession, "Test Infrastructure Provider", org, user)
+	assert.NotNil(t, ip)
+	site := TestBuildSite(t, dbSession, ip, "Test Site", user)
+	sDAO := cdbm.NewSiteDAO(dbSession)
+	_, err := sDAO.Update(context.Background(), nil, cdbm.SiteUpdateInput{
+		SiteID: site.ID,
+		Status: cutil.GetPtr(cdbm.SiteStatusRegistered),
+	})
+	require.NoError(t, err)
+
+	otherOrg := "other-provider-org"
+	otherUser := TestBuildUser(t, dbSession, uuid.NewString(), otherOrg, []string{authz.ProviderAdminRole})
+	assert.NotNil(t, otherUser)
+	otherIP := TestBuildInfrastructureProvider(t, dbSession, "Other Infrastructure Provider", otherOrg, otherUser)
+	assert.NotNil(t, otherIP)
+	otherSite := TestBuildSite(t, dbSession, otherIP, "Other Site", otherUser)
+	assert.NotNil(t, otherSite)
+
+	tenantOrg := "tenant-org"
+	tenantUser := TestBuildUser(t, dbSession, uuid.NewString(), tenantOrg, []string{authz.TenantAdminRole})
+	assert.NotNil(t, tenantUser)
+	tenant := TestBuildTenant(t, dbSession, tenantOrg, "Tenant", tenantUser)
+	assert.NotNil(t, tenant)
+	tenantSite := TestBuildTenantSite(t, dbSession, tenant, site, user)
+	assert.NotNil(t, tenantSite)
+
+	scp := &stubSiteTemporalClientPool{client: &tmocks.Client{}}
+	authInput := func(org string, user *cdbm.User, siteID string) AuthorizeProviderSiteForCoreInput {
+		return AuthorizeProviderSiteForCoreInput{
+			Ctx:       ctx,
+			Logger:    logger,
+			DBSession: dbSession,
+			SCP:       scp,
+			Org:       org,
+			User:      user,
+			SiteID:    siteID,
+		}
+	}
+
+	t.Run("success", func(t *testing.T) {
+		client, siteID, apiErr := AuthorizeProviderSiteForCore(authInput(org, user, site.ID.String()))
+		require.Nil(t, apiErr)
+		require.NotNil(t, client)
+		assert.Equal(t, site.ID.String(), siteID)
+	})
+
+	t.Run("nil user", func(t *testing.T) {
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(org, nil, site.ID.String()))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusInternalServerError, apiErr.Code)
+	})
+
+	t.Run("user is not a provider admin", func(t *testing.T) {
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(tenantOrg, tenantUser, site.ID.String()))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusForbidden, apiErr.Code)
+	})
+
+	t.Run("site not found", func(t *testing.T) {
+		missingSiteID := uuid.NewString()
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(org, user, missingSiteID))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusBadRequest, apiErr.Code)
+		assert.Contains(t, apiErr.Message, missingSiteID)
+	})
+
+	t.Run("site belongs to another provider", func(t *testing.T) {
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(org, user, otherSite.ID.String()))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusForbidden, apiErr.Code)
+	})
+}
+
+type stubSiteTemporalClientPool struct {
+	client tclient.Client
+}
+
+func (s *stubSiteTemporalClientPool) GetClientByID(siteID uuid.UUID) (tclient.Client, error) {
+	return s.client, nil
 }
 
 func TestGetIPBlockFromIDString(t *testing.T) {
@@ -905,7 +1068,7 @@ func TestGetUnallocatedMachineForInstanceType(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := GetUnallocatedMachineForInstanceType(ctx, tx, dbSession, tc.instancetype)
+			s, err := GetUnallocatedMachineForInstanceType(ctx, zerolog.Nop(), tx, dbSession, tc.instancetype, nil)
 			assert.Equal(t, tc.expectErr, err != nil)
 			if err == nil {
 				assert.NotNil(t, s)
@@ -1036,6 +1199,76 @@ func TestGetSiteMachineCountStats(t *testing.T) {
 			assert.Equal(t, tc.wantMachineAllocationStats, ms[tc.siteID].TotalByAllocation)
 		})
 	}
+}
+
+func TestGetSiteGPUStats(t *testing.T) {
+	ctx := context.Background()
+	dbSession := testCommonInitDB(t)
+	defer dbSession.Close()
+
+	testCommonSetupSchema(t, dbSession)
+
+	ipOrg := "test-gpu-ip-org"
+	orgRoles := []string{"NICO_SERVICE_PROVIDER_ADMIN"}
+	ipuser := testCommonBuildUser(t, dbSession, uuid.New().String(), []string{ipOrg}, orgRoles)
+
+	ip := testCommonBuildInfrastructureProvider(t, dbSession, "test-gpu-ip", ipOrg, ipuser)
+	assert.NotNil(t, ip)
+
+	site1 := testCommonBuildSite(t, dbSession, ip, "gpu-site-1", ipuser)
+	site2 := testCommonBuildSite(t, dbSession, ip, "gpu-site-2", ipuser)
+
+	mA := testCommonBuildMachine(t, dbSession, ip.ID, site1.ID, nil, uuid.New(), nil, nil, nil, cdbm.MachineStatusReady)
+	mB := testCommonBuildMachine(t, dbSession, ip.ID, site1.ID, nil, uuid.New(), nil, nil, nil, cdbm.MachineStatusReady)
+	mC := testCommonBuildMachine(t, dbSession, ip.ID, site2.ID, nil, uuid.New(), nil, nil, nil, cdbm.MachineStatusReady)
+
+	const h100 = "NVIDIA H100"
+	const a100 = "NVIDIA A100"
+
+	// site1: H100 on mA(8) and mB(8) -> 16 GPUs / 2 machines; A100 on mA(2) -> 2 GPUs / 1 machine
+	TestBuildMachineCapability(t, dbSession, &mA.ID, nil, cdbm.MachineCapabilityTypeGPU, h100, nil, nil, nil, cutil.GetPtr(8), nil, nil)
+	TestBuildMachineCapability(t, dbSession, &mA.ID, nil, cdbm.MachineCapabilityTypeGPU, a100, nil, nil, nil, cutil.GetPtr(2), nil, nil)
+	TestBuildMachineCapability(t, dbSession, &mB.ID, nil, cdbm.MachineCapabilityTypeGPU, h100, nil, nil, nil, cutil.GetPtr(8), nil, nil)
+	// site2: H100 on mC(4)
+	TestBuildMachineCapability(t, dbSession, &mC.ID, nil, cdbm.MachineCapabilityTypeGPU, h100, nil, nil, nil, cutil.GetPtr(4), nil, nil)
+	// non-GPU capability must be excluded from GPU stats
+	TestBuildMachineCapability(t, dbSession, &mA.ID, nil, cdbm.MachineCapabilityTypeCPU, "Intel Xeon", nil, nil, nil, cutil.GetPtr(2), nil, nil)
+
+	logger := zerolog.Nop()
+
+	t.Run("provider-wide returns per-site stats sorted by name", func(t *testing.T) {
+		stats, err := GetSiteGPUStats(ctx, nil, dbSession, logger, &ip.ID, nil)
+		require.Nil(t, err)
+
+		require.Len(t, stats[site1.ID], 2)
+		assert.Equal(t, a100, stats[site1.ID][0].Name)
+		assert.Equal(t, 2, stats[site1.ID][0].GPUs)
+		assert.Equal(t, 1, stats[site1.ID][0].Machines)
+		assert.Equal(t, h100, stats[site1.ID][1].Name)
+		assert.Equal(t, 16, stats[site1.ID][1].GPUs)
+		assert.Equal(t, 2, stats[site1.ID][1].Machines)
+
+		require.Len(t, stats[site2.ID], 1)
+		assert.Equal(t, h100, stats[site2.ID][0].Name)
+		assert.Equal(t, 4, stats[site2.ID][0].GPUs)
+		assert.Equal(t, 1, stats[site2.ID][0].Machines)
+	})
+
+	t.Run("site-scoped returns only the requested site", func(t *testing.T) {
+		stats, err := GetSiteGPUStats(ctx, nil, dbSession, logger, &ip.ID, &site2.ID)
+		require.Nil(t, err)
+
+		assert.Len(t, stats, 1)
+		require.Len(t, stats[site2.ID], 1)
+		assert.Equal(t, 4, stats[site2.ID][0].GPUs)
+	})
+
+	t.Run("site with no GPUs yields no entry", func(t *testing.T) {
+		emptySite := testCommonBuildSite(t, dbSession, ip, "gpu-site-empty", ipuser)
+		stats, err := GetSiteGPUStats(ctx, nil, dbSession, logger, &ip.ID, &emptySite.ID)
+		require.Nil(t, err)
+		assert.Empty(t, stats[emptySite.ID])
+	})
 }
 
 func TestGetAllocationIDsForTenantAtSite(t *testing.T) {
@@ -2621,4 +2854,384 @@ func TestGetFlowUUIDPtr(t *testing.T) {
 			assert.Equal(t, s, got.GetId())
 		}
 	})
+}
+
+func TestEvaluateInfiniBandRequestAgainstMachineCaps(t *testing.T) {
+	deviceType := cdbm.MachineCapabilityDeviceType("")
+	machineIbCaps := []cdbm.MachineCapability{
+		{
+			Type:            cdbm.MachineCapabilityTypeInfiniBand,
+			Name:            "MT28908 Family [ConnectX-6]",
+			Vendor:          cutil.GetPtr("Mellanox Technologies"),
+			Count:           cutil.GetPtr(3),
+			DeviceType:      &deviceType,
+			InactiveDevices: []int{1, 3},
+		},
+	}
+
+	t.Run("builds validation errors from suggested device instances", func(t *testing.T) {
+		req := cam.APIInstanceCreateRequest{
+			InfiniBandInterfaces: []cam.APIInfiniBandInterfaceCreateOrUpdateRequest{
+				{Device: "MT28908 Family [ConnectX-6]", DeviceInstance: 1, IsPhysical: true},
+			},
+		}
+		match := req.ValidateInfiniBandRequestForMachineCapability(machineIbCaps)
+		assert.False(t, match.Satisfied)
+		assert.True(t, match.CountSatisfiable)
+
+		selErr := &InfiniBandMachineSelectionError{SuggestedByDevice: match.SuggestedByDevice}
+		errs := selErr.ValidationError()
+		require.Len(t, errs, 1)
+		assert.Contains(t, errs, "infiniBandInterfaces")
+		errMsg := errs["infiniBandInterfaces"].Error()
+		assert.Contains(t, errMsg, "requested device instances are not available on any Machine for this Instance Type")
+		assert.Contains(t, errMsg, "Use deviceInstances: [0 2] for device: MT28908 Family [ConnectX-6]")
+		assert.Equal(t, []int{0, 2}, match.SuggestedByDevice["MT28908 Family [ConnectX-6]"])
+	})
+}
+
+func TestTenantHasTargetedInstanceCreation(t *testing.T) {
+	ctx := context.Background()
+	dbSession := testCommonInitDB(t)
+	defer dbSession.Close()
+
+	testCommonSetupSchema(t, dbSession)
+
+	org := "test-priv-org"
+	user := testCommonBuildUser(t, dbSession, uuid.NewString(), []string{org}, []string{authz.ProviderAdminRole})
+	ip := testCommonBuildInfrastructureProvider(t, dbSession, "Test Provider", org, user)
+	ip2 := testCommonBuildInfrastructureProvider(t, dbSession, "Test Provider 2", org+"-2", user)
+
+	// A Site under ip is required so effective capability resolution can report
+	// a Ready TenantAccount's global default as an enabled Site. The coarse and
+	// provider-scoped ceilings report privileged only when at least one Site
+	// resolves to an enabled effective capability.
+	ipSite := testCommonBuildSite(t, dbSession, ip, "Priv Site", user)
+
+	tnDAO := cdbm.NewTenantDAO(dbSession)
+
+	// Tenant with a Ready TenantAccount that enables TargetedInstanceCreation.
+	enabledTenant, err := tnDAO.Create(ctx, nil, cdbm.TenantCreateInput{
+		Name:      "enabled-tenant",
+		Org:       org + "-enabled",
+		CreatedBy: user.ID,
+	})
+	assert.Nil(t, err)
+
+	// Tenant whose only Ready TenantAccount leaves the capability disabled.
+	disabledTenant, err := tnDAO.Create(ctx, nil, cdbm.TenantCreateInput{
+		Name:      "disabled-tenant",
+		Org:       org + "-disabled",
+		CreatedBy: user.ID,
+	})
+	assert.Nil(t, err)
+
+	// Tenant with the capability enabled but only on a non-Ready TenantAccount.
+	pendingTenant, err := tnDAO.Create(ctx, nil, cdbm.TenantCreateInput{
+		Name:      "pending-tenant",
+		Org:       org + "-pending",
+		CreatedBy: user.ID,
+	})
+	assert.Nil(t, err)
+
+	taDAO := cdbm.NewTenantAccountDAO(dbSession)
+	_, err = taDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+		AccountNumber:             uuid.NewString(),
+		TenantID:                  &enabledTenant.ID,
+		TenantOrg:                 enabledTenant.Org,
+		InfrastructureProviderID:  ip.ID,
+		InfrastructureProviderOrg: ip.Org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: true},
+		CreatedBy:                 user.ID,
+	})
+	assert.Nil(t, err)
+	// A second Ready account (different provider) with the capability disabled
+	// must not mask the enabled one.
+	_, err = taDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+		AccountNumber:             uuid.NewString(),
+		TenantID:                  &enabledTenant.ID,
+		TenantOrg:                 enabledTenant.Org,
+		InfrastructureProviderID:  ip2.ID,
+		InfrastructureProviderOrg: ip2.Org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: false},
+		CreatedBy:                 user.ID,
+	})
+	assert.Nil(t, err)
+
+	_, err = taDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+		AccountNumber:             uuid.NewString(),
+		TenantID:                  &disabledTenant.ID,
+		TenantOrg:                 disabledTenant.Org,
+		InfrastructureProviderID:  ip.ID,
+		InfrastructureProviderOrg: ip.Org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: false},
+		CreatedBy:                 user.ID,
+	})
+	assert.Nil(t, err)
+
+	_, err = taDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+		AccountNumber:             uuid.NewString(),
+		TenantID:                  &pendingTenant.ID,
+		TenantOrg:                 pendingTenant.Org,
+		InfrastructureProviderID:  ip.ID,
+		InfrastructureProviderOrg: ip.Org,
+		Status:                    cdbm.TenantAccountStatusPending,
+		Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: true},
+		CreatedBy:                 user.ID,
+	})
+	assert.Nil(t, err)
+
+	// A Ready account at a different Provider ensures the list helper cannot
+	// treat any Ready account as sufficient for an override at ip.
+	_, err = taDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+		AccountNumber:             uuid.NewString(),
+		TenantID:                  &pendingTenant.ID,
+		TenantOrg:                 pendingTenant.Org,
+		InfrastructureProviderID:  ip2.ID,
+		InfrastructureProviderOrg: ip2.Org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: false},
+		CreatedBy:                 user.ID,
+	})
+	assert.Nil(t, err)
+
+	cdbm.TestBuildTenantSite(t, dbSession, pendingTenant, ipSite, &cdbm.TenantSiteConfig{
+		TargetedInstanceCreation: cutil.GetPtr(true),
+	}, user)
+
+	tests := []struct {
+		name     string
+		tenant   *cdbm.Tenant
+		scope    *TenantPrivilegeScope
+		expected bool
+		wantErr  bool
+	}{
+		{name: "nil tenant", tenant: nil, scope: nil, expected: false},
+		{name: "nil scope requires explicit scope", tenant: enabledTenant, scope: nil, expected: false, wantErr: true},
+		{name: "enabled via Ready TenantAccount", tenant: enabledTenant, scope: &TenantPrivilegeScope{InfrastructureProviderID: &ip.ID}, expected: true},
+		{name: "disabled TenantAccount config", tenant: disabledTenant, scope: &TenantPrivilegeScope{InfrastructureProviderID: &ip.ID}, expected: false},
+		{name: "enabled only on non-Ready TenantAccount", tenant: pendingTenant, scope: &TenantPrivilegeScope{InfrastructureProviderID: &ip.ID}, expected: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gerr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tc.tenant, tc.scope)
+			if tc.wantErr {
+				assert.Error(t, gerr)
+			} else {
+				assert.Nil(t, gerr)
+			}
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+
+	t.Run("Site override requires Ready TenantAccount at the Site Provider", func(t *testing.T) {
+		got, gerr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, pendingTenant, &TenantPrivilegeScope{SiteID: &ipSite.ID})
+		assert.Nil(t, gerr)
+		assert.False(t, got)
+
+		privilegedSiteIDs, gerr := GetPrivilegedAccessSiteIDsForTenant(ctx, nil, dbSession, pendingTenant)
+		assert.Nil(t, gerr)
+		assert.NotContains(t, privilegedSiteIDs, ipSite.ID)
+	})
+
+	effOrg := "test-eff-org"
+	effUser := testCommonBuildUser(t, dbSession, uuid.NewString(), []string{effOrg}, []string{authz.ProviderAdminRole})
+	effIP := testCommonBuildInfrastructureProvider(t, dbSession, "Test Provider", effOrg, effUser)
+	site := testCommonBuildSite(t, dbSession, effIP, "Test Site", effUser)
+	site2 := testCommonBuildSite(t, dbSession, effIP, "Test Site 2", effUser)
+	site3 := testCommonBuildSite(t, dbSession, effIP, "Test Site 3", effUser)
+
+	tenant, err := tnDAO.Create(ctx, nil, cdbm.TenantCreateInput{
+		Name:      "tenant",
+		Org:       effOrg + "-tenant",
+		CreatedBy: effUser.ID,
+	})
+	assert.Nil(t, err)
+
+	_, err = taDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+		AccountNumber:             uuid.NewString(),
+		TenantID:                  &tenant.ID,
+		TenantOrg:                 tenant.Org,
+		InfrastructureProviderID:  effIP.ID,
+		InfrastructureProviderOrg: effIP.Org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: true},
+		CreatedBy:                 effUser.ID,
+	})
+	assert.Nil(t, err)
+
+	cdbm.TestBuildTenantSite(t, dbSession, tenant, site, nil, effUser)
+	ts2 := cdbm.TestBuildTenantSite(t, dbSession, tenant, site2, &cdbm.TenantSiteConfig{TargetedInstanceCreation: cutil.GetPtr(false)}, effUser)
+	cdbm.TestBuildTenantSite(t, dbSession, disabledTenant, site, nil, effUser)
+
+	siteTests := []struct {
+		name     string
+		tenant   *cdbm.Tenant
+		site     *cdbm.Site
+		expected bool
+	}{
+		{name: "TenantSite without explicit override inherits enabled account default", tenant: tenant, site: site, expected: true},
+		{name: "explicit override disables site", tenant: tenant, site: site2, expected: false},
+		{name: "enabled account default when no TenantSite exists", tenant: tenant, site: site3, expected: true},
+		{name: "TenantSite without explicit override inherits disabled account default", tenant: disabledTenant, site: site, expected: false},
+	}
+
+	for _, tc := range siteTests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gerr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tc.tenant, &TenantPrivilegeScope{SiteID: &tc.site.ID})
+			assert.Nil(t, gerr)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+
+	privilegedSiteIDs, gerr := GetPrivilegedAccessSiteIDsForTenant(ctx, nil, dbSession, tenant)
+	assert.Nil(t, gerr)
+	assert.ElementsMatch(t, []uuid.UUID{site.ID, site3.ID}, privilegedSiteIDs)
+
+	_ = ts2
+
+	// A Tenant whose Ready TenantAccount global default is disabled but which
+	// has a per-site override enabling the capability must pass a Site-scoped
+	// check for that Site. Provider-scoped checks still follow the account
+	// global default and remain false.
+	overrideTenant, err := tnDAO.Create(ctx, nil, cdbm.TenantCreateInput{
+		Name:      "override-tenant",
+		Org:       effOrg + "-override-tenant",
+		CreatedBy: effUser.ID,
+	})
+	assert.Nil(t, err)
+
+	_, err = taDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+		AccountNumber:             uuid.NewString(),
+		TenantID:                  &overrideTenant.ID,
+		TenantOrg:                 overrideTenant.Org,
+		InfrastructureProviderID:  effIP.ID,
+		InfrastructureProviderOrg: effIP.Org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: false},
+		CreatedBy:                 effUser.ID,
+	})
+	assert.Nil(t, err)
+
+	// Provider-scoped check is false before any enabling override exists.
+	got, gerr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, overrideTenant, &TenantPrivilegeScope{InfrastructureProviderID: &effIP.ID})
+	assert.Nil(t, gerr)
+	assert.False(t, got)
+
+	cdbm.TestBuildTenantSite(t, dbSession, overrideTenant, site, &cdbm.TenantSiteConfig{TargetedInstanceCreation: cutil.GetPtr(true)}, effUser)
+
+	got, gerr = TenantHasTargetedInstanceCreation(ctx, nil, dbSession, overrideTenant, &TenantPrivilegeScope{SiteID: &site.ID})
+	assert.Nil(t, gerr)
+	assert.True(t, got)
+
+	got, gerr = TenantHasTargetedInstanceCreation(ctx, nil, dbSession, overrideTenant, &TenantPrivilegeScope{InfrastructureProviderID: &effIP.ID})
+	assert.Nil(t, gerr)
+	assert.False(t, got)
+
+	// Provider-scoped ceiling: enabled on ip but not on ip2.
+	got, gerr = TenantHasTargetedInstanceCreation(ctx, nil, dbSession, enabledTenant, &TenantPrivilegeScope{InfrastructureProviderID: &ip.ID})
+	assert.Nil(t, gerr)
+	assert.True(t, got)
+
+	got, gerr = TenantHasTargetedInstanceCreation(ctx, nil, dbSession, enabledTenant, &TenantPrivilegeScope{InfrastructureProviderID: &ip2.ID})
+	assert.Nil(t, gerr)
+	assert.False(t, got)
+
+	t.Run("TenantSite without a Site relation returns an error", func(t *testing.T) {
+		deletedSite := testCommonBuildSite(t, dbSession, effIP, "Deleted Site", effUser)
+		cdbm.TestBuildTenantSite(t, dbSession, tenant, deletedSite, &cdbm.TenantSiteConfig{
+			TargetedInstanceCreation: cutil.GetPtr(true),
+		}, effUser)
+
+		siteDAO := cdbm.NewSiteDAO(dbSession)
+		derr := siteDAO.Delete(ctx, nil, deletedSite.ID)
+		assert.Nil(t, derr)
+
+		got, gerr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tenant, &TenantPrivilegeScope{SiteID: &deletedSite.ID})
+		assert.False(t, got)
+		assert.EqualError(t, gerr, "failed to retrieve related Site for Tenant/Site association, DB error")
+	})
+}
+
+func TestTenantHasLegacyTargetedInstanceCreation(t *testing.T) {
+	ctx := context.Background()
+	dbSession := testCommonInitDB(t)
+	defer dbSession.Close()
+
+	testCommonSetupSchema(t, dbSession)
+
+	org := "test-legacy-capability-org"
+	user := testCommonBuildUser(t, dbSession, uuid.NewString(), []string{org}, []string{authz.ProviderAdminRole})
+	ip := testCommonBuildInfrastructureProvider(t, dbSession, "Legacy Provider", org, user)
+	ip2 := testCommonBuildInfrastructureProvider(t, dbSession, "Legacy Provider 2", org+"-2", user)
+	site := testCommonBuildSite(t, dbSession, ip, "Legacy Site", user)
+
+	tenantDAO := cdbm.NewTenantDAO(dbSession)
+	accountDAO := cdbm.NewTenantAccountDAO(dbSession)
+
+	buildTenant := func(name string) *cdbm.Tenant {
+		t.Helper()
+		tenant, err := tenantDAO.Create(ctx, nil, cdbm.TenantCreateInput{
+			Name:      name,
+			Org:       org + "-" + name,
+			CreatedBy: user.ID,
+		})
+		require.NoError(t, err)
+		return tenant
+	}
+	buildAccount := func(tenant *cdbm.Tenant, provider *cdbm.InfrastructureProvider, status string, enabled bool) {
+		t.Helper()
+		_, err := accountDAO.Create(ctx, nil, cdbm.TenantAccountCreateInput{
+			AccountNumber:             uuid.NewString(),
+			TenantID:                  &tenant.ID,
+			TenantOrg:                 tenant.Org,
+			InfrastructureProviderID:  provider.ID,
+			InfrastructureProviderOrg: provider.Org,
+			Status:                    status,
+			Config:                    &cdbm.TenantAccountConfig{TargetedInstanceCreation: enabled},
+			CreatedBy:                 user.ID,
+		})
+		require.NoError(t, err)
+	}
+
+	allEnabledTenant := buildTenant("all-enabled")
+	buildAccount(allEnabledTenant, ip, cdbm.TenantAccountStatusReady, true)
+	buildAccount(allEnabledTenant, ip2, cdbm.TenantAccountStatusReady, true)
+
+	accountDisabledTenant := buildTenant("account-disabled")
+	buildAccount(accountDisabledTenant, ip, cdbm.TenantAccountStatusReady, true)
+	buildAccount(accountDisabledTenant, ip2, cdbm.TenantAccountStatusReady, false)
+
+	siteDisabledTenant := buildTenant("site-disabled")
+	buildAccount(siteDisabledTenant, ip, cdbm.TenantAccountStatusReady, true)
+	cdbm.TestBuildTenantSite(t, dbSession, siteDisabledTenant, site, &cdbm.TenantSiteConfig{
+		TargetedInstanceCreation: cutil.GetPtr(false),
+	}, user)
+
+	pendingTenant := buildTenant("pending-only")
+	buildAccount(pendingTenant, ip, cdbm.TenantAccountStatusPending, true)
+
+	tests := []struct {
+		name     string
+		tenant   *cdbm.Tenant
+		expected bool
+	}{
+		{name: "nil Tenant", tenant: nil, expected: false},
+		{name: "all Ready TenantAccounts enabled", tenant: allEnabledTenant, expected: true},
+		{name: "one Ready TenantAccount disabled", tenant: accountDisabledTenant, expected: false},
+		{name: "TenantSite explicitly disabled", tenant: siteDisabledTenant, expected: false},
+		{name: "no Ready TenantAccount", tenant: pendingTenant, expected: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := TenantHasLegacyTargetedInstanceCreation(ctx, nil, dbSession, tc.tenant)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
 }

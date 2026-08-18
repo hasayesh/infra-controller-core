@@ -21,11 +21,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use carbide_health::endpoint::{BmcAddr, EndpointMetadata, MachineData};
+use carbide_health::endpoint::{BmcAddr, EndpointMetadata, MachineData, SharedSystemUuid};
 use carbide_health::metrics::MetricsManager;
 use carbide_health::sink::{
     Classification, CollectorEvent, CompositeDataSink, DataSink, EventContext, HealthReport,
-    HealthReportSink, LogRecord, MetricSample, PrometheusSink, ReportSource,
+    HealthReportSink, LogRecord, LogSeverity, MetricSample, PrometheusSink, ReportSource,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use health_report::HealthReport as CarbideHealthReport;
@@ -45,9 +45,14 @@ impl DataSink for CountingSink {
         "counting_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), carbide_health::HealthError> {
         std::hint::black_box(context);
         std::hint::black_box(event);
+        Ok(())
     }
 }
 
@@ -64,12 +69,15 @@ fn event_context_for_machine(machine_id: &str) -> EventContext {
             mac: MacAddress::from_str("42:9e:b1:bd:9d:dd").unwrap(),
         },
         collector_type: "sensor_collector",
+        labels: Default::default(),
         metadata: Some(EndpointMetadata::Machine(MachineData {
-            machine_id: machine_id.parse().expect("valid machine id"),
+            machine_id: Some(machine_id.parse().expect("valid machine id")),
             machine_serial: None,
+            system_uuid: SharedSystemUuid::default(),
             slot_number: None,
             tray_index: None,
             nvlink_domain_uuid: None,
+            driver_version: None,
         })),
         rack_id: None,
     }
@@ -334,7 +342,7 @@ fn log_events_with_attrs(count: usize, unique_sensors: usize) -> Vec<CollectorEv
             let sensor = format!("HGX_GPU_{}_Temp_1", idx % unique_sensors);
             CollectorEvent::Log(Box::new(LogRecord {
                 body: format!("{sensor} sensor crossed threshold"),
-                severity: "Warning".to_string(),
+                severity: LogSeverity::Warn,
                 attributes: vec![
                     (
                         Cow::Borrowed("message_id"),
@@ -345,6 +353,7 @@ fn log_events_with_attrs(count: usize, unique_sensors: usize) -> Vec<CollectorEv
                         format!(r#"["{sensor}","3.96","-0.05"]"#),
                     ),
                 ],
+                diagnostic_record: None,
             }))
         })
         .collect()

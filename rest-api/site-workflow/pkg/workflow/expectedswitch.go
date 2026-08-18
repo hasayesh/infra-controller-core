@@ -6,11 +6,16 @@ package workflow
 import (
 	"time"
 
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/activity"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
 	"github.com/rs/zerolog/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
+)
+
+const (
+	removeCreateExpectedSwitchOnFlowChangeID = "remove-create-expected-switch-on-flow"
+	removeCreateExpectedSwitchOnFlowVersion  = workflow.Version(1)
 )
 
 // DiscoverExpectedSwitchInventory is a workflow to fetch Expected Switch inventory on Site and publish to Cloud
@@ -50,9 +55,8 @@ func DiscoverExpectedSwitchInventory(ctx workflow.Context) error {
 	return nil
 }
 
-// CreateExpectedSwitch is a workflow to create a new Expected Switch using the CreateExpectedSwitchOnSite activity,
-// then also creates the component in Flow via CreateExpectedSwitchOnFlow.
-func CreateExpectedSwitch(ctx workflow.Context, request *cwssaws.ExpectedSwitch) error {
+// CreateExpectedSwitch is a workflow to create a new Expected Switch using the CreateExpectedSwitchOnSite activity.
+func CreateExpectedSwitch(ctx workflow.Context, request *corev1.ExpectedSwitch) error {
 	logger := log.With().Str("Workflow", "ExpectedSwitch").Str("Action", "Create").Str("ID", request.GetExpectedSwitchId().GetValue()).Str("Expected MAC address", request.BmcMacAddress).Str("Serial", request.SwitchSerialNumber).Logger()
 
 	logger.Info().Msg("starting workflow")
@@ -82,10 +86,13 @@ func CreateExpectedSwitch(ctx workflow.Context, request *cwssaws.ExpectedSwitch)
 		return err
 	}
 
-	// Then write to Flow (best-effort: log warning but don't fail the workflow)
-	err = workflow.ExecuteActivity(ctx, expectedSwitchManager.CreateExpectedSwitchOnFlow, request).Get(ctx, nil)
-	if err != nil {
-		logger.Warn().Err(err).Str("Activity", "CreateExpectedSwitchOnFlow").Msg("Failed to create component on Flow, Core write succeeded")
+	// Preserve the Flow activity command when replaying histories created before
+	// direct Flow writes were removed.
+	if workflow.GetVersion(ctx, removeCreateExpectedSwitchOnFlowChangeID, workflow.DefaultVersion, removeCreateExpectedSwitchOnFlowVersion) == workflow.DefaultVersion {
+		err = workflow.ExecuteActivity(ctx, expectedSwitchManager.CreateExpectedSwitchOnFlow, request).Get(ctx, nil)
+		if err != nil {
+			logger.Warn().Err(err).Str("Activity", "CreateExpectedSwitchOnFlow").Msg("Failed to create component on Flow, Core write succeeded")
+		}
 	}
 
 	logger.Info().Msg("completing workflow")
@@ -94,8 +101,7 @@ func CreateExpectedSwitch(ctx workflow.Context, request *cwssaws.ExpectedSwitch)
 }
 
 // UpdateExpectedSwitch is a workflow to update an Expected Switch using the UpdateExpectedSwitchOnSite activity
-// TODO: Add Flow PatchComponent dual-write when update/delete Flow support is implemented
-func UpdateExpectedSwitch(ctx workflow.Context, request *cwssaws.ExpectedSwitch) error {
+func UpdateExpectedSwitch(ctx workflow.Context, request *corev1.ExpectedSwitch) error {
 	logger := log.With().Str("Workflow", "ExpectedSwitch").Str("Action", "Update").Str("ID", request.GetExpectedSwitchId().GetValue()).Str("Expected MAC address", request.BmcMacAddress).Str("Serial", request.SwitchSerialNumber).Logger()
 
 	logger.Info().Msg("starting workflow")
@@ -130,8 +136,7 @@ func UpdateExpectedSwitch(ctx workflow.Context, request *cwssaws.ExpectedSwitch)
 }
 
 // DeleteExpectedSwitch is a workflow to Delete an Expected Switch using the DeleteExpectedSwitchOnSite activity
-// TODO: Add Flow DeleteComponent dual-write when update/delete Flow support is implemented
-func DeleteExpectedSwitch(ctx workflow.Context, request *cwssaws.ExpectedSwitchRequest) error {
+func DeleteExpectedSwitch(ctx workflow.Context, request *corev1.ExpectedSwitchRequest) error {
 	logger := log.With().Str("Workflow", "ExpectedSwitch").Str("Action", "Delete").Str("ID", request.GetExpectedSwitchId().GetValue()).Str("optional MAC address", request.BmcMacAddress).Logger()
 
 	logger.Info().Msg("starting workflow")

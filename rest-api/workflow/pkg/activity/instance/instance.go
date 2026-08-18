@@ -25,7 +25,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
 
-	cwsv1 "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/internal/config"
 	cwm "github.com/NVIDIA/infra-controller/rest-api/workflow/internal/metrics"
 
@@ -43,10 +43,22 @@ type ManageInstance struct {
 	cfg            *config.Config
 }
 
+// primaryResolvedVpcPrefixID preserves the scalar REST cache contract: IPv4 is
+// primary for dual-stack selections, while IPv6 is primary for IPv6-only selections.
+func primaryResolvedVpcPrefixID(prefixes *corev1.InstanceInterfaceResolvedVpcPrefixes) *corev1.VpcPrefixId {
+	if prefixes == nil {
+		return nil
+	}
+	if prefixes.Ipv4VpcPrefixId != nil {
+		return prefixes.Ipv4VpcPrefixId
+	}
+	return prefixes.Ipv6VpcPrefixId
+}
+
 // Activity functions
 
 // UpdateInstancesInDB is a Temporal activity that takes a collection of Instance data pushed by Site Agent and updates the DB
-func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UUID, instanceInventory *cwsv1.InstanceInventory) ([]cwm.InventoryObjectLifecycleEvent, error) {
+func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UUID, instanceInventory *corev1.InstanceInventory) ([]cwm.InventoryObjectLifecycleEvent, error) {
 	logger := log.With().Str("Activity", "UpdateInstancesInDB").Str("Site", siteID.String()).Logger()
 
 	logger.Info().Msg("starting activity")
@@ -66,7 +78,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 		return nil, err
 	}
 
-	if instanceInventory.InventoryStatus == cwsv1.InventoryStatus_INVENTORY_STATUS_FAILED {
+	if instanceInventory.InventoryStatus == corev1.InventoryStatus_INVENTORY_STATUS_FAILED {
 		logger.Warn().Msg("received failed inventory status from Site Agent, skipping inventory processing")
 		return nil, nil
 	}
@@ -287,7 +299,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 			} else {
 				// Check if the latest status detail message is different from the current status message
 				// Leave orderBy nil since the result is sorted by create timestamp by default
-				latestsd, _, serr := sdDAO.GetAllByEntityID(ctx, nil, instance.ID.String(), nil, cwutil.GetPtr(1), nil)
+				latestsd, _, serr := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{instance.ID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(1)})
 				if serr != nil {
 					slogger.Error().Err(serr).Msg("failed to retrieve latest Status Detail for Instance")
 				} else if len(latestsd) == 0 || (latestsd[0].Message != nil && *latestsd[0].Message != statusMessage) {
@@ -322,16 +334,22 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 		}
 
 		// Process/update Ethernet Interfaces in DB
-		// Process Interface type of VpcPrefix as well as Subnet
+		// Process Interface types of VPC selection, VpcPrefix, and Subnet.
 		if controllerInstance.Config.Network != nil && controllerInstance.Status.Network != nil {
 			interfaceDAO := cdbm.NewInterfaceDAO(mi.dbSession)
-			interfaces, _, serr := interfaceDAO.GetAll(ctx, nil, cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)}, []string{cdbm.SubnetRelationName, cdbm.VpcPrefixRelationName})
+			interfaces, _, serr := interfaceDAO.GetAll(
+				ctx,
+				nil,
+				cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}},
+				cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)},
+				[]string{cdbm.SubnetRelationName, cdbm.VpcRelationName, cdbm.VpcPrefixRelationName},
+			)
 			if serr != nil {
 				slogger.Error().Err(serr).Msg("failed to get Interfaces for Instance from DB")
 				continue
 			}
 
-			// Build either Subnet or VpcPrefix Map
+			// Build a lookup map from persisted interface intent.
 			interfaceMap := map[string]*cdbm.Interface{}
 			for _, ifc := range interfaces {
 				curIfc := ifc
@@ -343,8 +361,14 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 						continue
 					}
 				} else {
-					// Build multi DPU interface map where same VPC prefix can have multiple interfaces
-					if ifc.VpcPrefixID != nil && ifc.Device != nil {
+					if ifc.VpcID != nil && ifc.Vpc != nil && ifc.Vpc.ControllerVpcID != nil {
+						// TODO: Persist a request index to distinguish multiple device-less
+						// Interfaces selecting the same VPC deterministically.
+						interfaceMap["vpc-"+ifc.Vpc.ControllerVpcID.String()] = &curIfc
+					}
+
+					// Build multi DPU interface map where the same network selector can have multiple interfaces
+					if (ifc.VpcID != nil || ifc.VpcPrefixID != nil) && ifc.Device != nil {
 						// Multi DPU interface
 						deviceInstanceId := fmt.Sprintf("%s-%d", *ifc.Device, 0)
 						if ifc.DeviceInstance != nil {
@@ -356,7 +380,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 							deviceInstanceId = fmt.Sprintf("%s-virtual-%d", deviceInstanceId, *ifc.VirtualFunctionID)
 						}
 						interfaceMap[deviceInstanceId] = &curIfc
-					} else if ifc.VpcPrefixID != nil {
+					} else if ifc.VpcID == nil && ifc.VpcPrefixID != nil {
 						// FNN interface
 						interfaceMap[ifc.VpcPrefixID.String()] = &curIfc
 					}
@@ -379,26 +403,38 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 			for idx, interfaceConfig := range controllerInstance.Config.Network.Interfaces {
 				var ok bool
 				var ifc *cdbm.Interface
+				usesVpcSelection := false
 
-				// Parse the VpcPrefix if it is specified
+				deviceInstanceId := ""
+				if interfaceConfig.Device != nil {
+					deviceInstanceId = fmt.Sprintf("%s-%d", *interfaceConfig.Device, interfaceConfig.DeviceInstance)
+					if interfaceConfig.FunctionType == corev1.InterfaceFunctionType_PHYSICAL_FUNCTION {
+						deviceInstanceId = fmt.Sprintf("%s-physical", deviceInstanceId)
+					} else {
+						deviceInstanceId = fmt.Sprintf("%s-virtual-%d", deviceInstanceId, *interfaceConfig.VirtualFunctionId)
+					}
+				}
+
+				// Match the controller config to its persisted REST interface intent.
 				if interfaceConfig.NetworkDetails != nil {
-					switch interfaceConfig.NetworkDetails.(type) {
-					case *cwsv1.InstanceInterfaceConfig_VpcPrefixId:
+					switch networkDetails := interfaceConfig.NetworkDetails.(type) {
+					case *corev1.InstanceInterfaceConfig_VpcPrefixId:
 						if interfaceConfig.Device != nil {
 							// Multi DPU interface
-							deviceInstanceId := fmt.Sprintf("%s-%d", *interfaceConfig.Device, interfaceConfig.DeviceInstance)
-							if interfaceConfig.FunctionType == cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION {
-								deviceInstanceId = fmt.Sprintf("%s-physical", deviceInstanceId)
-							} else {
-								deviceInstanceId = fmt.Sprintf("%s-virtual-%d", deviceInstanceId, *interfaceConfig.VirtualFunctionId)
-							}
 							ifc, ok = interfaceMap[deviceInstanceId]
 						} else {
 							// FNN interface
-							ifc, ok = interfaceMap[interfaceConfig.NetworkDetails.(*cwsv1.InstanceInterfaceConfig_VpcPrefixId).VpcPrefixId.Value]
+							ifc, ok = interfaceMap[networkDetails.VpcPrefixId.Value]
 						}
-					case *cwsv1.InstanceInterfaceConfig_SegmentId:
-						ifc, ok = interfaceMap[interfaceConfig.NetworkDetails.(*cwsv1.InstanceInterfaceConfig_SegmentId).SegmentId.Value]
+					case *corev1.InstanceInterfaceConfig_SegmentId:
+						ifc, ok = interfaceMap[networkDetails.SegmentId.Value]
+					case *corev1.InstanceInterfaceConfig_Vpc:
+						usesVpcSelection = true
+						if interfaceConfig.Device != nil {
+							ifc, ok = interfaceMap[deviceInstanceId]
+						} else if networkDetails.Vpc != nil && networkDetails.Vpc.VpcId != nil {
+							ifc, ok = interfaceMap["vpc-"+networkDetails.Vpc.VpcId.Value]
+						}
 					}
 				} else {
 					if interfaceConfig.NetworkSegmentId != nil {
@@ -410,9 +446,15 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 					continue
 				}
 
+				// Config and status interface indices are aligned by Core. A partial
+				// inventory must not panic or shift status onto a different interface.
+				if idx >= len(controllerInstance.Status.Network.Interfaces) {
+					slogger.Warn().Int("Interface Index", idx).Msg("Site Controller Instance is missing matching Interface status")
+					continue
+				}
 				interfaceStatus := controllerInstance.Status.Network.Interfaces[idx]
 				if interfaceStatus != nil {
-					// Update Instance Subnet attributes and status in DB
+					// Update Instance Interface attributes and status in DB
 					var vfID *int
 					if interfaceStatus.VirtualFunctionId != nil {
 						vfID = cwutil.GetPtr(int(*interfaceStatus.VirtualFunctionId))
@@ -438,14 +480,34 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 						inlineRoutingProfile.FromProto(interfaceConfig.RoutingProfile)
 					}
 
+					// A VPC selector remains the desired intent; synchronize Core's
+					// primary resolved prefix from the aligned status.
+					var vpcPrefixID *uuid.UUID
+					clearResolvedVpcPrefix := false
+					if usesVpcSelection {
+						resolvedPrefix := primaryResolvedVpcPrefixID(interfaceStatus.ResolvedVpcPrefixes)
+						if resolvedPrefix == nil {
+							clearResolvedVpcPrefix = controllerInstance.Status.Network.ConfigsSynced == corev1.SyncState_SYNCED &&
+								ifc.VpcPrefixID != nil
+						} else {
+							resolvedPrefixID, prefixErr := uuid.Parse(resolvedPrefix.Value)
+							if prefixErr != nil {
+								slogger.Error().Err(prefixErr).Str("Interface ID", ifc.ID.String()).Msg("failed to parse resolved VPC Prefix ID")
+							} else {
+								vpcPrefixID = &resolvedPrefixID
+							}
+						}
+					}
+
 					clearInput := cdbm.InterfaceClearInput{InterfaceID: ifc.ID}
+					clearInput.VpcPrefixID = clearResolvedVpcPrefix
 					if ifc.RequestedIpAddress != nil && interfaceConfig.IpAddress == nil {
 						clearInput.RequestedIpAddress = true
 					}
 					if ifc.InlineRoutingProfile != nil && interfaceConfig.RoutingProfile == nil {
 						clearInput.InlineRoutingProfile = true
 					}
-					if clearInput.RequestedIpAddress || clearInput.InlineRoutingProfile {
+					if clearInput.VpcPrefixID || clearInput.RequestedIpAddress || clearInput.InlineRoutingProfile {
 						_, serr := interfaceDAO.Clear(ctx, nil, clearInput)
 						if serr != nil {
 							slogger.Error().Err(serr).Str("Interface ID", ifc.ID.String()).Msg("failed to update Interface in DB")
@@ -454,13 +516,24 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 					}
 
 					var status *string
-					if controllerInstance.Status.Network.ConfigsSynced == cwsv1.SyncState_SYNCED {
+					if controllerInstance.Status.Network.ConfigsSynced == corev1.SyncState_SYNCED {
 						status = cwutil.GetPtr(cdbm.InterfaceStatusReady)
 					}
 
-					_, serr := interfaceDAO.Update(ctx, nil, cdbm.InterfaceUpdateInput{InterfaceID: ifc.ID, Device: device, DeviceInstance: deviceInstance, VirtualFunctionID: vfID, RequestedIpAddress: requestedIpAddress, InlineRoutingProfile: inlineRoutingProfile, MacAddress: macAddress, IpAddresses: ipAddresses, Status: status})
-					if serr != nil {
-						slogger.Error().Err(serr).Str("Interface ID", ifc.ID.String()).Msg("failed to update Interface in DB")
+					_, updateErr := interfaceDAO.Update(ctx, nil, cdbm.InterfaceUpdateInput{
+						InterfaceID:          ifc.ID,
+						VpcPrefixID:          vpcPrefixID,
+						Device:               device,
+						DeviceInstance:       deviceInstance,
+						VirtualFunctionID:    vfID,
+						RequestedIpAddress:   requestedIpAddress,
+						InlineRoutingProfile: inlineRoutingProfile,
+						MacAddress:           macAddress,
+						IpAddresses:          ipAddresses,
+						Status:               status,
+					})
+					if updateErr != nil {
+						slogger.Error().Err(updateErr).Str("Interface ID", ifc.ID.String()).Msg("failed to update Interface in DB")
 					}
 				}
 			}
@@ -550,7 +623,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 					}
 
 					var status *string
-					if controllerInstance.Status.Infiniband.ConfigsSynced == cwsv1.SyncState_SYNCED {
+					if controllerInstance.Status.Infiniband.ConfigsSynced == corev1.SyncState_SYNCED {
 						// If the InfiniBand Config is synced
 						isInfiniBandConfigSynced = true
 						if ibifc.Status != cdbm.InfiniBandInterfaceStatusReady {
@@ -625,18 +698,18 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 
 				var status *string
 				switch desdStatus.DeploymentStatus {
-				case cwsv1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_PENDING:
+				case corev1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_PENDING:
 					status = cwutil.GetPtr(cdbm.DpuExtensionServiceDeploymentStatusPending)
-				case cwsv1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_RUNNING:
+				case corev1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_RUNNING:
 					status = cwutil.GetPtr(cdbm.DpuExtensionServiceDeploymentStatusRunning)
-				case cwsv1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_TERMINATING:
+				case corev1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_TERMINATING:
 					status = cwutil.GetPtr(cdbm.DpuExtensionServiceDeploymentStatusTerminating)
-				case cwsv1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_TERMINATED:
+				case corev1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_TERMINATED:
 					// This state is unlikely to be seen but in case we see it, Site is still in the process of removing the entry
 					status = cwutil.GetPtr(cdbm.DpuExtensionServiceDeploymentStatusTerminating)
-				case cwsv1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_ERROR:
+				case corev1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_ERROR:
 					status = cwutil.GetPtr(cdbm.DpuExtensionServiceDeploymentStatusError)
-				case cwsv1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_FAILED:
+				case corev1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_FAILED:
 					status = cwutil.GetPtr(cdbm.DpuExtensionServiceDeploymentStatusFailed)
 				}
 
@@ -715,7 +788,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 					continue
 				}
 
-				nvlifcKey := fmt.Sprintf("%s-%d", nvLinkGpuConfig.LogicalPartitionId.Value, nvLinkGpuConfig.DeviceInstance)
+				nvlifcKey := fmt.Sprintf("%s-%d", nvLinkGpuConfig.LogicalPartitionId.GetValue(), nvLinkGpuConfig.DeviceInstance)
 				nvlifc, ok := nvLinkInterfaceMap[nvlifcKey]
 				if !ok {
 					continue
@@ -765,7 +838,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 				}
 
 				var status *string
-				if controllerInstance.Status.Nvlink.ConfigsSynced == cwsv1.SyncState_SYNCED {
+				if controllerInstance.Status.Nvlink.ConfigsSynced == corev1.SyncState_SYNCED {
 					isNVLinkConfigSynced = true
 
 					// If the NVLink Interface is not in Ready state, set the status to Ready
@@ -913,7 +986,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 
 			// Leave orderBy as nil as the result is sorted by created timestamp by default
 			if status == instance.Status {
-				latestsd, _, serr := sdDAO.GetAllByEntityID(ctx, nil, instance.ID.String(), nil, cwutil.GetPtr(1), nil)
+				latestsd, _, serr := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{instance.ID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(1)})
 				if serr != nil {
 					slogger.Error().Err(serr).Msg("failed to retrieve latest Status Detail for Instance")
 					continue
@@ -1163,9 +1236,9 @@ func (mi ManageInstance) updateInstanceStatusInDB(ctx context.Context, tx *cdb.T
 
 	statusDetailDAO := cdbm.NewStatusDetailDAO(mi.dbSession)
 	if powerStatus != nil {
-		_, err = statusDetailDAO.CreateFromParams(ctx, tx, instanceID.String(), *powerStatus, statusMessage)
+		_, err = statusDetailDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: instanceID.String(), Status: *powerStatus, Message: statusMessage})
 	} else {
-		_, err = statusDetailDAO.CreateFromParams(ctx, tx, instanceID.String(), *status, statusMessage)
+		_, err = statusDetailDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: instanceID.String(), Status: *status, Message: statusMessage})
 	}
 
 	if err != nil {
@@ -1176,29 +1249,29 @@ func (mi ManageInstance) updateInstanceStatusInDB(ctx context.Context, tx *cdb.T
 }
 
 // Utility function to get NICo Instance status from Controller Instance state
-func getNICoInstanceStatus(controllerInstanceTenantState cwsv1.TenantState) (string, string) {
+func getNICoInstanceStatus(controllerInstanceTenantState corev1.TenantState) (string, string) {
 	switch controllerInstanceTenantState {
-	case cwsv1.TenantState_PROVISIONING:
+	case corev1.TenantState_PROVISIONING:
 		return cdbm.InstanceStatusProvisioning, "Instance is being provisioned on Site"
-	case cwsv1.TenantState_READY:
+	case corev1.TenantState_READY:
 		return cdbm.InstanceStatusReady, "Instance is ready for use"
-	case cwsv1.TenantState_CONFIGURING:
+	case corev1.TenantState_CONFIGURING:
 		return cdbm.InstanceStatusConfiguring, "Instance is being configured on Site"
-	case cwsv1.TenantState_REPAIRING:
+	case corev1.TenantState_REPAIRING:
 		return cdbm.InstanceStatusRepairing, "Instance is undergoing online-repair"
-	case cwsv1.TenantState_TERMINATING:
+	case corev1.TenantState_TERMINATING:
 		return cdbm.InstanceStatusTerminating, "Instance is terminating on Site"
-	case cwsv1.TenantState_TERMINATED:
+	case corev1.TenantState_TERMINATED:
 		return cdbm.InstanceStatusTerminated, "Instance has been terminated on Site"
-	case cwsv1.TenantState_FAILED:
+	case corev1.TenantState_FAILED:
 		return cdbm.InstanceStatusError, "Instance is in error state"
 	// Deprecated in favor of TenantState_UPDATING
-	case cwsv1.TenantState_DPU_REPROVISIONING:
+	case corev1.TenantState_DPU_REPROVISIONING:
 		return cdbm.InstanceStatusUpdating, "Instance is receiving system firmware updates"
 	// Deprecated in favor of TenantState_UPDATING
-	case cwsv1.TenantState_HOST_REPROVISIONING:
+	case corev1.TenantState_HOST_REPROVISIONING:
 		return cdbm.InstanceStatusUpdating, "Instance is receiving system firmware updates"
-	case cwsv1.TenantState_UPDATING:
+	case corev1.TenantState_UPDATING:
 		return cdbm.InstanceStatusUpdating, "Instance is receiving system firmware updates"
 	default:
 		return cdbm.InstanceStatusError, "Instance status is unknown"
@@ -1207,7 +1280,7 @@ func getNICoInstanceStatus(controllerInstanceTenantState cwsv1.TenantState) (str
 
 // UpdateInstanceMetadata is a Temporal activity that will trigger an update of an instance's metadata
 // if they are found out of sync with the cloud.
-func (mi ManageInstance) UpdateInstanceMetadata(ctx context.Context, siteID uuid.UUID, tc client.Client, instanceID uuid.UUID, controllerInstance *cwsv1.Instance) error {
+func (mi ManageInstance) UpdateInstanceMetadata(ctx context.Context, siteID uuid.UUID, tc client.Client, instanceID uuid.UUID, controllerInstance *corev1.Instance) error {
 	logger := log.With().Str("Activity", "UpdateInstanceMetadata").Str("Site ID", siteID.String()).Str("Instance ID", instanceID.String()).Logger()
 
 	logger.Info().Msg("starting activity")
@@ -1227,9 +1300,9 @@ func (mi ManageInstance) UpdateInstanceMetadata(ctx context.Context, siteID uuid
 	}
 
 	// Prepare the labels for the metadata of the nico call.
-	labels := []*cwsv1.Label{}
+	labels := []*corev1.Label{}
 	for k, v := range instance.Labels {
-		labels = append(labels, &cwsv1.Label{
+		labels = append(labels, &corev1.Label{
 			Key:   k,
 			Value: &v,
 		})
@@ -1242,15 +1315,15 @@ func (mi ManageInstance) UpdateInstanceMetadata(ctx context.Context, siteID uuid
 	}
 
 	// Prepare the config update request workflow object
-	updateInstanceRequest := &cwsv1.InstanceConfigUpdateRequest{
+	updateInstanceRequest := &corev1.InstanceConfigUpdateRequest{
 		InstanceId: controllerInstance.GetId(),
-		Metadata: &cwsv1.Metadata{
+		Metadata: &corev1.Metadata{
 			Name:        instance.Name,
 			Description: description,
 			Labels:      labels,
 		},
-		Config: &cwsv1.InstanceConfig{
-			Tenant: &cwsv1.TenantConfig{
+		Config: &corev1.InstanceConfig{
+			Tenant: &corev1.TenantConfig{
 				TenantOrganizationId: controllerInstance.Config.GetTenant().GetTenantOrganizationId(),
 				TenantKeysetIds:      controllerInstance.Config.GetTenant().GetTenantKeysetIds(),
 			},
@@ -1316,7 +1389,7 @@ func (milm ManageInstanceLifecycleMetrics) RecordInstanceStatusTransitionMetrics
 	metricsRecorded := 0
 
 	for _, event := range instanceLifecycleEvents {
-		statusDetails, _, err := sdDAO.GetAllByEntityID(ctx, nil, event.ObjectID.String(), nil, cwutil.GetPtr(cdbp.TotalLimit), nil)
+		statusDetails, _, err := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{event.ObjectID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)})
 		if err != nil {
 			logger.Error().Err(err).Str("Instance ID", event.ObjectID.String()).Msg("failed to retrieve Status Details for Instance")
 			return err

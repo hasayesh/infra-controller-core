@@ -21,6 +21,7 @@ edition.workspace = true
 exclude = ["/tests"]
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "libnmxc"
@@ -28,6 +29,7 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = { workspace = true }
+trace-propagation = { path = "../trace-propagation" }
 http = { workspace = true }
 tokio = { workspace = true, features = [
   "fs",
@@ -44,8 +46,12 @@ tonic-prost.workspace = true
 
 [dev-dependencies]
 clap = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

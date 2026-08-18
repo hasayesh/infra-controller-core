@@ -33,6 +33,14 @@ struct NetworkState {
     state: String,
 }
 
+fn format_free_ip_count(legacy_count: u32, count_v2: Option<u64>, saturated: bool) -> String {
+    match (count_v2, saturated) {
+        (Some(_), true) => "Effectively unlimited".to_string(),
+        (Some(count), false) => count.to_string(),
+        (None, _) => u64::from(legacy_count).to_string(),
+    }
+}
+
 #[allow(deprecated)]
 fn convert_old_history(
     history: &[forgerpc::NetworkSegmentStateHistory],
@@ -48,9 +56,9 @@ fn convert_old_history(
 }
 
 #[allow(deprecated)]
-async fn convert_network_to_nice_format(
+pub(in crate::network_segment) async fn convert_network_to_nice_format(
     segment: forgerpc::NetworkSegment,
-    history: Vec<forgerpc::StateHistoryRecord>,
+    history: Option<Vec<forgerpc::StateHistoryRecord>>,
     api_client: &ApiClient,
 ) -> CarbideCliResult<String> {
     let name = segment
@@ -69,6 +77,7 @@ async fn convert_network_to_nice_format(
             mtu: segment.mtu,
             segment_type: segment.segment_type,
             prefixes: segment.prefixes.clone(),
+            infer_slaac_eui64_addresses: false,
         }
     };
 
@@ -84,7 +93,7 @@ async fn convert_network_to_nice_format(
         )
     };
 
-    let width = 10;
+    let width = 18;
     let mut lines = String::new();
 
     let data = vec![
@@ -119,6 +128,10 @@ async fn convert_network_to_nice_format(
                 forgerpc::NetworkSegmentType::try_from(config.segment_type).unwrap_or_default()
             ),
         ),
+        (
+            "INFER SLAAC EUI-64",
+            config.infer_slaac_eui64_addresses.to_string(),
+        ),
     ];
     for (key, value) in data {
         writeln!(&mut lines, "{key:<width$}: {value}")?;
@@ -144,7 +157,14 @@ async fn convert_network_to_nice_format(
                 ),
                 ("SVI IP", prefix.svi_ip.unwrap_or_default()),
                 ("Reserve First", prefix.reserve_first.to_string()),
-                ("Free IP Count", prefix.free_ip_count.to_string()),
+                (
+                    "Free IP Count",
+                    format_free_ip_count(
+                        prefix.free_ip_count,
+                        prefix.free_ip_count_v2,
+                        prefix.free_ip_count_saturated,
+                    ),
+                ),
             ];
 
             for (key, value) in data {
@@ -157,28 +177,30 @@ async fn convert_network_to_nice_format(
         }
     }
 
-    writeln!(&mut lines, "STATE HISTORY: (Latest 5 only)")?;
-    if history.is_empty() {
-        writeln!(&mut lines, "\tEMPTY")?;
-    } else {
-        writeln!(
-            &mut lines,
-            "\tState          Version                      Time"
-        )?;
-        writeln!(
-            &mut lines,
-            "\t---------------------------------------------------"
-        )?;
-        for x in history.iter().rev().take(5).rev() {
+    if let Some(history) = history {
+        writeln!(&mut lines, "STATE HISTORY: (Latest 5 only)")?;
+        if history.is_empty() {
+            writeln!(&mut lines, "\tEMPTY")?;
+        } else {
             writeln!(
                 &mut lines,
-                "\t{:<15} {:25} {}",
-                serde_json::from_str::<NetworkState>(&x.state)
-                    .map(|ns| ns.state)
-                    .unwrap_or_else(|_| x.state.clone()),
-                x.version,
-                x.time.unwrap_or_default()
+                "\tState          Version                      Time"
             )?;
+            writeln!(
+                &mut lines,
+                "\t---------------------------------------------------"
+            )?;
+            for x in history.iter().rev().take(5).rev() {
+                writeln!(
+                    &mut lines,
+                    "\t{:<15} {:25} {}",
+                    serde_json::from_str::<NetworkState>(&x.state)
+                        .map(|ns| ns.state)
+                        .unwrap_or_else(|_| x.state.clone()),
+                    x.version,
+                    x.time.unwrap_or_default()
+                )?;
+            }
         }
     }
 
@@ -230,6 +252,7 @@ fn convert_network_to_nice_table(
                 mtu: segment.mtu,
                 segment_type: segment.segment_type,
                 prefixes: segment.prefixes.clone(),
+                infer_slaac_eui64_addresses: false,
             }
         };
 
@@ -331,13 +354,13 @@ async fn show_network_information(
     } else {
         println!(
             "{}",
-            convert_network_to_nice_format(segment, history, api_client).await?
+            convert_network_to_nice_format(segment, Some(history), api_client).await?
         );
     }
     Ok(())
 }
 
-pub async fn handle_show(
+pub(crate) async fn handle_show(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,
@@ -362,8 +385,9 @@ pub async fn handle_show(
 #[cfg(test)]
 mod tests {
     use ::rpc::forge as forgerpc;
+    use carbide_test_support::{Check, check_values};
 
-    use super::{convert_network_to_nice_table, convert_old_history};
+    use super::{convert_network_to_nice_table, convert_old_history, format_free_ip_count};
 
     fn prefix(cidr: &str) -> forgerpc::NetworkPrefix {
         forgerpc::NetworkPrefix {
@@ -373,7 +397,60 @@ mod tests {
             reserve_first: 0,
             free_ip_count: 0,
             svi_ip: None,
+            free_ip_count_v2: None,
+            free_ip_count_saturated: false,
         }
+    }
+
+    #[test]
+    fn free_ip_count_display_marks_saturated_values() {
+        struct FreeIpCountRow {
+            legacy: u32,
+            v2: Option<u64>,
+            saturated: bool,
+        }
+
+        check_values(
+            [
+                Check {
+                    scenario: "wide count",
+                    input: FreeIpCountRow {
+                        legacy: 42,
+                        v2: Some(1u64 << 32),
+                        saturated: false,
+                    },
+                    expect: (1u64 << 32).to_string(),
+                },
+                Check {
+                    scenario: "saturated",
+                    input: FreeIpCountRow {
+                        legacy: u32::MAX,
+                        v2: Some(u64::MAX),
+                        saturated: true,
+                    },
+                    expect: "Effectively unlimited".to_string(),
+                },
+                Check {
+                    scenario: "legacy server fallback",
+                    input: FreeIpCountRow {
+                        legacy: 42,
+                        v2: None,
+                        saturated: false,
+                    },
+                    expect: "42".to_string(),
+                },
+                Check {
+                    scenario: "legacy fallback ignores an unknown saturation flag",
+                    input: FreeIpCountRow {
+                        legacy: 42,
+                        v2: None,
+                        saturated: true,
+                    },
+                    expect: "42".to_string(),
+                },
+            ],
+            |row| format_free_ip_count(row.legacy, row.v2, row.saturated),
+        );
     }
 
     fn old_history_record(state: &str, version: &str) -> forgerpc::NetworkSegmentStateHistory {
@@ -425,6 +502,7 @@ mod tests {
                 mtu: Some(9000),
                 segment_type: forgerpc::NetworkSegmentType::Tenant as i32,
                 prefixes: vec![prefix(cidr)],
+                infer_slaac_eui64_addresses: false,
             }),
             status: Some(forgerpc::NetworkSegmentStatus {
                 flags: vec![],

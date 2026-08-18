@@ -14,10 +14,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use std::collections::HashMap;
 
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::vpc::VpcId;
 use carbide_uuid::vpc_peering::VpcPeeringId;
+use futures_util::{FutureExt, TryFutureExt};
 use model::metadata::Metadata;
 use rpc::forge::forge_server::Forge;
 use rpc::forge::{
@@ -25,10 +27,11 @@ use rpc::forge::{
     VpcPeeringList, VpcPeeringSearchFilter, VpcPeeringsByIdsRequest, VpcVirtualizationType,
 };
 use sqlx::PgPool;
-use tonic::{Request, Response, Status};
+use tonic::{IntoRequest, Request, Response, Status};
 use uuid::Uuid;
 
-use super::common::api_fixtures::{self, TestEnv};
+use super::common::api_fixtures::{self, TestEnv, TestManagedHost};
+use crate::test_support::network_segment::FIXTURE_TENANT_ORG_ID;
 use crate::tests::common::api_fixtures::instance::default_tenant_config;
 use crate::tests::common::api_fixtures::network_segment::{
     FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS, create_network_segment, create_tenant_network_segment,
@@ -120,7 +123,9 @@ async fn create_test_vpcs(
             ipv6_interface_config: None,
             routing_profile: None,
         }],
+        #[allow(deprecated)]
         auto: false,
+        auto_config: None,
     };
     mh.instance_builer(env)
         .network(instance_network)
@@ -128,6 +133,76 @@ async fn create_test_vpcs(
         .await;
 
     Ok(mh.dpu().id)
+}
+
+async fn release_instances_from_vpcs(
+    env: &TestEnv,
+    vpc_ids: &[VpcId],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let instance_ids = futures_util::future::join_all(vpc_ids.iter().map(|vpc_id| {
+        async move {
+            env.api
+                .find_instance_ids(
+                    rpc::forge::InstanceSearchFilter {
+                        vpc_id: Some(vpc_id.to_string()),
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .map_ok(|r| r.into_inner().instance_ids)
+                .await
+                .unwrap()
+        }
+        .boxed()
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if instance_ids.is_empty() {
+        return Ok(());
+    }
+
+    let instances = env
+        .api
+        .find_instances_by_ids(rpc::forge::InstancesByIdsRequest { instance_ids }.into_request())
+        .await
+        .expect("searching for instances should succeed")
+        .into_inner()
+        .instances;
+
+    let mut machines: HashMap<MachineId, rpc::forge::Machine> = env
+        .api
+        .find_machines_by_ids(
+            rpc::forge::MachinesByIdsRequest {
+                machine_ids: instances.iter().filter_map(|i| i.machine_id).collect(),
+                include_history: false,
+            }
+            .into_request(),
+        )
+        .await
+        .expect("Finding machines should succeed")
+        .into_inner()
+        .machines
+        .into_iter()
+        .map(|m| (m.id.unwrap(), m))
+        .collect();
+
+    futures_util::future::join_all(instances.into_iter().map(|i| {
+        let machine = machines
+            .remove(&i.machine_id.unwrap())
+            .expect("Should have found machine for instance");
+        async move {
+            TestManagedHost::from_rpc_machine(&machine, env.api.clone())
+                .delete_instance(env, i.id.unwrap())
+                .await
+        }
+        .boxed()
+    }))
+    .await;
+
+    Ok(())
 }
 
 async fn find_vpc_id_by_name(
@@ -283,6 +358,8 @@ async fn test_vpc_peering_full(pool: PgPool) -> Result<(), Box<dyn std::error::E
     let vpc_peering_list = get_vpc_peerings(&env, vpc_id_1).await.unwrap().into_inner();
     assert_eq!(vpc_peering_list.vpc_peerings.len(), 2);
 
+    release_instances_from_vpcs(&env, &[vpc_id_1, vpc_id_2, vpc_id_3]).await?;
+
     let vpc_delete_response = env
         .api
         .delete_vpc(tonic::Request::new(rpc::forge::VpcDeletionRequest {
@@ -405,7 +482,9 @@ async fn create_vpc_peering(
             ipv6_interface_config: None,
             routing_profile: None,
         }],
+        #[allow(deprecated)]
         auto: false,
+        auto_config: None,
     };
 
     mh.instance_builer(env)
@@ -462,35 +541,6 @@ async fn test_vpc_peering_network_config_mixed(
 
 #[crate::sqlx_test]
 async fn test_vpc_peering_network_config_exclusive_etv(
-    pool: sqlx::PgPool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let env = api_fixtures::create_test_env(pool).await;
-
-    let (_, _, _, _, dpu_machine_id) = create_vpc_peering(
-        &env,
-        VpcVirtualizationType::EthernetVirtualizer,
-        VpcVirtualizationType::EthernetVirtualizer,
-    )
-    .await?;
-
-    let response = env
-        .api
-        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
-            dpu_machine_id: Some(dpu_machine_id),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert_eq!(response.tenant_interfaces.len(), 1);
-    assert_eq!(response.tenant_interfaces[0].vpc_peer_prefixes.len(), 1);
-    assert_eq!(response.tenant_interfaces[0].vpc_peer_vnis.len(), 0);
-
-    Ok(())
-}
-
-#[crate::sqlx_test]
-async fn test_vpc_peering_network_config_exclusive_etv_with_nvue(
     pool: sqlx::PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let env = api_fixtures::create_test_env(pool).await;
@@ -671,14 +721,14 @@ async fn flat_vpc_can_peer_with_etv_under_exclusive_policy(
     let (_, etv_vpc) = api_fixtures::vpc::create_vpc(
         &env,
         "etv".to_string(),
-        Some("2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string()),
+        Some(FIXTURE_TENANT_ORG_ID.to_string()),
         None,
     )
     .await;
     let (_, flat_vpc) = api_fixtures::vpc::create_flat_vpc(
         &env,
         "flat".to_string(),
-        Some("2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string()),
+        Some(FIXTURE_TENANT_ORG_ID.to_string()),
     )
     .await;
 
@@ -690,6 +740,38 @@ async fn flat_vpc_can_peer_with_etv_under_exclusive_policy(
         }))
         .await
         .expect("Flat <-> ETV peering must be allowed under Exclusive policy");
+
+    // The create returning Ok only says the RPC didn't error. Read the peering back --
+    // and from *both* sides, because `find_vpc_peering_ids` filters on a single
+    // `vpc_id` while the row stores an ordered (vpc_id, peer_vpc_id) pair, so whether
+    // the flat side sees its own peering is a separate question.
+    let peerings = get_vpc_peerings(&env, etv_vpc.id.unwrap())
+        .await?
+        .into_inner()
+        .vpc_peerings;
+    assert_eq!(peerings.len(), 1);
+    // The stored row does not preserve the order the peering was created in, so assert
+    // the pair connects the two VPCs without assuming which side landed in `vpc_id`.
+    let pair = (peerings[0].vpc_id, peerings[0].peer_vpc_id);
+    assert!(
+        pair == (etv_vpc.id, flat_vpc.id) || pair == (flat_vpc.id, etv_vpc.id),
+        "peering should connect the two VPCs, got {pair:?}"
+    );
+
+    let from_flat = get_vpc_peerings(&env, flat_vpc.id.unwrap())
+        .await?
+        .into_inner()
+        .vpc_peerings;
+    assert_eq!(
+        from_flat.len(),
+        1,
+        "the flat side should see the peering too"
+    );
+    let pair = (from_flat[0].vpc_id, from_flat[0].peer_vpc_id);
+    assert!(
+        pair == (etv_vpc.id, flat_vpc.id) || pair == (flat_vpc.id, etv_vpc.id),
+        "the reverse lookup should name the same pair, got {pair:?}"
+    );
 
     Ok(())
 }
@@ -705,7 +787,7 @@ async fn flat_vpc_can_peer_with_fnn_under_exclusive_policy(
     let fnn_vpc = env
         .api
         .create_vpc(
-            VpcCreationRequest::builder("2829bbe3-c169-4cd9-8b2a-19a8b1618a93")
+            VpcCreationRequest::builder(FIXTURE_TENANT_ORG_ID)
                 .metadata(Metadata {
                     name: "fnn".to_string(),
                     ..Default::default()
@@ -718,7 +800,7 @@ async fn flat_vpc_can_peer_with_fnn_under_exclusive_policy(
     let (_, flat_vpc) = api_fixtures::vpc::create_flat_vpc(
         &env,
         "flat".to_string(),
-        Some("2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string()),
+        Some(FIXTURE_TENANT_ORG_ID.to_string()),
     )
     .await;
 
@@ -730,6 +812,38 @@ async fn flat_vpc_can_peer_with_fnn_under_exclusive_policy(
         }))
         .await
         .expect("Flat <-> FNN peering must be allowed under Exclusive policy");
+
+    // The create returning Ok only says the RPC didn't error. Read the peering back --
+    // and from *both* sides, because `find_vpc_peering_ids` filters on a single
+    // `vpc_id` while the row stores an ordered (vpc_id, peer_vpc_id) pair, so whether
+    // the flat side sees its own peering is a separate question.
+    let peerings = get_vpc_peerings(&env, fnn_vpc.id.unwrap())
+        .await?
+        .into_inner()
+        .vpc_peerings;
+    assert_eq!(peerings.len(), 1);
+    // The stored row does not preserve the order the peering was created in, so assert
+    // the pair connects the two VPCs without assuming which side landed in `vpc_id`.
+    let pair = (peerings[0].vpc_id, peerings[0].peer_vpc_id);
+    assert!(
+        pair == (fnn_vpc.id, flat_vpc.id) || pair == (flat_vpc.id, fnn_vpc.id),
+        "peering should connect the two VPCs, got {pair:?}"
+    );
+
+    let from_flat = get_vpc_peerings(&env, flat_vpc.id.unwrap())
+        .await?
+        .into_inner()
+        .vpc_peerings;
+    assert_eq!(
+        from_flat.len(),
+        1,
+        "the flat side should see the peering too"
+    );
+    let pair = (from_flat[0].vpc_id, from_flat[0].peer_vpc_id);
+    assert!(
+        pair == (fnn_vpc.id, flat_vpc.id) || pair == (flat_vpc.id, fnn_vpc.id),
+        "the reverse lookup should name the same pair, got {pair:?}"
+    );
 
     Ok(())
 }
@@ -744,13 +858,13 @@ async fn flat_vpc_can_peer_with_flat_under_exclusive_policy(
     let (_, flat_a) = api_fixtures::vpc::create_flat_vpc(
         &env,
         "flat-a".to_string(),
-        Some("2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string()),
+        Some(FIXTURE_TENANT_ORG_ID.to_string()),
     )
     .await;
     let (_, flat_b) = api_fixtures::vpc::create_flat_vpc(
         &env,
         "flat-b".to_string(),
-        Some("2829bbe3-c169-4cd9-8b2a-19a8b1618a93".to_string()),
+        Some(FIXTURE_TENANT_ORG_ID.to_string()),
     )
     .await;
 
@@ -762,6 +876,34 @@ async fn flat_vpc_can_peer_with_flat_under_exclusive_policy(
         }))
         .await
         .expect("Flat <-> Flat peering must be allowed under Exclusive policy");
+
+    // The create returning Ok only says the RPC didn't error. Read the peering back --
+    // and from *both* sides, because `find_vpc_peering_ids` filters on a single
+    // `vpc_id` while the row stores an ordered (vpc_id, peer_vpc_id) pair, so whether
+    // the flat side sees its own peering is a separate question.
+    let peerings = get_vpc_peerings(&env, flat_a.id.unwrap())
+        .await?
+        .into_inner()
+        .vpc_peerings;
+    assert_eq!(peerings.len(), 1);
+    // The stored row does not preserve the order the peering was created in, so assert
+    // the pair connects the two VPCs without assuming which side landed in `vpc_id`.
+    let pair = (peerings[0].vpc_id, peerings[0].peer_vpc_id);
+    assert!(
+        pair == (flat_a.id, flat_b.id) || pair == (flat_b.id, flat_a.id),
+        "peering should connect the two VPCs, got {pair:?}"
+    );
+
+    let from_peer = get_vpc_peerings(&env, flat_b.id.unwrap())
+        .await?
+        .into_inner()
+        .vpc_peerings;
+    assert_eq!(from_peer.len(), 1, "the peer side should see it too");
+    let pair = (from_peer[0].vpc_id, from_peer[0].peer_vpc_id);
+    assert!(
+        pair == (flat_a.id, flat_b.id) || pair == (flat_b.id, flat_a.id),
+        "the reverse lookup should name the same pair, got {pair:?}"
+    );
 
     Ok(())
 }
@@ -857,7 +999,9 @@ async fn test_fnn_vpc_with_flat_peer_exchanges_prefixes_and_vnis(
             ipv6_interface_config: None,
             routing_profile: None,
         }],
+        #[allow(deprecated)]
         auto: false,
+        auto_config: None,
     };
     mh.instance_builer(&env)
         .network(instance_network)

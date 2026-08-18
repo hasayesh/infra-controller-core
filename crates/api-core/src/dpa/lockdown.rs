@@ -25,9 +25,11 @@ use sha2::Sha256;
 use sqlx::PgPool;
 
 // CURRENT_LOCKDOWN_IKM_VERSION is the site-wide lockdown IKM version the
-// lock/unlock flow currently derives keys from. We will leave it hardcoded to 0 until
-// we introduce rotation logic.
-pub const CURRENT_LOCKDOWN_IKM_VERSION: u32 = 0;
+// lock/unlock flow derives keys from, and the version recorded as each card's
+// convergence target. Hardcoded to 0 until the rotation engine lands: rotating
+// the IKM (v0 -> v1) is what advances this, and that logic will own making newly
+// ingested NICs lock under the new IKM while already-locked cards migrate.
+pub(crate) const CURRENT_LOCKDOWN_IKM_VERSION: u32 = 0;
 
 // LOCKDOWN_KEY_LENGTH is the max length of the supported
 // key by a Mellanox device. As of now it's a 64-bit key,
@@ -41,16 +43,16 @@ const LOCKDOWN_KEY_LENGTH: usize = 8;
 // of the input KDF context provided for the key.
 // As of now we're just at V1.
 #[derive(Debug, Clone, Copy)]
-pub enum KdfContextVersion {
+enum KdfContextVersion {
     V1,
 }
 
 // KdfContext is the context provided to the underlying
 // KDF function for generating stable, device-unique,
 // lockdown (lock and unlock) keys.
-pub struct KdfContext {
-    pub mac_address: String,
-    pub machine_id: String,
+struct KdfContext {
+    mac_address: String,
+    machine_id: String,
 }
 
 impl KdfContext {
@@ -73,7 +75,7 @@ impl KdfContext {
 // Uses HKDF-SHA256 (RFC 5869) with the site-wide root as IKM and
 // a versioned info string containing device-specific context.
 // Returns a 16-character hex string representing the 64-bit key.
-pub fn build_lockdown_key(
+fn build_lockdown_key(
     site_wide_root: &[u8],
     ctx: &KdfContext,
     version: KdfContextVersion,
@@ -106,7 +108,7 @@ pub fn build_lockdown_key(
 // TODO(chet): Once I update the unlock flow to support
 // multiple unlock keys, I'll remove the #[cfg(test)].
 #[cfg(test)]
-pub fn derive_candidate_keys(
+fn derive_candidate_keys(
     site_wide_root: &[u8],
     ctx: &KdfContext,
 ) -> Result<Vec<String>, eyre::Report> {
@@ -144,22 +146,26 @@ fn lockdown_ikm_key(version: u32) -> CredentialKey {
     }
 }
 
-// fetch_kdf_secret fetches the IKM for the KDF from the
-// dedicated site-wide lockdown credential, decoupled from the BMC root so the
-// two can be rotated independently.
+// fetch_kdf_secret fetches the IKM for the KDF from the dedicated site-wide
+// lockdown credential, decoupled from the BMC root so the two can be rotated
+// independently.
+//
+// Returns the IKM version it resolved alongside the secret so the caller can
+// durably record the exact version a card is locked under, rather than
+// re-reading the (mutable) site-wide target later. Today the version is
+// `CURRENT_LOCKDOWN_IKM_VERSION`; the rotation engine will own advancing it.
 async fn fetch_kdf_secret(
     credential_reader: &dyn CredentialReader,
-) -> Result<String, eyre::Report> {
-    let ikm_key = lockdown_ikm_key(CURRENT_LOCKDOWN_IKM_VERSION);
+) -> Result<(u32, String), eyre::Report> {
+    let version = CURRENT_LOCKDOWN_IKM_VERSION;
+    let ikm_key = lockdown_ikm_key(version);
     let credentials = credential_reader
         .get_credentials(&ikm_key)
         .await?
-        .ok_or_else(|| {
-            eyre::eyre!("lockdown IKM v{CURRENT_LOCKDOWN_IKM_VERSION} not found; site not seeded")
-        })?;
+        .ok_or_else(|| eyre::eyre!("lockdown IKM v{version} not found; site not seeded"))?;
     let Credentials::UsernamePassword { password, .. } = credentials;
 
-    Ok(password)
+    Ok((version, password))
 }
 
 // ensure_lockdown_ikm_seeded idempotently seeds the dedicated site-wide
@@ -172,7 +178,7 @@ async fn fetch_kdf_secret(
 // this is a no-op and the IKM is seeded on a later boot once the root exists.
 // Safe to run on every startup and concurrently across replicas (a lost
 // create race is treated as success).
-pub async fn ensure_lockdown_ikm_seeded(
+pub(crate) async fn ensure_lockdown_ikm_seeded(
     credential_manager: &dyn CredentialManager,
 ) -> Result<(), eyre::Report> {
     let ikm_key = lockdown_ikm_key(CURRENT_LOCKDOWN_IKM_VERSION);
@@ -225,16 +231,32 @@ pub async fn ensure_lockdown_ikm_seeded(
     }
 }
 
+// SupernicLockdownKey is a derived lockdown key together with the site-wide
+// lockdown IKM version it was derived from. The version travels with the key so
+// the lock flow can durably record the exact version the card is locked under.
+pub(crate) struct SupernicLockdownKey {
+    // The 16-character hex lockdown key sent to the device.
+    pub(crate) key: String,
+    // The site-wide lockdown IKM version `key` was derived from.
+    pub(crate) ikm_version: u32,
+}
+
 // build_supernic_lockdown_key builds a single lockdown key using
 // the latest KdfContextVersion. Use this for locking a card.
-pub async fn build_supernic_lockdown_key(
+//
+// Returns the derived key together with the IKM version it used (see
+// `SupernicLockdownKey`). The unlock flow can ignore the version; the lock flow
+// persists it so the recorded convergence version matches what actually locked
+// the card.
+pub(crate) async fn build_supernic_lockdown_key(
     db_reader: &PgPool,
     dpa_interface_id: DpaInterfaceId,
     credential_reader: &dyn CredentialReader,
-) -> Result<String, eyre::Report> {
+) -> Result<SupernicLockdownKey, eyre::Report> {
     let ctx = build_kdf_context(db_reader, dpa_interface_id).await?;
-    let secret = fetch_kdf_secret(credential_reader).await?;
-    build_lockdown_key(secret.as_bytes(), &ctx, KdfContextVersion::V1)
+    let (ikm_version, secret) = fetch_kdf_secret(credential_reader).await?;
+    let key = build_lockdown_key(secret.as_bytes(), &ctx, KdfContextVersion::V1)?;
+    Ok(SupernicLockdownKey { key, ikm_version })
 }
 
 #[cfg(test)]
@@ -439,7 +461,8 @@ mod tests {
             .await
             .unwrap();
 
-        let secret = fetch_kdf_secret(&store).await.unwrap();
+        let (version, secret) = fetch_kdf_secret(&store).await.unwrap();
+        assert_eq!(version, CURRENT_LOCKDOWN_IKM_VERSION);
         assert_eq!(secret, "ikm-pass");
     }
 

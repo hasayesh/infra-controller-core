@@ -16,7 +16,6 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	swe "github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/error"
-	wutil "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
 	"github.com/labstack/echo/v4"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -34,7 +33,7 @@ import (
 	auth "github.com/NVIDIA/infra-controller/rest-api/auth/pkg/authorization"
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 )
 
@@ -235,11 +234,34 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 		}
 	}
 
+	// TargetedInstanceCreation supplies both policies, but keep write authorization
+	// separate from effective-profile response visibility.
+	tenantCanSetRoutingProfile := false
+	tenantCanViewEffectiveRoutingProfile := false
+	if cdbm.VpcTypeSupportsRoutingProfile(networkVirtualizationType) || apiRequest.RoutingProfile != nil {
+		tenantHasTargetedInstanceCreation, err := common.TenantHasTargetedInstanceCreation(ctx, nil, cvh.dbSession, tenant, &common.TenantPrivilegeScope{SiteID: &site.ID})
+		if err != nil {
+			logger.Error().Err(err).Msg("error resolving TargetedInstanceCreation for Tenant/Site")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to verify privileges for Site", nil)
+		}
+		tenantCanSetRoutingProfile = tenantHasTargetedInstanceCreation
+		tenantCanViewEffectiveRoutingProfile = tenantHasTargetedInstanceCreation
+	}
+
+	if apiRequest.RoutingProfileOverrides != nil && !cdbm.VpcTypeSupportsRoutingProfile(networkVirtualizationType) {
+		logger.Warn().Str("networkVirtualizationType", *networkVirtualizationType).Msg("routing profile overrides are not supported for network virtualization type")
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Routing profile overrides are not supported for network virtualization type: %s", *networkVirtualizationType), nil)
+	}
+
+	if apiRequest.RoutingProfileOverrides != nil && !tenantCanSetRoutingProfile {
+		logger.Warn().Msg("tenant does not have sufficient privileges to set `routingProfileOverrides`")
+		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "Tenant does not have sufficient privileges to set `routingProfileOverrides`", nil)
+	}
+
 	var routingProfile *string
 	if apiRequest.RoutingProfile != nil {
-		// For now, we gate on TargetedInstanceCreation permission,
-		// Which implies a "privileged tenant"
-		if tenant.Config == nil || !tenant.Config.TargetedInstanceCreation {
+		// Routing-profile writes require TargetedInstanceCreation for the VPC's Site.
+		if !tenantCanSetRoutingProfile {
 			logger.Warn().Msg("tenant does not have sufficient privileges to set `routingProfile`")
 			return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "Tenant does not have sufficient privileges to set `routingProfile`", nil)
 		}
@@ -307,7 +329,7 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 
 	var vpc *cdbm.Vpc
 	var ssd *cdbm.StatusDetail
-	controllerVpc := &cwssaws.Vpc{}
+	controllerVpc := &corev1.Vpc{}
 
 	// timeoutResp lets the closure signal a post-rollback handler — the
 	// TerminateWorkflow call has to run after the closure returns so that
@@ -328,6 +350,7 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 			SiteID:                    site.ID,
 			NetworkVirtualizationType: networkVirtualizationType,
 			RoutingProfile:            routingProfile,
+			RoutingProfileOverrides:   apiRequest.RoutingProfileOverrides.ToDB(),
 			NVLinkLogicalPartitionID:  defaultNvllPartitionId,
 			Labels:                    labels,
 			Status:                    cdbm.VpcStatusProvisioning,
@@ -356,14 +379,13 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 		vpc = updatedVpc
 
 		// Create status detail
-		createdSsd, derr := sdDAO.CreateFromParams(ctx, tx, vpc.ID.String(), cdbm.VpcStatusProvisioning,
-			cutil.GetPtr("VPC provisioning has been initiated on Site"))
+		createdSsd, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: vpc.ID.String(), Status: cdbm.VpcStatusProvisioning, Message: cutil.GetPtr("VPC provisioning has been initiated on Site")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for VPC", nil)
 		}
 		if createdSsd == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for VPC", nil)
 		}
 		ssd = createdSsd
@@ -435,14 +457,20 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 
 	statusDetails := []cdbm.StatusDetail{*ssd}
 
-	// Make a best-effort attempt to return a response with the allocated VNI.
-	if controllerVpc.GetStatus() != nil {
-		activeVni := wutil.GetUint32PtrToIntPtr(controllerVpc.GetStatus().Vni)
-
+	// Make a best-effort attempt to cache the controller-reported VNI and
+	// effective routing profile for the response.
+	controllerVpcModel := &cdbm.Vpc{}
+	controllerVpcModel.FromProto(controllerVpc)
+	activeVni := controllerVpcModel.ActiveVni
+	effectiveRoutingProfile := controllerVpcModel.EffectiveRoutingProfile
+	if activeVni != nil || effectiveRoutingProfile != nil {
 		uvpcInput := cdbm.VpcUpdateInput{
-			VpcID:     vpc.ID,
-			ActiveVni: activeVni,
-			Status:    cutil.GetPtr(cdbm.VpcStatusReady),
+			VpcID:                   vpc.ID,
+			ActiveVni:               activeVni,
+			EffectiveRoutingProfile: effectiveRoutingProfile,
+		}
+		if activeVni != nil {
+			uvpcInput.Status = cutil.GetPtr(cdbm.VpcStatusReady)
 		}
 		updatedVpc, err := vpcDAO.Update(ctx, nil, uvpcInput)
 		if err != nil {
@@ -451,20 +479,22 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 			// Update the vpc being returned if all went well.
 			vpc = updatedVpc
 
-			// Best effort create status detail
-			ssd, err = sdDAO.CreateFromParams(ctx, nil, vpc.ID.String(), cdbm.VpcStatusReady, cutil.GetPtr("VPC is ready for use"))
-			if err != nil {
-				logger.Error().Err(err).Msg("error creating Status Detail DB entry")
-			} else if ssd == nil {
-				logger.Error().Err(err).Msg("unexpected nil Status Detail returned from DB")
-			} else {
-				statusDetails = append(statusDetails, *ssd)
+			if activeVni != nil {
+				// Best effort create status detail
+				ssd, err = sdDAO.Create(ctx, nil, cdbm.StatusDetailCreateInput{EntityID: vpc.ID.String(), Status: cdbm.VpcStatusReady, Message: cutil.GetPtr("VPC is ready for use")})
+				if err != nil {
+					logger.Error().Err(err).Msg("error creating Status Detail DB entry")
+				} else if ssd == nil {
+					logger.Error().Err(err).Msg("unexpected nil Status Detail returned from DB")
+				} else {
+					statusDetails = append(statusDetails, *ssd)
+				}
 			}
 		}
 	}
 
 	// Create response
-	apiVpc := model.NewAPIVpc(*vpc, statusDetails)
+	apiVpc := model.NewAPIVpc(*vpc, statusDetails, tenantCanViewEffectiveRoutingProfile)
 
 	logger.Info().Msg("finishing API handler")
 
@@ -582,6 +612,34 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 	// Check that VPC belongs to the Tenant
 	if vpc.TenantID != tenant.ID {
 		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "VPC does not belong to current Tenant", nil)
+	}
+
+	// TargetedInstanceCreation supplies both policies, but keep write authorization
+	// separate from effective-profile response visibility.
+	tenantCanSetRoutingProfile := false
+	tenantCanViewEffectiveRoutingProfile := false
+	if cdbm.VpcTypeSupportsRoutingProfile(vpc.NetworkVirtualizationType) {
+		tenantHasTargetedInstanceCreation, err := common.TenantHasTargetedInstanceCreation(ctx, nil, uvh.dbSession, tenant, &common.TenantPrivilegeScope{SiteID: &vpc.SiteID})
+		if err != nil {
+			logger.Error().Err(err).Msg("error resolving TargetedInstanceCreation for Tenant/Site")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to resolve Tenant capability, DB error", nil)
+		}
+		tenantCanSetRoutingProfile = tenantHasTargetedInstanceCreation
+		tenantCanViewEffectiveRoutingProfile = tenantHasTargetedInstanceCreation
+	}
+
+	if apiRequest.RoutingProfileOverrides != nil && !cdbm.VpcTypeSupportsRoutingProfile(vpc.NetworkVirtualizationType) {
+		networkVirtualizationType := "<unspecified>"
+		if vpc.NetworkVirtualizationType != nil {
+			networkVirtualizationType = *vpc.NetworkVirtualizationType
+		}
+		logger.Warn().Str("networkVirtualizationType", networkVirtualizationType).Msg("routing profile overrides are not supported for network virtualization type")
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Routing profile overrides are not supported for network virtualization type: %s", networkVirtualizationType), nil)
+	}
+
+	if apiRequest.RoutingProfileOverrides != nil && !tenantCanSetRoutingProfile {
+		logger.Warn().Msg("tenant does not have sufficient privileges to set `routingProfileOverrides`")
+		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "Tenant does not have sufficient privileges to set `routingProfileOverrides`", nil)
 	}
 
 	// Ensure that Tenant has an Allocation with specified Site
@@ -735,11 +793,12 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 	err = cdb.WithTx(ctx, uvh.dbSession, func(tx *cdb.Tx) error {
 		// Update VPC
 		uvpcInput := cdbm.VpcUpdateInput{
-			VpcID:                  vpc.ID,
-			Name:                   apiRequest.Name,
-			Description:            apiRequest.Description,
-			Labels:                 labels,
-			NetworkSecurityGroupID: nsgID,
+			VpcID:                   vpc.ID,
+			Name:                    apiRequest.Name,
+			Description:             apiRequest.Description,
+			Labels:                  labels,
+			NetworkSecurityGroupID:  nsgID,
+			RoutingProfileOverrides: apiRequest.RoutingProfileOverrides.ToDB(),
 		}
 
 		if defaultNvllPartitionId != nil {
@@ -755,13 +814,9 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 
 		clearInput := cdbm.VpcClearInput{VpcID: vpc.ID}
 		shouldClear := false
-		// If this request is attempting to clear the OS for the instance, set it.
-		if apiRequest.NetworkSecurityGroupID != nil && *apiRequest.NetworkSecurityGroupID == "" {
-			clearInput.NetworkSecurityGroupID = true
-			shouldClear = true
-		}
 
-		// If this request is attempting to clear NSG for the VPC, set it.
+		// NSG updates clear propagation details so users do not see stale status.
+		// An empty ID also clears the VPC association itself.
 		if apiRequest.NetworkSecurityGroupID != nil {
 			if *apiRequest.NetworkSecurityGroupID == "" {
 				clearInput.NetworkSecurityGroupID = true
@@ -779,6 +834,12 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 			shouldClear = true
 		}
 
+		// A changed desired definition invalidates the last controller-resolved value.
+		if apiRequest.RoutingProfileOverrides != nil {
+			clearInput.EffectiveRoutingProfile = true
+			shouldClear = true
+		}
+
 		// Clear it in the db if something should be cleared.
 		if shouldClear {
 			clearedVpc, derr := vpcDAO.Clear(ctx, tx, clearInput)
@@ -790,7 +851,7 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 		}
 
 		// Get status details
-		fetchedSsds, _, derr := sdDAO.GetAllByEntityID(ctx, tx, vpc.ID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+		fetchedSsds, _, derr := sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{vpc.ID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Status Details for VPC from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Status Details for VPC", nil)
@@ -863,7 +924,7 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 	}
 
 	// Create response
-	apiVpc := model.NewAPIVpc(*vpc, ssds)
+	apiVpc := model.NewAPIVpc(*vpc, ssds, tenantCanViewEffectiveRoutingProfile)
 
 	logger.Info().Msg("finishing API handler")
 	return c.JSON(http.StatusOK, apiVpc)
@@ -982,6 +1043,12 @@ func (uvvh UpdateVPCVirtualizationHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "VPC does not belong to current Tenant", nil)
 	}
 
+	tenantCanViewEffectiveRoutingProfile, err := common.TenantHasTargetedInstanceCreation(ctx, nil, uvvh.dbSession, tenant, &common.TenantPrivilegeScope{SiteID: &vpc.SiteID})
+	if err != nil {
+		logger.Error().Err(err).Msg("error resolving TargetedInstanceCreation for Tenant/Site")
+		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to resolve Tenant capability, DB error", nil)
+	}
+
 	// Ensure that Tenant has access to Site
 	tsDAO := cdbm.NewTenantSiteDAO(uvvh.dbSession)
 	_, err = tsDAO.GetByTenantIDAndSiteID(ctx, nil, tenant.ID, vpc.SiteID, nil)
@@ -1055,7 +1122,7 @@ func (uvvh UpdateVPCVirtualizationHandler) Handle(c echo.Context) error {
 		uv = updatedVpc
 
 		// Get status details
-		fetchedSsds, _, derr := sdDAO.GetAllByEntityID(ctx, tx, uv.ID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+		fetchedSsds, _, derr := sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{uv.ID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Status Details for VPC from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve status history for VPC", nil)
@@ -1070,9 +1137,9 @@ func (uvvh UpdateVPCVirtualizationHandler) Handle(c echo.Context) error {
 		}
 
 		// VPC virtualization type can only be updated to FNN, the request validator guarantees that
-		siteVirtualizationType := cwssaws.VpcVirtualizationType_FNN
-		siteRequest := &cwssaws.VpcUpdateVirtualizationRequest{
-			Id:                        &cwssaws.VpcId{Value: vpc.GetSiteID().String()},
+		siteVirtualizationType := corev1.VpcVirtualizationType_FNN
+		siteRequest := &corev1.VpcUpdateVirtualizationRequest{
+			Id:                        &corev1.VpcId{Value: vpc.GetSiteID().String()},
 			NetworkVirtualizationType: &siteVirtualizationType,
 		}
 
@@ -1132,7 +1199,7 @@ func (uvvh UpdateVPCVirtualizationHandler) Handle(c echo.Context) error {
 	}
 
 	// Create response
-	apiVpc := model.NewAPIVpc(*uv, ssds)
+	apiVpc := model.NewAPIVpc(*uv, ssds, tenantCanViewEffectiveRoutingProfile)
 
 	logger.Info().Msg("finishing API handler")
 	return c.JSON(http.StatusOK, apiVpc)
@@ -1242,6 +1309,17 @@ func (gvh GetVPCHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "VPC does not belong to current Tenant", nil)
 	}
 
+	tenantCanViewEffectiveRoutingProfile := false
+	// Existing non-FNN rows can carry cached effective state, so gate that state
+	// instead of hiding it solely based on VPC type.
+	if cdbm.VpcTypeSupportsRoutingProfile(vpc.NetworkVirtualizationType) || vpc.EffectiveRoutingProfile != nil {
+		tenantCanViewEffectiveRoutingProfile, err = common.TenantHasTargetedInstanceCreation(ctx, nil, gvh.dbSession, tenant, &common.TenantPrivilegeScope{SiteID: &vpc.SiteID})
+		if err != nil {
+			logger.Error().Err(err).Msg("error resolving TargetedInstanceCreation for Tenant/Site")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to resolve Tenant capability, DB error", nil)
+		}
+	}
+
 	// Get status details
 	sdDAO := cdbm.NewStatusDetailDAO(gvh.dbSession)
 
@@ -1252,7 +1330,7 @@ func (gvh GetVPCHandler) Handle(c echo.Context) error {
 	}
 
 	// Create response
-	vc := model.NewAPIVpc(*vpc, ssds)
+	vc := model.NewAPIVpc(*vpc, ssds, tenantCanViewEffectiveRoutingProfile)
 
 	logger.Info().Msg("finishing API handler")
 
@@ -1347,26 +1425,6 @@ func (gavh GetAllVPCHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, errMsg, nil)
 	}
 
-	// Get infrastructure provider ID from query param
-	var infrastructureProviderID *uuid.UUID
-	qInfrastructureProviderID := c.QueryParam("infrastructureProviderId")
-	if qInfrastructureProviderID != "" {
-		id, serr := uuid.Parse(qInfrastructureProviderID)
-		if serr != nil {
-			logger.Warn().Err(serr).Msg("error parsing infrastructureProviderId in query into uuid")
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid Infrastructure Provider ID in query", nil)
-		}
-		infrastructureProviderID = &id
-
-		// Check for IP existence
-		ipDAO := cdbm.NewInfrastructureProviderDAO(gavh.dbSession)
-		_, verr := ipDAO.GetByID(ctx, nil, *infrastructureProviderID, nil)
-		if verr != nil {
-			logger.Warn().Err(verr).Msg("error retrieving InfrastructureProvider from DB by ID")
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Could not retrieve InfrastructureProvider with ID specified in query", nil)
-		}
-	}
-
 	// Get site IDs from query param
 	var siteIDs []uuid.UUID
 
@@ -1424,7 +1482,7 @@ func (gavh GetAllVPCHandler) Handle(c echo.Context) error {
 	// Get Tenant for this org
 	tnDAO := cdbm.NewTenantDAO(gavh.dbSession)
 
-	tenants, err := tnDAO.GetAllByOrg(ctx, nil, org, nil)
+	tenants, _, err := tnDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{Orgs: []string{org}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving Tenant for this org")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant for org", nil)
@@ -1435,14 +1493,23 @@ func (gavh GetAllVPCHandler) Handle(c echo.Context) error {
 	}
 	tenant := tenants[0]
 
+	privilegedSiteIDs, err := common.GetPrivilegedAccessSiteIDsForTenant(ctx, nil, gavh.dbSession, &tenant)
+	if err != nil {
+		logger.Error().Err(err).Msg("error resolving privileged Site access for Tenant")
+		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to resolve Tenant capability, DB error", nil)
+	}
+	privilegedSites := make(map[uuid.UUID]bool, len(privilegedSiteIDs))
+	for _, siteID := range privilegedSiteIDs {
+		privilegedSites[siteID] = true
+	}
+
 	// Get all VPCs by Tenant, and Site, if specified
 	vpcDAO := cdbm.NewVpcDAO(gavh.dbSession)
 
 	vpcFilter := cdbm.VpcFilterInput{
-		Org:                      &org,
-		InfrastructureProviderID: infrastructureProviderID,
-		SearchQuery:              searchQuery,
-		TenantIDs:                []uuid.UUID{tenant.ID},
+		Org:         &org,
+		SearchQuery: searchQuery,
+		TenantIDs:   []uuid.UUID{tenant.ID},
 	}
 
 	if len(siteIDs) > 0 {
@@ -1552,7 +1619,7 @@ func (gavh GetAllVPCHandler) Handle(c echo.Context) error {
 	apiVpcs := []model.APIVpc{}
 
 	for _, vpc := range vpcs {
-		apiVpc := model.NewAPIVpc(vpc, ssdMap[vpc.ID.String()])
+		apiVpc := model.NewAPIVpc(vpc, ssdMap[vpc.ID.String()], privilegedSites[vpc.SiteID])
 		apiVpcs = append(apiVpcs, apiVpc)
 	}
 
@@ -1732,8 +1799,7 @@ func (dvh DeleteVPCHandler) Handle(c echo.Context) error {
 		}
 
 		// Create status detail (best-effort: original code only logs on error)
-		if _, derr := sdDAO.CreateFromParams(ctx, tx, vpc.ID.String(), *cutil.GetPtr(cdbm.VpcStatusDeleting),
-			cutil.GetPtr("received request for deletion, pending processing")); derr != nil {
+		if _, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: vpc.ID.String(), Status: *cutil.GetPtr(cdbm.VpcStatusDeleting), Message: cutil.GetPtr("received request for deletion, pending processing")}); derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 		}
 
@@ -1744,8 +1810,8 @@ func (dvh DeleteVPCHandler) Handle(c echo.Context) error {
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve client for Site", nil)
 		}
 
-		deleteVpcRequest := &cwssaws.VpcDeletionRequest{
-			Id: &cwssaws.VpcId{Value: vpc.GetSiteID().String()},
+		deleteVpcRequest := &corev1.VpcDeletionRequest{
+			Id: &corev1.VpcId{Value: vpc.GetSiteID().String()},
 		}
 
 		workflowOptions := temporalClient.StartWorkflowOptions{
@@ -1818,5 +1884,5 @@ func (dvh DeleteVPCHandler) Handle(c echo.Context) error {
 	// Return response
 	logger.Info().Msg("finishing API handler")
 
-	return c.String(http.StatusAccepted, "Deletion request was accepted")
+	return c.JSON(http.StatusAccepted, model.NewAPIDeletionAcceptedResponse())
 }

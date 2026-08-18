@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
+	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 
 	"github.com/uptrace/bun"
@@ -19,7 +20,20 @@ import (
 const (
 	// TenantRelationName is the relation name for the Tenant model
 	TenantRelationName = "Tenant"
+
+	// TenantOrderByDefault default field to be used for ordering when none specified
+	TenantOrderByDefault = "created"
 )
+
+// TenantOrderByFields is a list of fields that can be used for ordering Tenants
+var TenantOrderByFields = []string{"created", "name", "org"}
+
+// TenantFilterInput input parameters for GetAll method
+type TenantFilterInput struct {
+	TenantIDs       []uuid.UUID
+	Orgs            []string
+	OrgDisplayNames []string
+}
 
 // TenantCreateInput input parameters for Create method
 type TenantCreateInput struct {
@@ -27,7 +41,6 @@ type TenantCreateInput struct {
 	DisplayName    *string
 	Org            string
 	OrgDisplayName *string
-	Config         *TenantConfig
 	CreatedBy      uuid.UUID
 }
 
@@ -37,11 +50,11 @@ type TenantUpdateInput struct {
 	Name           *string
 	DisplayName    *string
 	OrgDisplayName *string
-	Config         *TenantConfig
 }
 
-// TenantConfig is a data structure to capture configuration and capabilities for a Tenant
-// TODO: EnableSSHAccess is deprecated and should be removed.
+// TenantConfig captures Tenant-wide configuration. TargetedInstanceCreation
+// authorization no longer reads this configuration; it uses the
+// provider-scoped TenantAccount.config and per-site TenantSite.config values.
 type TenantConfig struct {
 	EnableSSHAccess          bool `json:"enableSshAccess"`
 	TargetedInstanceCreation bool `json:"targetedInstanceCreation"`
@@ -51,29 +64,32 @@ type TenantConfig struct {
 type Tenant struct {
 	bun.BaseModel `bun:"table:tenant,alias:tn"`
 
-	ID             uuid.UUID     `bun:"type:uuid,pk"`
-	Name           string        `bun:"name,notnull"`
-	DisplayName    *string       `bun:"display_name"`
-	Org            string        `bun:"org,notnull"`
-	OrgDisplayName *string       `bun:"org_display_name"`
-	Config         *TenantConfig `bun:"config,type:jsonb,notnull,default:'{}'::jsonb"`
-	Created        time.Time     `bun:"created,nullzero,notnull,default:current_timestamp"`
-	Updated        time.Time     `bun:"updated,nullzero,notnull,default:current_timestamp"`
-	Deleted        *time.Time    `bun:"deleted,soft_delete"`
-	CreatedBy      uuid.UUID     `bun:"type:uuid,notnull"`
+	ID             uuid.UUID `bun:"type:uuid,pk"`
+	Name           string    `bun:"name,notnull"`
+	DisplayName    *string   `bun:"display_name"`
+	Org            string    `bun:"org,notnull"`
+	OrgDisplayName *string   `bun:"org_display_name"`
+	// TargetedInstanceCreation within Config is superseded by
+	// TenantAccount.config and TenantSite.config. Config remains available for
+	// other Tenant-wide preferences.
+	Config    *TenantConfig `bun:"config,type:jsonb,scanonly"`
+	Created   time.Time     `bun:"created,nullzero,notnull,default:current_timestamp"`
+	Updated   time.Time     `bun:"updated,nullzero,notnull,default:current_timestamp"`
+	Deleted   *time.Time    `bun:"deleted,soft_delete"`
+	CreatedBy uuid.UUID     `bun:"type:uuid,notnull"`
 }
 
 // ToCreateRequestProto builds a CreateTenantRequest proto for sending this Tenant
 // to a Site. Falls back to Org for the metadata Name when OrgDisplayName
 // isn't set.
-func (tn *Tenant) ToCreateRequestProto() *cwssaws.CreateTenantRequest {
+func (tn *Tenant) ToCreateRequestProto() *corev1.CreateTenantRequest {
 	name := tn.Org
 	if tn.OrgDisplayName != nil {
 		name = *tn.OrgDisplayName
 	}
-	return &cwssaws.CreateTenantRequest{
+	return &corev1.CreateTenantRequest{
 		OrganizationId: tn.Org,
-		Metadata: &cwssaws.Metadata{
+		Metadata: &corev1.Metadata{
 			Name: name,
 		},
 	}
@@ -81,14 +97,14 @@ func (tn *Tenant) ToCreateRequestProto() *cwssaws.CreateTenantRequest {
 
 // ToUpdateRequestProto builds an UpdateTenantRequest proto for sending this Tenant
 // to a Site.
-func (tn *Tenant) ToUpdateRequestProto() *cwssaws.UpdateTenantRequest {
+func (tn *Tenant) ToUpdateRequestProto() *corev1.UpdateTenantRequest {
 	name := tn.Org
 	if tn.OrgDisplayName != nil {
 		name = *tn.OrgDisplayName
 	}
-	return &cwssaws.UpdateTenantRequest{
+	return &corev1.UpdateTenantRequest{
 		OrganizationId: tn.Org,
-		Metadata: &cwssaws.Metadata{
+		Metadata: &corev1.Metadata{
 			Name: name,
 		},
 	}
@@ -113,7 +129,7 @@ type TenantDAO interface {
 	//
 	GetByID(ctx context.Context, tx *db.Tx, id uuid.UUID, includeRelations []string) (*Tenant, error)
 	//
-	GetAllByOrg(ctx context.Context, tx *db.Tx, org string, includeRelations []string) ([]Tenant, error)
+	GetAll(ctx context.Context, tx *db.Tx, filter TenantFilterInput, page paginator.PageInput, includeRelations []string) ([]Tenant, int, error)
 	//
 	Create(ctx context.Context, tx *db.Tx, input TenantCreateInput) (*Tenant, error)
 	//
@@ -157,30 +173,59 @@ func (tsd TenantSQLDAO) GetByID(ctx context.Context, tx *db.Tx, id uuid.UUID, in
 	return tn, nil
 }
 
-// GetAllByOrg returns all Tenants for an Org
-func (tsd TenantSQLDAO) GetAllByOrg(ctx context.Context, tx *db.Tx, org string, includeRelations []string) ([]Tenant, error) {
-	// Create a child span and set the attributes for current request
-	ctx, tnDAOSpan := tsd.tracerSpan.CreateChildInCurrentContext(ctx, "TenantDAO.GetAllByOrg")
+func (tsd TenantSQLDAO) setQueryWithFilter(filter TenantFilterInput, query *bun.SelectQuery, tnDAOSpan *stracer.CurrentContextSpan) *bun.SelectQuery {
+	if filter.Orgs != nil {
+		query = query.Where("tn.org IN (?)", bun.In(filter.Orgs))
+		tsd.tracerSpan.SetAttribute(tnDAOSpan, "orgs", filter.Orgs)
+	}
+
+	if filter.OrgDisplayNames != nil {
+		query = query.Where("tn.org_display_name IN (?)", bun.In(filter.OrgDisplayNames))
+		tsd.tracerSpan.SetAttribute(tnDAOSpan, "org_display_names", filter.OrgDisplayNames)
+	}
+
+	if filter.TenantIDs != nil {
+		query = query.Where("tn.id IN (?)", bun.In(filter.TenantIDs))
+		tsd.tracerSpan.SetAttribute(tnDAOSpan, "tenant_ids", filter.TenantIDs)
+	}
+
+	return query
+}
+
+// GetAll returns all Tenants matching the given filter.
+func (tsd TenantSQLDAO) GetAll(ctx context.Context, tx *db.Tx, filter TenantFilterInput, page paginator.PageInput, includeRelations []string) ([]Tenant, int, error) {
+	ctx, tnDAOSpan := tsd.tracerSpan.CreateChildInCurrentContext(ctx, "TenantDAO.GetAll")
 	if tnDAOSpan != nil {
 		defer tnDAOSpan.End()
-
-		tsd.tracerSpan.SetAttribute(tnDAOSpan, "org", org)
 	}
 
 	tns := []Tenant{}
+	if filter.TenantIDs != nil && len(filter.TenantIDs) == 0 {
+		return tns, 0, nil
+	}
 
-	query := db.GetIDB(tx, tsd.dbSession).NewSelect().Model(&tns).Where("tn.org = ?", org)
+	query := db.GetIDB(tx, tsd.dbSession).NewSelect().Model(&tns)
+	query = tsd.setQueryWithFilter(filter, query, tnDAOSpan)
 
 	for _, relation := range includeRelations {
 		query = query.Relation(relation)
 	}
 
-	err := query.Scan(ctx)
-	if err != nil {
-		return nil, err
+	if page.OrderBy == nil {
+		page.OrderBy = paginator.NewDefaultOrderBy(TenantOrderByDefault)
 	}
 
-	return tns, nil
+	pag, err := paginator.NewPaginator(ctx, query, page.Offset, page.Limit, page.OrderBy, TenantOrderByFields)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	err = pag.Query.Limit(pag.Limit).Offset(pag.Offset).Scan(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return tns, pag.Total, nil
 }
 
 // Create creates a new Tenant from the given input
@@ -199,7 +244,6 @@ func (tsd TenantSQLDAO) Create(ctx context.Context, tx *db.Tx, input TenantCreat
 		DisplayName:    input.DisplayName,
 		Org:            input.Org,
 		OrgDisplayName: input.OrgDisplayName,
-		Config:         input.Config,
 		CreatedBy:      input.CreatedBy,
 	}
 
@@ -248,11 +292,6 @@ func (tsd TenantSQLDAO) Update(ctx context.Context, tx *db.Tx, input TenantUpdat
 		tn.OrgDisplayName = input.OrgDisplayName
 		updatedFields = append(updatedFields, "org_display_name")
 		tsd.tracerSpan.SetAttribute(tnDAOSpan, "org_display_name", *input.OrgDisplayName)
-	}
-
-	if input.Config != nil {
-		tn.Config = input.Config
-		updatedFields = append(updatedFields, "config")
 	}
 
 	if len(updatedFields) > 0 {

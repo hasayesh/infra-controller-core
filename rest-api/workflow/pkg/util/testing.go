@@ -93,6 +93,20 @@ func TestSetupSchema(t *testing.T, dbSession *cdb.Session) {
 	// create Operating System Site Association table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.OperatingSystemSiteAssociation)(nil))
 	assert.Nil(t, err)
+	// create IpxeTemplate table (UNIQUE(name) applied by migration in production)
+	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.IpxeTemplate)(nil))
+	assert.Nil(t, err)
+	_, err = dbSession.DB.Exec("ALTER TABLE ipxe_template DROP CONSTRAINT IF EXISTS ipxe_template_name_key")
+	assert.Nil(t, err)
+	_, err = dbSession.DB.Exec("ALTER TABLE ipxe_template ADD CONSTRAINT ipxe_template_name_key UNIQUE (name)")
+	assert.Nil(t, err)
+	// create IpxeTemplateSiteAssociation table (composite UNIQUE applied by migration in production)
+	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.IpxeTemplateSiteAssociation)(nil))
+	assert.Nil(t, err)
+	_, err = dbSession.DB.Exec("ALTER TABLE ipxe_template_site_association DROP CONSTRAINT IF EXISTS ipxe_template_site_association_template_id_site_id_key")
+	assert.Nil(t, err)
+	_, err = dbSession.DB.Exec("ALTER TABLE ipxe_template_site_association ADD CONSTRAINT ipxe_template_site_association_template_id_site_id_key UNIQUE (ipxe_template_id, site_id)")
+	assert.Nil(t, err)
 	// create Machine table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.Machine)(nil))
 	assert.Nil(t, err)
@@ -224,7 +238,7 @@ func TestBuildSite(t *testing.T, dbSession *cdb.Session, ip *cdbm.Infrastructure
 }
 
 // TestBuildTenant build tenant
-func TestBuildTenant(t *testing.T, dbSession *cdb.Session, org string, orgDisplayName string, config *cdbm.TenantConfig, user *cdbm.User) *cdbm.Tenant {
+func TestBuildTenant(t *testing.T, dbSession *cdb.Session, orgDisplayName string, org string, config *cdbm.TenantConfig, user *cdbm.User) *cdbm.Tenant {
 	tenant := &cdbm.Tenant{
 		ID:             uuid.New(),
 		Name:           orgDisplayName,
@@ -542,7 +556,10 @@ func TestBuildMachineInterface(t *testing.T, dbSession *cdb.Session, machineID s
 func TestBuildMachineInstanceType(t *testing.T, dbSession *cdb.Session, m *cdbm.Machine, it *cdbm.InstanceType) *cdbm.MachineInstanceType {
 	mitDAO := cdbm.NewMachineInstanceTypeDAO(dbSession)
 
-	mit, err := mitDAO.CreateFromParams(context.Background(), nil, m.ID, it.ID)
+	mit, err := mitDAO.Create(context.Background(), nil, cdbm.MachineInstanceTypeCreateInput{
+		MachineID:      m.ID,
+		InstanceTypeID: it.ID,
+	})
 	assert.Nil(t, err)
 
 	return mit
@@ -870,7 +887,7 @@ func TestTemporalSiteClientPool(t *testing.T) *sc.ClientPool {
 func TestBuildStatusDetailWithTime(t *testing.T, dbSession *cdb.Session, entityID string, status string, message *string, timestamp time.Time) *cdbm.StatusDetail {
 	// Create status detail using DAO
 	statusDetailDAO := cdbm.NewStatusDetailDAO(dbSession)
-	statusDetail, err := statusDetailDAO.CreateFromParams(context.Background(), nil, entityID, status, message)
+	statusDetail, err := statusDetailDAO.Create(context.Background(), nil, cdbm.StatusDetailCreateInput{EntityID: entityID, Status: status, Message: message})
 	assert.NoError(t, err)
 
 	// Update the created timestamp directly in the database

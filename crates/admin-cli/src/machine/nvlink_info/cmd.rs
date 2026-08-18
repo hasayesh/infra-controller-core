@@ -17,12 +17,14 @@
 
 use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge as forgerpc;
+use carbide_utils::none_if_empty::NoneIfEmpty;
 
 use super::args::{NvlinkInfoArgs, NvlinkInfoPopulateArgs};
 use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
-pub async fn handle_nvlink_info_show(
+#[allow(deprecated)]
+pub(super) async fn handle_nvlink_info_show(
     args: NvlinkInfoArgs,
     api_client: &ApiClient,
 ) -> CarbideCliResult<()> {
@@ -58,7 +60,8 @@ pub async fn handle_nvlink_info_show(
     Ok(())
 }
 
-pub async fn handle_nvlink_info_populate(
+#[allow(deprecated)]
+pub(super) async fn handle_nvlink_info_populate(
     args: NvlinkInfoPopulateArgs,
     _output_format: OutputFormat,
     api_client: &ApiClient,
@@ -125,6 +128,7 @@ pub async fn handle_nvlink_info_populate(
         .0
         .nmxc_browse(forgerpc::NmxcBrowseRequest {
             chassis_serial: serial_number.clone(),
+            rack_id: None,
             operation: forgerpc::NmxcBrowseOperation::GpuInfoList as i32,
             gpu_uid: 0,
         })
@@ -149,7 +153,7 @@ pub async fn handle_nvlink_info_populate(
         .get("server_header")
         .and_then(|h| h.get("domain_uuid"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .none_if_empty()
         .ok_or_else(|| {
             CarbideCliError::GenericError("No domain_uuid in NMX-C server_header".to_string())
         })?

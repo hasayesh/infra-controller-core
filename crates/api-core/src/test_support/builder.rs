@@ -27,6 +27,8 @@ use carbide_secrets::credentials::CredentialManager;
 use carbide_secrets::test_support::certificates::TestCertificateProvider;
 use carbide_secrets::test_support::credentials::TestCredentialManager;
 use carbide_site_explorer::config::SiteExplorerExploreMode;
+use carbide_site_explorer::test_support::MockEndpointExplorer;
+use carbide_site_explorer::{EndpointExplorationService, EndpointExplorer};
 use carbide_utils::test_support::test_meter::TestMeter;
 use db::work_lock_manager::WorkLockManagerHandle;
 use libnmxc::NmxcPool;
@@ -62,6 +64,8 @@ pub struct TestApiBuilder {
     metric_emitter: Option<ApiMetricsEmitter>,
     ib_fabric_manager: Option<Arc<dyn IBFabricManager>>,
     component_manager: Option<Arc<component_manager::component_manager::ComponentManager>>,
+    secrets_context: Option<crate::secrets::SecretsContext>,
+    endpoint_explorer: Option<MockEndpointExplorer>,
 }
 
 impl TestApiBuilder {
@@ -84,6 +88,8 @@ impl TestApiBuilder {
             metric_emitter: None,
             ib_fabric_manager: None,
             component_manager: None,
+            secrets_context: None,
+            endpoint_explorer: None,
         }
     }
 
@@ -115,7 +121,8 @@ impl TestApiBuilder {
         }
     }
 
-    pub fn with_eth_data(self, eth_data: EthVirtData) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_eth_data(self, eth_data: EthVirtData) -> Self {
         Self {
             eth_data: Some(eth_data),
             ..self
@@ -150,12 +157,30 @@ impl TestApiBuilder {
         }
     }
 
+    /// Build a secrets-backed `Api` so handler tests can exercise the
+    /// Postgres secrets / re-wrap path. Left `None` by default, which keeps
+    /// the secrets RPCs returning "not configured" as in production without
+    /// a `[secrets]` section.
+    pub fn with_secrets_context(self, secrets_context: crate::secrets::SecretsContext) -> Self {
+        Self {
+            secrets_context: Some(secrets_context),
+            ..self
+        }
+    }
+
     pub fn with_component_manager(
         self,
         component_manager: Arc<component_manager::component_manager::ComponentManager>,
     ) -> Self {
         Self {
             component_manager: Some(component_manager),
+            ..self
+        }
+    }
+
+    pub fn with_endpoint_explorer(self, endpoint_explorer: MockEndpointExplorer) -> Self {
+        Self {
+            endpoint_explorer: Some(endpoint_explorer),
             ..self
         }
     }
@@ -196,16 +221,28 @@ impl TestApiBuilder {
             runtime_config.allow_bmc_basic_auth_fallback,
         ));
 
-        let endpoint_explorer = carbide_site_explorer::new_bmc_explorer(
+        // In tests a real explorer can't explore (nv-redfish has no `RedfishSim`
+        // behind it), so a supplied mock serves exploration -- but forwards its
+        // boot-order/machine-setup calls to this real, `RedfishSim`-backed
+        // explorer. With no mock, the API uses the real explorer (prod wiring).
+        let real_endpoint_explorer = carbide_site_explorer::new_bmc_explorer(
             redfish_pool.clone(),
             nv_redfish_pool,
             carbide_ipmi::test_support(),
             credential_manager.clone(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            // Tests use MockEndpointExplorer. So this doesn't affect anything.
             SiteExplorerExploreMode::NvRedfish,
+            self.db_pool.clone(),
         );
-
+        let endpoint_explorer: Arc<dyn EndpointExplorer> = match self.endpoint_explorer {
+            Some(mock) => Arc::new(mock.with_redfish_backend(real_endpoint_explorer)),
+            None => real_endpoint_explorer,
+        };
+        let endpoint_exploration_service = Arc::new(EndpointExplorationService::new(
+            self.db_pool.clone(),
+            endpoint_explorer.clone(),
+            Arc::new(runtime_config.get_firmware_config()),
+        ));
         let metric_emitter = self.metric_emitter.unwrap_or_else(|| {
             let test_meter = TestMeter::default();
             ApiMetricsEmitter::new(&test_meter.meter())
@@ -241,6 +278,7 @@ impl TestApiBuilder {
             ib_fabric_manager,
             dynamic_settings,
             endpoint_explorer,
+            endpoint_exploration_service,
             dpu_health_log_limiter,
             scout_stream_registry,
             rms_client: self.rms_client,
@@ -251,6 +289,8 @@ impl TestApiBuilder {
             component_manager: self.component_manager.map(|cm| (*cm).clone()),
             bmc_session_manager,
             bms_client: std::sync::OnceLock::new(),
+            secrets_context: self.secrets_context,
+            node_jwt_validator: None,
         }
     }
 }

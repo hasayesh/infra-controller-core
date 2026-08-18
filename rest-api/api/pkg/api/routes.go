@@ -11,7 +11,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/api/internal/config"
 	apiHandler "github.com/NVIDIA/infra-controller/rest-api/api/pkg/api/handler"
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	sc "github.com/NVIDIA/infra-controller/rest-api/api/pkg/client/site"
 )
@@ -28,6 +28,80 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Path:    apiPathPrefix + "/metadata",
 			Method:  http.MethodGet,
 			Handler: apiHandler.NewMetadataHandler(),
+		},
+		// BMC credential endpoint (Provider Admin). First operation migrated to
+		// the generic NICo Core gRPC proxy; equivalent to the admin CLI
+		// `credential add-bmc` command.
+		{
+			Path:    apiPathPrefix + "/credential/bmc",
+			Method:  http.MethodPut,
+			Handler: apiHandler.NewCreateOrUpdateBMCCredentialHandler(dbSession, scp, cfg),
+		},
+		// Site Explorer explored endpoints (Provider Admin). Lists Core explored
+		// endpoints through FindExploredEndpointIds + FindExploredEndpointsByIds.
+		{
+			Path:    apiPathPrefix + "/site-explorer/endpoint",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllExploredEndpointHandler(dbSession, scp, cfg),
+		},
+		// Site Explorer endpoint actions (Provider Admin). Composes existing
+		// single-endpoint Core methods through the generic gRPC proxy.
+		{
+			Path:    apiPathPrefix + "/site-explorer/endpoint/action",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewSiteExplorerEndpointActionHandler(dbSession, scp, cfg),
+		},
+		// Site-default UEFI credential endpoint (Provider Admin); equivalent to
+		// the admin CLI `credential add-uefi` command.
+		{
+			Path:    apiPathPrefix + "/credential/uefi",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCreateUEFICredentialHandler(dbSession, scp),
+		},
+		// Measured-boot machine and profile trust approvals (Provider Admin).
+		{
+			Path:    apiPathPrefix + "/measured-boot/trusted-machine",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCreateMeasuredBootTrustedMachineHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/measured-boot/trusted-machine",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllMeasuredBootTrustedMachineHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/measured-boot/trusted-machine/:id",
+			Method:  http.MethodDelete,
+			Handler: apiHandler.NewDeleteMeasuredBootTrustedMachineHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/measured-boot/trusted-profile",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCreateMeasuredBootTrustedProfileHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/measured-boot/trusted-profile",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllMeasuredBootTrustedProfileHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/measured-boot/trusted-profile/:id",
+			Method:  http.MethodDelete,
+			Handler: apiHandler.NewDeleteMeasuredBootTrustedProfileHandler(dbSession, scp),
+		},
+		// Site-wide credential rotation (Provider Admin); equivalent to the admin
+		// CLI `credential rotate` / `credential rotation-status` commands. POST
+		// stages a rotation and returns the new target version; GET reports
+		// convergence for the site or a single device by MAC.
+		{
+			Path:    apiPathPrefix + "/credential/rotation",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewRotateCredentialHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/credential/rotation",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetCredentialRotationStatusHandler(dbSession, scp),
 		},
 		// User endpoint
 		{
@@ -554,6 +628,57 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Method:  http.MethodGet,
 			Handler: apiHandler.NewGetMachineStatusDetailsHandler(dbSession),
 		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/dpu",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllDpuMachineHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/dpu/reprovision",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewReprovisionMachineDpuHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/bmc/reset",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewResetMachineBMCHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/health-report",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllMachineHealthReportHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/health-report",
+			Method:  http.MethodPut,
+			Handler: apiHandler.NewCreateOrUpdateMachineHealthReportHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/health-report/:source",
+			Method:  http.MethodDelete,
+			Handler: apiHandler.NewDeleteMachineHealthReportHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/power",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewMachinePowerControlHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/validation/run",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCreateMachineValidationRunHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/validation/run",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllMachineValidationRunHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/validation/result",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetMachineValidationResultsHandler(dbSession, tc, scp, cfg),
+		},
+
 		// Machine GPU Stats endpoint
 		{
 			Path:    apiPathPrefix + "/machine/gpu/stats",
@@ -671,6 +796,17 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Path:    apiPathPrefix + "/operating-system/:id",
 			Method:  http.MethodDelete,
 			Handler: apiHandler.NewDeleteOperatingSystemHandler(dbSession, tc, scp, cfg),
+		},
+		// iPXE Template endpoints (read-only; templates are synced from nico-core)
+		{
+			Path:    apiPathPrefix + "/ipxe-template",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllIpxeTemplateHandler(dbSession, tc, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/ipxe-template/:id",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetIpxeTemplateHandler(dbSession, tc, cfg),
 		},
 		// NetworkSecurityGroup endpoints
 		{
@@ -867,6 +1003,11 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 		// SKU endpoints
 		{
 			Path:    apiPathPrefix + "/sku",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCreateSkuHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/sku",
 			Method:  http.MethodGet,
 			Handler: apiHandler.NewGetAllSkuHandler(dbSession, tc, cfg),
 		},
@@ -874,6 +1015,16 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Path:    apiPathPrefix + "/sku/:id",
 			Method:  http.MethodGet,
 			Handler: apiHandler.NewGetSkuHandler(dbSession, tc, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/sku/:id",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewUpdateSkuHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/sku/:id",
+			Method:  http.MethodDelete,
+			Handler: apiHandler.NewDeleteSkuHandler(dbSession, scp),
 		},
 		// Task endpoints (Flow). /rack/task/* and /task/* share get/cancel
 		// handlers; list operations are exposed under /rack/{id}/task and
@@ -924,6 +1075,48 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Path:    apiPathPrefix + "/task/rule/:id",
 			Method:  http.MethodDelete,
 			Handler: apiHandler.NewDeleteTaskRuleHandler(dbSession, tc, scp, cfg),
+		},
+		// Run endpoints (Flow). A run is a phased, policy-gated execution of
+		// one operation across many racks; Flow calls it an operation run.
+		{
+			Path:    apiPathPrefix + "/task/run",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCreateTaskRunHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/task/run",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllTaskRunHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/task/run/:id",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetTaskRunHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/task/run/:id/target",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllTaskRunTargetHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/task/run/:id/pause",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewPauseTaskRunHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/task/run/:id/resume",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewResumeTaskRunHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/task/run/:id/advance",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewAdvanceTaskRunPhaseHandler(dbSession, tc, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/task/run/:id/cancel",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCancelTaskRunHandler(dbSession, tc, scp, cfg),
 		},
 		{
 			Path:    apiPathPrefix + "/rack",
@@ -1057,6 +1250,18 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Method:  http.MethodDelete,
 			Handler: apiHandler.NewDeleteTenantIdentityTokenDelegationHandler(dbSession, scp),
 		},
+		// Host Firmware Config endpoint (Provider Admin). Proxied to Core via
+		// UpsertHostFirmwareConfig.
+		{
+			Path:    apiPathPrefix + "/firmware-config/host",
+			Method:  http.MethodPut,
+			Handler: apiHandler.NewCreateOrUpdateHostFirmwareConfigHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/firmware-config/host",
+			Method:  http.MethodDelete,
+			Handler: apiHandler.NewDeleteHostFirmwareConfigHandler(dbSession, scp),
+		},
 	}
 
 	return apiRoutes
@@ -1072,7 +1277,7 @@ func NewWellKnownRoutes(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.
 		{
 			Path:    apiPathPrefix + "/site/:siteID/.well-known/jwks.json",
 			Method:  http.MethodGet,
-			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, cwssaws.JwksKind_Oidc),
+			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, corev1.JwksKind_Oidc),
 		},
 		{
 			Path:    apiPathPrefix + "/site/:siteID/.well-known/openid-configuration",
@@ -1082,7 +1287,7 @@ func NewWellKnownRoutes(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.
 		{
 			Path:    apiPathPrefix + "/site/:siteID/.well-known/spiffe/jwks.json",
 			Method:  http.MethodGet,
-			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, cwssaws.JwksKind_Spiffe),
+			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, corev1.JwksKind_Spiffe),
 		},
 	}
 }

@@ -14,11 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pub mod dpu_nic_firmware;
-pub mod dpu_nic_firmware_metrics;
-pub mod host_firmware;
-pub mod machine_update_module;
-pub mod metrics;
+pub(crate) mod dpu_nic_firmware;
+pub(crate) mod dpu_nic_firmware_metrics;
+mod host_firmware;
+pub(crate) mod machine_update_module;
+pub(crate) mod metrics;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -27,9 +27,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use carbide_machine_controller::dpf::DpfOperations;
+use carbide_utils::managed_loop::{self, LoopManager};
 use carbide_utils::periodic_timer::PeriodicTimer;
 use carbide_uuid::machine::MachineId;
-use db::work_lock_manager::WorkLockManagerHandle;
+use db::work_lock_manager::{AcquireLockError, WorkLockManagerHandle};
 use db::{DatabaseError, ObjectFilter, Transaction};
 use host_firmware::HostFirmwareUpdate;
 use machine_update_module::MachineUpdateModule;
@@ -43,8 +44,8 @@ use tokio_util::sync::CancellationToken;
 
 use self::dpu_nic_firmware::DpuNicFirmwareUpdate;
 use self::metrics::MachineUpdateManagerMetrics;
-use crate::CarbideResult;
 use crate::cfg::file::{CarbideConfig, MaxConcurrentUpdates};
+use crate::{CarbideError, CarbideResult};
 
 /// The MachineUpdateManager periodically runs [modules](machine_update_module::MachineUpdateModule) to initiate upgrades of machine components.
 /// On each iteration the MachineUpdateManager will:
@@ -55,7 +56,7 @@ use crate::cfg::file::{CarbideConfig, MaxConcurrentUpdates};
 /// Config from [CarbideConfig]:
 /// * `max_concurrent_machine_updates` the maximum number of updates allowed across all modules
 /// * `machine_update_run_interval` how often the manager calls the modules to start updates
-pub struct MachineUpdateManager {
+pub(crate) struct MachineUpdateManager {
     database_connection: PgPool,
     max_concurrent_machine_updates: MaxConcurrentUpdates,
     run_interval: Duration,
@@ -71,7 +72,7 @@ impl MachineUpdateManager {
 
     /// create a MachineUpdateManager with provided modules, overriding the default.
     #[cfg(test)]
-    pub fn new_with_modules(
+    pub(crate) fn new_with_modules(
         database_connection: sqlx::PgPool,
         config: Arc<CarbideConfig>,
         modules: Vec<Box<dyn MachineUpdateModule>>,
@@ -89,7 +90,7 @@ impl MachineUpdateManager {
     }
 
     /// Create a MachineUpdateManager with the default modules.
-    pub fn new(
+    pub(crate) fn new(
         database_connection: sqlx::PgPool,
         config: Arc<CarbideConfig>,
         meter: opentelemetry::metrics::Meter,
@@ -125,7 +126,7 @@ impl MachineUpdateManager {
     }
 
     /// Start the MachineUpdateManager and return a [sending channel](tokio::sync::oneshot::Sender) that will stop the MachineUpdateManager when dropped.
-    pub fn start(
+    pub(crate) fn start(
         self,
         join_set: &mut JoinSet<()>,
         cancel_token: CancellationToken,
@@ -145,9 +146,8 @@ impl MachineUpdateManager {
         let timer = PeriodicTimer::new(self.run_interval);
         loop {
             let tick = timer.tick();
-            if let Err(e) = self.run_single_iteration().await {
-                tracing::warn!("MachineUpdateManager error: {}", e);
-            }
+            let result = self.run_single_iteration().await;
+            managed_loop::record_iteration(LoopManager::MachineUpdateManager, &result);
 
             tokio::select! {
                 _ = tick.sleep() => {},
@@ -184,7 +184,7 @@ impl MachineUpdateManager {
         .map_err(Into::into)
     }
 
-    pub async fn run_single_iteration(&self) -> CarbideResult<()> {
+    pub(crate) async fn run_single_iteration(&self) -> CarbideResult<()> {
         let mut updates_started_count = 0;
 
         let _lock = match self
@@ -193,11 +193,17 @@ impl MachineUpdateManager {
             .await
         {
             Ok(lock) => lock,
-            Err(e) => {
+            Err(e @ AcquireLockError::WorkAlreadyLocked(_)) => {
                 tracing::warn!(
-                    "MachineUpdateManager failed to acquire work lock: Another instance of carbide running? {e}"
+                    error = %e,
+                    "MachineUpdateManager failed to acquire work lock: Another instance of carbide running?"
                 );
                 return Ok(());
+            }
+            Err(e) => {
+                return Err(CarbideError::internal(format!(
+                    "failed to acquire machine update work lock: {e}"
+                )));
             }
         };
 
@@ -239,7 +245,10 @@ impl MachineUpdateManager {
             if (current_updating_machines.len() as i32) >= max_concurrent_updates {
                 break;
             }
-            tracing::debug!("in progress: {:?}", current_updating_machines);
+            tracing::debug!(
+                current_updating_machines = ?current_updating_machines,
+                "Machine updates in progress",
+            );
             let available_updates = max_concurrent_updates - current_updating_machines.len() as i32;
 
             let updates_started = update_module
@@ -250,7 +259,10 @@ impl MachineUpdateManager {
                     &snapshots,
                 )
                 .await?;
-            tracing::debug!("started: {:?}", updates_started);
+            tracing::debug!(
+                updates_started = ?updates_started,
+                "Machine updates started",
+            );
 
             updates_started_count += updates_started.len();
 
@@ -290,7 +302,7 @@ impl MachineUpdateManager {
     /// Removes all markers from a Host that are used to indicate that updates are applied
     /// This includes
     /// - A Health Override
-    pub async fn remove_machine_update_markers(
+    pub(crate) async fn remove_machine_update_markers(
         txn: &mut PgConnection,
         machine_update: &DpuMachineUpdate,
     ) -> CarbideResult<()> {
@@ -306,7 +318,7 @@ impl MachineUpdateManager {
     }
 
     /// get host machines that are applying updates
-    pub async fn get_updating_machines(
+    pub(crate) async fn get_updating_machines(
         txn: &mut PgConnection,
     ) -> Result<HashSet<MachineId>, DatabaseError> {
         let machines = db::machine::find(

@@ -23,7 +23,7 @@ import (
 	cwm "github.com/NVIDIA/infra-controller/rest-api/workflow/internal/metrics"
 	sc "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/client/site"
 
-	cwsv1 "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -46,7 +46,7 @@ type ManageSubnet struct {
 // Activity functions
 
 // UpdateSubnetsInDB is a Temporal activity that takes a collection of Subnet/Network Segment data pushed by Site Agent and updates the DB
-func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, subnetInventory *cwsv1.SubnetInventory) ([]cwm.InventoryObjectLifecycleEvent, error) {
+func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, subnetInventory *corev1.SubnetInventory) ([]cwm.InventoryObjectLifecycleEvent, error) {
 	logger := log.With().Str("Activity", "UpdateSubnetsInDB").Str("Site ID", siteID.String()).Logger()
 
 	logger.Info().Msg("starting activity")
@@ -66,7 +66,7 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 		return nil, err
 	}
 
-	if subnetInventory.InventoryStatus == cwsv1.InventoryStatus_INVENTORY_STATUS_FAILED {
+	if subnetInventory.InventoryStatus == corev1.InventoryStatus_INVENTORY_STATUS_FAILED {
 		logger.Warn().Msg("received failed inventory status from Site Agent, skipping inventory processing")
 		return nil, nil
 	}
@@ -120,15 +120,15 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 
 		subnet, ok := existingSubnetCtrlIDMap[controllerSegment.Id.Value]
 		if !ok {
-			// Check if the Subnet is found by ID (controllerSegment.Name == cloudSubnet.ID)
-			subnet, ok = existingSubnetIDMap[controllerSegment.Name]
+			// Check if the Subnet is found by ID (segment name == cloudSubnet.ID)
+			subnet, ok = existingSubnetIDMap[controllerSegment.GetMetadata().GetName()]
 			if ok {
 				existingSubnetCtrlIDMap[controllerSegment.Id.Value] = subnet
 			}
 		}
 
 		if subnet == nil {
-			if controllerSegment.SegmentType == cwsv1.NetworkSegmentType_TENANT {
+			if controllerSegment.GetConfig().GetSegmentType() == corev1.NetworkSegmentType_TENANT {
 				logger.Error().Str("Controller Segment ID", controllerSegment.Id.Value).Msg("Network Segment does not have a Subnet record in DB, possibly created directly on Site")
 			}
 			continue
@@ -154,8 +154,9 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 		}
 
 		var mtu *int
-		if controllerSegment.Mtu != nil {
-			mtuVal := int(*controllerSegment.Mtu)
+		cfg := controllerSegment.GetConfig()
+		if cfg != nil && cfg.Mtu != nil {
+			mtuVal := int(*cfg.Mtu)
 			mtu = &mtuVal
 		}
 
@@ -168,7 +169,7 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 		}
 
 		// Update Subnet in DB
-		status, statusMessage := getNICoSubnetStatus(controllerSegment.State)
+		status, statusMessage := getNICoSubnetStatus(controllerSegment.GetStatus().GetTenantState())
 
 		// If Subnet is already in Deleting state then no need to update status
 		if subnet.Status == cdbm.SubnetStatusDeleting {
@@ -183,7 +184,7 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 		} else {
 			// Check if the latest status detail message is different from the current status message
 			// Leave orderBy nil since the result is sorted by create timestamp by default
-			latestsd, _, serr := sdDAO.GetAllByEntityID(ctx, nil, subnet.ID.String(), nil, cwutil.GetPtr(1), nil)
+			latestsd, _, serr := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{subnet.ID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(1)})
 			if serr != nil {
 				slogger.Error().Err(serr).Msg("failed to retrieve latest Status Detail for Subnet")
 			} else if len(latestsd) == 0 || (latestsd[0].Message != nil && *latestsd[0].Message != statusMessage) {
@@ -274,7 +275,7 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 
 			// Leave orderBy as nil as the result is sorted by created timestamp by default
 			if status == subnet.Status {
-				latestsd, _, serr := sdDAO.GetAllByEntityID(ctx, nil, subnet.ID.String(), nil, cwutil.GetPtr(1), nil)
+				latestsd, _, serr := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{subnet.ID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(1)})
 				if serr != nil {
 					slogger.Error().Err(serr).Msg("failed to retrieve latest Status Detail for Subnet")
 					continue
@@ -314,7 +315,7 @@ func (ms ManageSubnet) updateSubnetStatusInDB(ctx context.Context, tx *cdb.Tx, s
 		}
 
 		statusDetailDAO := cdbm.NewStatusDetailDAO(ms.dbSession)
-		_, err = statusDetailDAO.CreateFromParams(ctx, tx, subnetID.String(), *status, statusMessage)
+		_, err = statusDetailDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: subnetID.String(), Status: *status, Message: statusMessage})
 		if err != nil {
 			return err
 		}
@@ -368,19 +369,19 @@ func (ms ManageSubnet) deleteSubnetFromDB(ctx context.Context, tx *cdb.Tx, subne
 }
 
 // Utility function to get NICo Subent status from Controller Segment state
-func getNICoSubnetStatus(controllerNetworkSegmentTenantState cwsv1.TenantState) (string, string) {
+func getNICoSubnetStatus(controllerNetworkSegmentTenantState corev1.TenantState) (string, string) {
 	switch controllerNetworkSegmentTenantState {
-	case cwsv1.TenantState_PROVISIONING:
+	case corev1.TenantState_PROVISIONING:
 		return cdbm.SubnetStatusProvisioning, "Subnet is being provisioned on Site"
-	case cwsv1.TenantState_READY:
+	case corev1.TenantState_READY:
 		return cdbm.SubnetStatusReady, "Subnet is ready for use"
-	case cwsv1.TenantState_CONFIGURING:
+	case corev1.TenantState_CONFIGURING:
 		return cdbm.SubnetStatusProvisioning, "Subnet is being configured on Site"
-	case cwsv1.TenantState_TERMINATING:
+	case corev1.TenantState_TERMINATING:
 		return cdbm.SubnetStatusDeleting, "Subnet is being deleted on Site"
-	case cwsv1.TenantState_TERMINATED:
+	case corev1.TenantState_TERMINATED:
 		return cdbm.SubnetStatusDeleted, "Subnet has been deleted on Site"
-	case cwsv1.TenantState_FAILED:
+	case corev1.TenantState_FAILED:
 		return cdbm.SubnetStatusError, "Subnet is in error state"
 	default:
 		return cdbm.SubnetStatusError, "Subnet status is unknown"
@@ -429,7 +430,7 @@ func (mslm ManageSubnetLifecycleMetrics) RecordSubnetStatusTransitionMetrics(ctx
 	metricsRecorded := 0
 
 	for _, event := range subnetLifecycleEvents {
-		statusDetails, _, err := sdDAO.GetAllByEntityID(ctx, nil, event.ObjectID.String(), nil, cwutil.GetPtr(cdbp.TotalLimit), nil)
+		statusDetails, _, err := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{event.ObjectID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)})
 		if err != nil {
 			logger.Error().Err(err).Str("Subnet ID", event.ObjectID.String()).Msg("failed to retrieve Status Details for Subnet")
 			return err

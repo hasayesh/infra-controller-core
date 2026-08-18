@@ -10,7 +10,7 @@ import (
 	"context"
 	"time"
 
-	pb "github.com/NVIDIA/infra-controller/rest-api/flow/internal/nicoapi/gen"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 // Client allow us to have both a real implemenation and a mock implementation for unit tests which can be switched transparently
@@ -61,6 +61,12 @@ type Client interface {
 	// MAC and its assigned address resolve, so switches without a resolved NVOS
 	// endpoint are omitted from the result.
 	FindSwitchNvosIPs(ctx context.Context, switchIds []string) (map[string]string, error)
+
+	// GetObservedNVLinkDomainMemberships returns valid rack/domain observations
+	// from a complete snapshot of Core's active switch inventory. Switches without
+	// a valid observation are omitted, so callers may clear omitted rack
+	// memberships after a successful read.
+	GetObservedNVLinkDomainMemberships(ctx context.Context) ([]NVLinkDomainMembership, error)
 
 	// FindPowerShelfControllerStates is the power-shelf equivalent of
 	// FindSwitchControllerStates.
@@ -164,19 +170,19 @@ type Client interface {
 	InvokeInstancePower(ctx context.Context, instanceID string, applyUpdates bool) error
 
 	// ComponentPowerControl performs power control on component targets (switches, power shelves).
-	ComponentPowerControl(ctx context.Context, req *pb.ComponentPowerControlRequest) (*pb.ComponentPowerControlResponse, error)
+	ComponentPowerControl(ctx context.Context, req *corev1.ComponentPowerControlRequest) (*corev1.ComponentPowerControlResponse, error)
 
 	// UpdateComponentFirmware queues firmware updates for component targets.
-	UpdateComponentFirmware(ctx context.Context, req *pb.UpdateComponentFirmwareRequest) (*pb.UpdateComponentFirmwareResponse, error)
+	UpdateComponentFirmware(ctx context.Context, req *corev1.UpdateComponentFirmwareRequest) (*corev1.UpdateComponentFirmwareResponse, error)
 
 	// GetComponentFirmwareStatus returns firmware update status for component targets.
-	GetComponentFirmwareStatus(ctx context.Context, req *pb.GetComponentFirmwareStatusRequest) (*pb.GetComponentFirmwareStatusResponse, error)
+	GetComponentFirmwareStatus(ctx context.Context, req *corev1.GetComponentFirmwareStatusRequest) (*corev1.GetComponentFirmwareStatusResponse, error)
 
 	// ListComponentFirmwareVersions lists available firmware versions for component targets.
-	ListComponentFirmwareVersions(ctx context.Context, req *pb.ListComponentFirmwareVersionsRequest) (*pb.ListComponentFirmwareVersionsResponse, error)
+	ListComponentFirmwareVersions(ctx context.Context, req *corev1.ListComponentFirmwareVersionsRequest) (*corev1.ListComponentFirmwareVersionsResponse, error)
 
 	// GetComponentInventory retrieves inventory (including site exploration reports) for component targets.
-	GetComponentInventory(ctx context.Context, req *pb.GetComponentInventoryRequest) (*pb.GetComponentInventoryResponse, error)
+	GetComponentInventory(ctx context.Context, req *corev1.GetComponentInventoryRequest) (*corev1.GetComponentInventoryResponse, error)
 
 	// GetAllExpectedSwitchesLinked returns expected switches linked to their
 	// explored endpoints and live Switch resources. Each entry includes the
@@ -216,14 +222,30 @@ type Client interface {
 	// GetDesiredFirmwareVersions returns a slice of desired firmware version
 	// entries configured in Core. Each entry carries vendor and model fields;
 	// iterate the slice to find matching entries.
-	GetDesiredFirmwareVersions(ctx context.Context) ([]*pb.DesiredFirmwareVersionEntry, error)
+	GetDesiredFirmwareVersions(ctx context.Context) ([]*corev1.DesiredFirmwareVersionEntry, error)
 
 	// FindExploredEndpointsByIds returns explored endpoint data (including
 	// firmware_versions) for the given BMC IP addresses.
-	FindExploredEndpointsByIds(ctx context.Context, bmcIPs []string) ([]*pb.ExploredEndpoint, error)
+	FindExploredEndpointsByIds(ctx context.Context, bmcIPs []string) ([]*corev1.ExploredEndpoint, error)
 
 	// SetMachineAutoUpdate enables or disables firmware auto-update for a machine.
 	SetMachineAutoUpdate(ctx context.Context, machineID string, enable bool) error
+
+	// FindMachineControllerStates returns the raw state string Core reports for
+	// each machine. Machines for which Core returns no state are omitted.
+	FindMachineControllerStates(ctx context.Context, machineIDs []string) (map[string]string, error)
+
+	// DecommissionMachine initiates decommissioning of the given machine via Core.
+	// TODO: Core Decommission Machine RPC pending.
+	DecommissionMachine(ctx context.Context, machineID string) error
+
+	// DecommissionSwitch initiates decommissioning of the given switch via Core.
+	// TODO: Core Decommission Switch RPC pending.
+	DecommissionSwitch(ctx context.Context, switchID string) error
+
+	// DecommissionPowerShelf initiates decommissioning of the given power shelf via Core.
+	// TODO: Core Decommission PowerShelf RPC pending.
+	DecommissionPowerShelf(ctx context.Context, shelfID string) error
 
 	// The following are only valid in the mock environment and should only be called by unit tests
 	AddMachine(MachineDetail)
@@ -238,12 +260,19 @@ type Client interface {
 	SetPowerShelfRackID(shelfID, rackID string)
 	SetSwitchControllerState(switchID, state string)
 	SetSwitchNvosIP(switchID, ip string)
+	SetObservedNVLinkDomainMemberships(memberships []NVLinkDomainMembership)
 	SetPowerShelfControllerState(shelfID, state string)
 	SetRackHostMachineIDs(rackID string, machineIDs []string)
 	AddExpectedRackDetail(detail ExpectedRackDetail)
 	AddExpectedMachineDetail(detail ExpectedMachineDetail)
 	AddExpectedSwitchDetail(detail ExpectedSwitchDetail)
 	AddExpectedPowerShelfDetail(detail ExpectedPowerShelfDetail)
+
+	// Decommission mock fixtures.
+	SetMachineControllerState(machineID, state string)
+	SetDecommissionMachineError(err error)
+	SetDecommissionSwitchError(err error)
+	SetDecommissionPowerShelfError(err error)
 
 	// DPU reprovisioning mock fixtures + recorders.
 	SetHostDpuMachineIds(hostMachineID string, dpuIDs []string)

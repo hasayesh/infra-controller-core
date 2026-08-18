@@ -23,7 +23,9 @@ use ::rpc::forge::{
     InstanceDpuExtensionServiceConfig, InstanceDpuExtensionServicesConfig,
     ManagedHostNetworkConfigRequest, ManagedHostNetworkStatusRequest,
 };
+use carbide_instrument::testing::MetricsCapture;
 use carbide_secrets::credentials::{BgpCredentialType, CredentialKey, Credentials};
+use carbide_uuid::machine::MachineId;
 use common::api_fixtures::network_segment::{
     FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS, create_network_segment, create_tenant_network_segment,
 };
@@ -45,8 +47,119 @@ use crate::tests::common::api_fixtures::TestEnvOverrides;
 use crate::tests::common::api_fixtures::site_explorer::MockExploredHost;
 use crate::tests::common::rpc_builder::VpcCreationRequest;
 
+async fn set_use_admin_network_changed(
+    env: &api_fixtures::TestEnv,
+    dpu_machine_id: MachineId,
+    value: bool,
+) {
+    let mut txn = env.db_txn().await;
+    db::machine::set_use_admin_network_changed(txn.deref_mut(), &dpu_machine_id, value)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+}
+
+async fn use_admin_network_changed(
+    env: &api_fixtures::TestEnv,
+    dpu_machine_id: MachineId,
+) -> Option<bool> {
+    let mut txn = env.db_txn().await;
+    let dpu = db::machine::find_one(txn.deref_mut(), &dpu_machine_id, Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    txn.commit().await.unwrap();
+    dpu.network_config.value.use_admin_network_changed
+}
+
+async fn bump_dpu_network_config_version(env: &api_fixtures::TestEnv, dpu_machine_id: MachineId) {
+    let mut txn = env.db_txn().await;
+    let dpu = db::machine::find_one(txn.deref_mut(), &dpu_machine_id, Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    let version = dpu.network_config.version;
+    let value = dpu.network_config.value;
+    db::machine::try_update_network_config(txn.deref_mut(), &dpu_machine_id, version, &value)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+}
+
+async fn record_dpu_network_status(
+    env: &api_fixtures::TestEnv,
+    dpu_machine_id: MachineId,
+    network_config_version: Option<String>,
+) {
+    env.api
+        .record_dpu_network_status(tonic::Request::new(DpuNetworkStatus {
+            dpu_machine_id: Some(dpu_machine_id),
+            dpu_agent_version: Some(dpu::TEST_DPU_AGENT_VERSION.to_string()),
+            observed_at: Some(SystemTime::now().into()),
+            dpu_health: Some(rpc::health::HealthReport {
+                source: "forge-dpu-agent".to_string(),
+                triggered_by: None,
+                observed_at: None,
+                successes: vec![],
+                alerts: vec![],
+            }),
+            network_config_version,
+            instance_id: None,
+            instance_config_version: None,
+            instance_network_config_version: None,
+            interfaces: vec![],
+            network_config_error: None,
+            client_certificate_expiry_unix_epoch_secs: None,
+            fabric_interfaces: vec![],
+            last_dhcp_requests: vec![],
+            dpu_extension_service_version: None,
+            dpu_extension_services: vec![],
+            astra_config_status: None,
+        }))
+        .await
+        .unwrap();
+}
+
 #[crate::sqlx_test]
+async fn test_clear_use_admin_network_changed_keeps_newer_version_flag(pool: sqlx::PgPool) {
+    let env = api_fixtures::create_test_env(pool).await;
+    let mh = create_managed_host(&env).await;
+    let dpu_machine_id = mh.dpu().id;
+
+    set_use_admin_network_changed(&env, dpu_machine_id, true).await;
+    let mut txn = env.db_txn().await;
+    let stale_version = db::machine::find_one(txn.deref_mut(), &dpu_machine_id, Default::default())
+        .await
+        .unwrap()
+        .unwrap()
+        .network_config
+        .version;
+    txn.commit().await.unwrap();
+
+    bump_dpu_network_config_version(&env, dpu_machine_id).await;
+
+    let mut txn = env.db_txn().await;
+    let cleared = db::machine::clear_use_admin_network_changed_if_version_matches(
+        txn.deref_mut(),
+        &dpu_machine_id,
+        &stale_version,
+    )
+    .await
+    .unwrap();
+    txn.commit().await.unwrap();
+
+    assert!(!cleared);
+    assert_eq!(
+        use_admin_network_changed(&env, dpu_machine_id).await,
+        Some(true)
+    );
+}
+
+#[crate::sqlx_test]
+// This test verifies parity between `addresses` and the compatibility fields.
+#[allow(deprecated)]
 async fn test_managed_host_network_config(pool: sqlx::PgPool) {
+    // The default fixture omits `lo-ip-v6`, which must preserve the existing IPv4-only response.
     let env = api_fixtures::create_test_env(pool).await;
     let host_config = env.managed_host_config();
     let mh = dpu::create_dpu_machine_in_waiting_for_network_install(&env, &host_config).await;
@@ -58,9 +171,138 @@ async fn test_managed_host_network_config(pool: sqlx::PgPool) {
         .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
             dpu_machine_id: Some(dpu_machine_id),
         }))
-        .await;
+        .await
+        .unwrap()
+        .into_inner();
 
-    assert!(response.is_ok());
+    assert!(
+        response
+            .managed_host_config
+            .as_ref()
+            .expect("managed host config")
+            .loopback_ip_v6
+            .is_none(),
+        "sites without lo-ip-v6 must remain IPv4-only"
+    );
+
+    let admin_interface = response.admin_interface.expect("admin interface");
+    assert_eq!(
+        admin_interface.addresses,
+        vec![rpc::forge::InterfaceAddressConfig {
+            address_family: rpc::forge::AddressFamily::V4.into(),
+            gateway: admin_interface.gateway,
+            ip: admin_interface.ip,
+            interface_prefix: admin_interface.interface_prefix,
+            prefix: admin_interface.prefix,
+            svi_ip: admin_interface.svi_ip,
+        }]
+    );
+}
+
+#[crate::sqlx_test]
+async fn test_managed_host_network_config_does_not_clear_use_admin_network_changed(
+    pool: sqlx::PgPool,
+) {
+    let env = api_fixtures::create_test_env(pool).await;
+    let mh = create_managed_host(&env).await;
+    let dpu_machine_id = mh.dpu().id;
+
+    set_use_admin_network_changed(&env, dpu_machine_id, true).await;
+
+    let response = env
+        .api
+        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
+            dpu_machine_id: Some(dpu_machine_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.use_admin_network_changed, Some(true));
+    assert_eq!(
+        use_admin_network_changed(&env, dpu_machine_id).await,
+        Some(true)
+    );
+}
+
+#[crate::sqlx_test]
+async fn test_record_dpu_network_status_clears_use_admin_network_changed_for_matching_version(
+    pool: sqlx::PgPool,
+) {
+    let env = api_fixtures::create_test_env(pool).await;
+    let mh = create_managed_host(&env).await;
+    let dpu_machine_id = mh.dpu().id;
+
+    set_use_admin_network_changed(&env, dpu_machine_id, true).await;
+    let response = env
+        .api
+        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
+            dpu_machine_id: Some(dpu_machine_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    record_dpu_network_status(
+        &env,
+        dpu_machine_id,
+        Some(response.managed_host_config_version),
+    )
+    .await;
+
+    assert_eq!(
+        use_admin_network_changed(&env, dpu_machine_id).await,
+        Some(false)
+    );
+}
+
+#[crate::sqlx_test]
+async fn test_record_dpu_network_status_keeps_use_admin_network_changed_without_matching_version(
+    pool: sqlx::PgPool,
+) {
+    let env = api_fixtures::create_test_env(pool).await;
+    let mh = create_managed_host(&env).await;
+    let dpu_machine_id = mh.dpu().id;
+
+    set_use_admin_network_changed(&env, dpu_machine_id, true).await;
+    record_dpu_network_status(&env, dpu_machine_id, None).await;
+
+    assert_eq!(
+        use_admin_network_changed(&env, dpu_machine_id).await,
+        Some(true)
+    );
+}
+
+#[crate::sqlx_test]
+async fn test_record_dpu_network_status_counts_failed_host_wakeup(pool: sqlx::PgPool) {
+    let env = api_fixtures::create_test_env(pool.clone()).await;
+    let mh = create_managed_host(&env).await;
+    let dpu_machine_id = mh.dpu().id;
+
+    // Remove the state-handler queue table so the host wakeup enqueue fails
+    // while the status report itself stays healthy.
+    sqlx::query("DROP TABLE machine_state_controller_queued_objects")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let metrics = MetricsCapture::start();
+    // A never-before-observed network config version registers as a change,
+    // which is what prompts the host state-handler wakeup.
+    record_dpu_network_status(
+        &env,
+        dpu_machine_id,
+        Some("wakeup-probe-version".to_string()),
+    )
+    .await;
+
+    assert_eq!(
+        metrics.counter_delta(
+            "carbide_state_handler_wakeup_failures_total",
+            &[("trigger", "dpu_network_status")],
+        ),
+        1.0
+    );
 }
 
 #[crate::sqlx_test]
@@ -127,20 +369,24 @@ async fn test_managed_host_network_config_includes_routing_profile_prefix_lists(
             routing_profiles: HashMap::from([(
                 profile_type.to_string(),
                 FnnRoutingProfileConfig {
-                    internal: true,
-                    access_tier: 0,
-                    accepted_leaks_from_underlay: expected_leaks
-                        .iter()
-                        .map(|prefix| PrefixFilterPolicyEntry {
-                            prefix: prefix.parse().unwrap(),
-                        })
-                        .collect(),
-                    allowed_anycast_prefixes: expected_allowed_anycast_prefixes
-                        .iter()
-                        .map(|prefix| PrefixFilterPolicyEntry {
-                            prefix: prefix.parse().unwrap(),
-                        })
-                        .collect(),
+                    internal: Some(true),
+                    access_tier: Some(0),
+                    accepted_leaks_from_underlay: Some(
+                        expected_leaks
+                            .iter()
+                            .map(|prefix| PrefixFilterPolicyEntry {
+                                prefix: prefix.parse().unwrap(),
+                            })
+                            .collect(),
+                    ),
+                    allowed_anycast_prefixes: Some(
+                        expected_allowed_anycast_prefixes
+                            .iter()
+                            .map(|prefix| PrefixFilterPolicyEntry {
+                                prefix: prefix.parse().unwrap(),
+                            })
+                            .collect(),
+                    ),
                     ..Default::default()
                 },
             )]),
@@ -243,7 +489,7 @@ async fn test_managed_host_network_config_narrows_interface_anycast_prefixes(poo
         vni: 123,
     };
 
-    // Configure an FNN routing profile with anycast prefixes broad enough for the interface.
+    // Configure inherited properties and a base prefix that the VPC will replace.
     let env = api_fixtures::create_test_env_with_overrides(
         pool,
         TestEnvOverrides::default().with_fnn_config(Some(FnnConfig {
@@ -253,16 +499,13 @@ async fn test_managed_host_network_config_narrows_interface_anycast_prefixes(poo
             routing_profiles: HashMap::from([(
                 profile_type.to_string(),
                 FnnRoutingProfileConfig {
-                    internal: true,
-                    access_tier: 0,
-                    leak_default_route_from_underlay: true,
-                    route_target_imports: vec![inherited_import.clone()],
-                    allowed_anycast_prefixes: vpc_allowed_anycast_prefixes
-                        .iter()
-                        .map(|prefix| PrefixFilterPolicyEntry {
-                            prefix: prefix.parse().unwrap(),
-                        })
-                        .collect(),
+                    internal: Some(true),
+                    access_tier: Some(0),
+                    leak_default_route_from_underlay: Some(true),
+                    route_target_imports: Some(vec![inherited_import.clone()]),
+                    allowed_anycast_prefixes: Some(vec![PrefixFilterPolicyEntry {
+                        prefix: "203.0.113.0/24".parse().unwrap(),
+                    }]),
                     ..Default::default()
                 },
             )]),
@@ -271,7 +514,7 @@ async fn test_managed_host_network_config_narrows_interface_anycast_prefixes(poo
     )
     .await;
 
-    // Create a tenant and FNN VPC using that VPC-level routing profile.
+    // Override the VPC anycast list while inheriting the other base properties.
     let tenant = env
         .api
         .create_tenant(tonic::Request::new(rpc::forge::CreateTenantRequest {
@@ -298,11 +541,22 @@ async fn test_managed_host_network_config_narrows_interface_anycast_prefixes(poo
                 })
                 .network_virtualization_type(rpc::forge::VpcVirtualizationType::Fnn as i32)
                 .routing_profile_type(profile_type.to_string())
+                .routing_profile_overrides(rpc::forge::VpcRoutingProfileOverrides {
+                    allowed_anycast_prefixes: Some(rpc::forge::PrefixFilterPolicyEntries {
+                        values: vpc_allowed_anycast_prefixes
+                            .iter()
+                            .map(|prefix| rpc::forge::PrefixFilterPolicyEntry {
+                                prefix: prefix.to_string(),
+                            })
+                            .collect(),
+                    }),
+                    ..Default::default()
+                })
                 .rpc(),
         )
         .await;
 
-    // Allocate an instance with a per-interface anycast prefix subset.
+    // Allocate an instance with a subset of the effective VPC override.
     let mut network_config =
         common::api_fixtures::instance::single_interface_network_config(segment_id);
     network_config.interfaces[0].routing_profile =
@@ -391,20 +645,20 @@ async fn test_managed_host_network_config_includes_per_vpc_routing_profiles(pool
                 (
                     "INTERNAL".to_string(),
                     FnnRoutingProfileConfig {
-                        internal: true,
-                        access_tier: 1,
-                        leak_default_route_from_underlay: true,
-                        route_target_imports: vec![internal_import.clone()],
+                        internal: Some(true),
+                        access_tier: Some(1),
+                        leak_default_route_from_underlay: Some(true),
+                        route_target_imports: Some(vec![internal_import.clone()]),
                         ..Default::default()
                     },
                 ),
                 (
                     "EXTERNAL".to_string(),
                     FnnRoutingProfileConfig {
-                        internal: false,
-                        access_tier: 2,
-                        leak_tenant_host_routes_to_underlay: true,
-                        route_targets_on_exports: vec![external_export.clone()],
+                        internal: Some(false),
+                        access_tier: Some(2),
+                        leak_tenant_host_routes_to_underlay: Some(true),
+                        route_targets_on_exports: Some(vec![external_export.clone()]),
                         ..Default::default()
                     },
                 ),
@@ -510,9 +764,11 @@ async fn test_managed_host_network_config_includes_per_vpc_routing_profiles(pool
     let mut txn = env.db_txn().await;
     let internal_vpc = db::vpc::find_by_segment(txn.as_mut(), internal_segment_id)
         .await
+        .unwrap()
         .unwrap();
     let external_vpc = db::vpc::find_by_segment(txn.as_mut(), external_segment_id)
         .await
+        .unwrap()
         .unwrap();
     let internal_vni = internal_vpc.status.vni.unwrap() as u32;
     let external_vni = external_vpc.status.vni.unwrap() as u32;
@@ -621,6 +877,7 @@ async fn test_managed_host_network_config_omits_fnn_vrf_loopback_by_default(pool
     let mut txn = env.db_txn().await;
     let vpc = db::vpc::find_by_segment(txn.as_mut(), segment_id)
         .await
+        .unwrap()
         .unwrap();
     let loopback = db::vpc_dpu_loopback::find(txn.as_mut(), &dpu_machine_id, &vpc.id)
         .await
@@ -694,6 +951,7 @@ async fn test_managed_host_network_config_includes_fnn_vrf_loopback_when_enabled
     let mut txn = env.db_txn().await;
     let vpc = db::vpc::find_by_segment(txn.as_mut(), segment_id)
         .await
+        .unwrap()
         .unwrap();
     let loopback = db::vpc_dpu_loopback::find(txn.as_mut(), &dpu_machine_id, &vpc.id)
         .await
@@ -711,11 +969,11 @@ async fn test_managed_host_network_config_omits_admin_fnn_vrf_loopback_by_defaul
         enabled: true,
         vpc_vni: Some(10000),
         routing_profile: FnnRoutingProfileConfig {
-            leak_default_route_from_underlay: true,
-            route_target_imports: vec![RouteTargetConfig {
+            leak_default_route_from_underlay: Some(true),
+            route_target_imports: Some(vec![RouteTargetConfig {
                 asn: 64512,
                 vni: 10000,
-            }],
+            }]),
             ..Default::default()
         },
     });
@@ -832,6 +1090,8 @@ async fn test_managed_host_network_config_errors_when_sitewide_bgp_password_miss
 }
 
 #[crate::sqlx_test]
+// This test compares compatibility fields across DPUs.
+#[allow(deprecated)]
 async fn test_managed_host_network_config_multi_dpu(pool: sqlx::PgPool) {
     let env = api_fixtures::create_test_env(pool).await;
 
@@ -839,8 +1099,16 @@ async fn test_managed_host_network_config_multi_dpu(pool: sqlx::PgPool) {
     let mh = api_fixtures::create_managed_host_multi_dpu(&env, 2).await;
 
     let host_machine = mh.host().rpc_machine().await;
-    let dpu_1_id = host_machine.associated_dpu_machine_ids[0];
-    let dpu_2_id = host_machine.associated_dpu_machine_ids[1];
+    let dpu_1_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[0];
+    let dpu_2_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[1];
 
     // And: Multiple admin segments exist when the DPU network config is rendered.
     let _second_admin_segment = create_network_segment(
@@ -954,14 +1222,99 @@ async fn test_managed_host_network_config_multi_dpu(pool: sqlx::PgPool) {
 }
 
 #[crate::sqlx_test]
+async fn test_managed_host_network_config_multi_dpu_fnn_ipv6_loopbacks(pool: sqlx::PgPool) {
+    let mut overrides = TestEnvOverrides::default().with_fnn_config(None);
+    overrides.fnn_config.as_mut().unwrap().admin_vpc = Some(AdminFnnConfig {
+        enabled: true,
+        vpc_vni: Some(10000),
+        routing_profile: FnnRoutingProfileConfig::default(),
+    });
+    let env = api_fixtures::create_test_env_with_overrides(pool, overrides).await;
+    crate::db_init::create_admin_vpc(&env.pool, Some(10000))
+        .await
+        .unwrap();
+    crate::db_init::update_network_segments_svi_ip(&env.pool)
+        .await
+        .unwrap();
+    env.api
+        .admin_grow_resource_pool(tonic::Request::new(rpc::forge::GrowResourcePoolRequest {
+            text: r#"
+[lo-ip-v6]
+type = "ipv6"
+prefix = "2001:db8:2390::/126"
+"#
+            .to_string(),
+        }))
+        .await
+        .unwrap();
+
+    let mh = api_fixtures::create_managed_host_multi_dpu(&env, 2).await;
+    let host_machine = mh.host().rpc_machine().await;
+    let dpu_ids = &host_machine
+        .status
+        .as_ref()
+        .expect("host status")
+        .associated_dpu_machine_ids;
+
+    let dpu_1_network_config = env
+        .api
+        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
+            dpu_machine_id: Some(dpu_ids[0]),
+        }))
+        .await
+        .expect("DPU 1 network config")
+        .into_inner();
+    let dpu_2_network_config = env
+        .api
+        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
+            dpu_machine_id: Some(dpu_ids[1]),
+        }))
+        .await
+        .expect("DPU 2 network config")
+        .into_inner();
+
+    // Each response must use the requesting DPU's allocation even though both
+    // responses share the host-level managed config version.
+    let dpu_1_loopback_ip_v6 = dpu_1_network_config
+        .managed_host_config
+        .as_ref()
+        .expect("DPU 1 managed host config")
+        .loopback_ip_v6
+        .as_deref()
+        .expect("DPU 1 IPv6 loopback");
+    let dpu_2_loopback_ip_v6 = dpu_2_network_config
+        .managed_host_config
+        .as_ref()
+        .expect("DPU 2 managed host config")
+        .loopback_ip_v6
+        .as_deref()
+        .expect("DPU 2 IPv6 loopback");
+    assert_ne!(dpu_1_loopback_ip_v6, dpu_2_loopback_ip_v6);
+    assert_eq!(
+        dpu_1_network_config.managed_host_config_version,
+        dpu_2_network_config.managed_host_config_version,
+    );
+}
+
+#[crate::sqlx_test]
+// This test verifies the compatibility admin address chosen for older agents.
+#[allow(deprecated)]
 async fn test_managed_host_network_config_uses_non_dpu_primary_admin_interface(pool: sqlx::PgPool) {
     let env = api_fixtures::create_test_env(pool).await;
 
     // Given: A managed host with 2 DPUs and a separate host admin NIC marked primary.
     let mh = api_fixtures::create_managed_host_multi_dpu(&env, 2).await;
     let host_machine = mh.host().rpc_machine().await;
-    let dpu_1_id = host_machine.associated_dpu_machine_ids[0];
-    let dpu_2_id = host_machine.associated_dpu_machine_ids[1];
+    let dpu_1_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[0];
+    let dpu_2_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[1];
 
     let mut txn = env.pool.begin().await.unwrap();
     let admin_segment = db::network_segment::admin(&mut txn)
@@ -1102,7 +1455,9 @@ async fn test_managed_host_network_status(pool: sqlx::PgPool) {
             ipv6_interface_config: None,
             routing_profile: None,
         }],
+        #[allow(deprecated)]
         auto: false,
+        auto_config: None,
     };
 
     mh.instance_builer(&env)
@@ -1151,6 +1506,8 @@ async fn test_managed_host_network_status(pool: sqlx::PgPool) {
         .into_inner()
         .machines
         .remove(0)
+        .status
+        .unwrap()
         .health;
     let mut reported_health = reported_health.unwrap();
     assert!(reported_health.observed_at.is_some());
@@ -1168,8 +1525,8 @@ async fn test_managed_host_network_status(pool: sqlx::PgPool) {
     assert_eq!(response.instances.len(), 1);
     let instance = &response.instances[0];
     tracing::info!(
-        "instance_network_config_version: {}",
-        instance.network_config_version
+        network_config_version = %instance.network_config_version,
+        "Instance network config version",
     );
     assert_eq!(
         instance.status.as_ref().unwrap().configs_synced,
@@ -1204,7 +1561,9 @@ async fn test_managed_host_network_config_with_extension_services(pool: sqlx::Pg
             ipv6_interface_config: None,
             routing_profile: None,
         }],
+        #[allow(deprecated)]
         auto: false,
+        auto_config: None,
     };
 
     let default_tenant_org = "best_org";
@@ -1318,6 +1677,8 @@ async fn test_managed_host_network_config_with_extension_services(pool: sqlx::Pg
 }
 
 #[crate::sqlx_test]
+// This test reports health with the compatibility interface fields.
+#[allow(deprecated)]
 async fn test_dpu_health_is_required(pool: sqlx::PgPool) {
     let env = api_fixtures::create_test_env(pool).await;
     let (_host_machine_id, dpu_machine_id) = create_managed_host(&env).await.into();
@@ -1361,6 +1722,7 @@ async fn test_dpu_health_is_required(pool: sqlx::PgPool) {
             last_dhcp_requests: vec![],
             dpu_extension_service_version: Some("V1-T1".to_string()),
             dpu_extension_services: vec![],
+            astra_config_status: None,
         }))
         .await
         .expect_err("Should fail");
@@ -1410,6 +1772,8 @@ async fn test_retain_in_alert_since(pool: sqlx::PgPool) {
         .into_inner()
         .machines
         .remove(0)
+        .status
+        .unwrap()
         .health;
 
     let reported_health = reported_health.unwrap();
@@ -1437,6 +1801,8 @@ async fn test_retain_in_alert_since(pool: sqlx::PgPool) {
         .into_inner()
         .machines
         .remove(0)
+        .status
+        .unwrap()
         .health;
     let reported_health = reported_health.unwrap();
     assert!(reported_health.observed_at.is_some());

@@ -26,8 +26,8 @@ use chrono::TimeDelta;
 use db::db_read::PgPoolReader;
 use db::work_lock_manager::WorkLockManagerHandle;
 use db::{self, TransactionVending};
-use metrics::DpaMonitorMetrics;
-use model::dpa_interface::{DpaInterface, DpaInterfaceControllerState};
+use metrics::{DpaMonitorIterationFinished, DpaMonitorMetrics};
+use model::dpa_interface::{DpaInterface, DpaInterfaceControllerState, DpaSearchConfig};
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{HostHealthConfig, LoadSnapshotOptions, ManagedHostStateSnapshot};
 use mqttea::client::MqtteaClient;
@@ -43,6 +43,9 @@ mod card_handler;
 pub mod config;
 pub mod errors;
 mod metrics;
+
+#[cfg(test)]
+pub(crate) use carbide_macros::sqlx_test;
 
 pub struct DpaMonitor {
     pub(crate) db_services: DbServices,
@@ -110,16 +113,13 @@ impl DpaMonitor {
         let timer = PeriodicTimer::new(self.config.monitor_run_interval);
         loop {
             let mut tick = timer.tick();
-            match self.run_single_iteration().await {
-                Ok(num_changes) => {
-                    if num_changes > 0 {
-                        // Decrease the interval if changes have been made.
-                        tick.set_interval(Duration::from_millis(1000));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("DpaMonitor error: {}", e);
-                }
+            // `run_single_iteration` records a failed pass before returning,
+            // so this loop only needs a successful result to adjust cadence.
+            if let Ok(num_changes) = self.run_single_iteration().await
+                && num_changes > 0
+            {
+                // Decrease the interval if changes have been made.
+                tick.set_interval(Duration::from_millis(1000));
             }
 
             tokio::select! {
@@ -146,6 +146,17 @@ impl DpaMonitor {
             .instrument(check_dpa_span.clone())
             .await;
         check_dpa_span.record("metrics", metrics.to_string());
+        check_dpa_span.in_scope(|| {
+            carbide_instrument::emit(match result.as_ref().err() {
+                None => DpaMonitorIterationFinished::Succeeded {
+                    latency: metrics.recording_started_at.elapsed(),
+                },
+                Some(error) => DpaMonitorIterationFinished::Failed {
+                    latency: metrics.recording_started_at.elapsed(),
+                    error: error.to_string(),
+                },
+            });
+        });
         self.metric_holder.update_metrics(metrics);
         result
     }
@@ -162,7 +173,8 @@ impl DpaMonitor {
             Ok(lock) => lock,
             Err(e) => {
                 tracing::warn!(
-                    "DpaMonitor failed to acquire work lock: Another instance of carbide running? {e}"
+                    error = %e,
+                    "DpaMonitor failed to acquire work lock: Another instance of carbide running?",
                 );
                 return Ok(0);
             }
@@ -321,12 +333,28 @@ impl DpaMonitor {
         .await
         .map_err(Into::<DpaManagerError>::into)?;
 
-        for mh in res.values_mut() {
-            let machine_id = mh.host_snapshot.id;
-            let dpa_snapshots = db::dpa_interface::find_by_machine_id(&mut *txn, machine_id)
+        // Load every host's DPA interfaces in one query rather than one per
+        // machine. Query by each entry's `host_snapshot.id` — the same key the
+        // assignment below looks up — collected up front so the batch call
+        // doesn't conflict with the mutable borrow of `res` below. Duplicates
+        // in the slice are harmless for `= ANY($1)`, and the non-consuming
+        // `get` keeps the assignment correct even when two entries resolve to
+        // the same host snapshot.
+        let machine_ids: Vec<MachineId> = res.values().map(|mh| mh.host_snapshot.id).collect();
+        let dpa_search_config = DpaSearchConfig {
+            only_svpc: false,
+            only_astra: false,
+        };
+        let dpa_snapshots_by_machine =
+            db::dpa_interface::find_by_machine_ids(&mut *txn, &machine_ids, dpa_search_config)
                 .await
                 .map_err(Into::<DpaManagerError>::into)?;
-            mh.dpa_interface_snapshots = dpa_snapshots;
+
+        for mh in res.values_mut() {
+            mh.dpa_interface_snapshots = dpa_snapshots_by_machine
+                .get(&mh.host_snapshot.id)
+                .cloned()
+                .unwrap_or_default();
         }
 
         Ok(res)
@@ -407,11 +435,11 @@ impl DpaMonitor {
                             db::AnnotatedSqlxError::new("dpa_monitor hb begin txn", e)
                         })?;
                     let res = db::dpa_interface::update_last_hb_time(state, &mut txn).await;
-                    if res.is_err() {
+                    if let Err(error) = res {
                         tracing::error!(
-                            "Error updating last_hb_time for dpa id: {} res: {:#?}",
-                            state.id,
-                            res
+                            dpa_interface_id = %state.id,
+                            error = %error,
+                            "Error updating DPA interface heartbeat time",
                         );
                     }
                     Ok(Some(txn))

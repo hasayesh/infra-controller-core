@@ -22,6 +22,7 @@ use carbide_api_core::test_support::Api;
 use carbide_api_core::test_support::fixture_config::FixtureDefault as _;
 use carbide_site_explorer::test_support::TestSiteExplorer;
 use carbide_uuid::machine::MachineId;
+use chrono::Utc;
 use mac_address::MacAddress;
 use model::expected_machine::{ExpectedMachine, ExpectedMachineData};
 use model::hardware_info::HardwareInfo;
@@ -31,6 +32,7 @@ use model::site_explorer::EndpointExplorationReport;
 use model::test_support::ManagedHostConfig;
 
 use crate::TestHarness;
+use crate::db_machine::DbMachineExt as _;
 use crate::machine::TestMachine;
 use crate::machine_dpu::TestDpuMachine;
 use crate::machine_host::TestHostMachine;
@@ -83,9 +85,46 @@ impl TestManagedHost {
             .await
             .expect("database transaction should start");
         let machine = self.host.db_machine(&mut txn).await;
-        db::machine::advance(&machine, &mut txn, &state, None)
+        machine.advance_state(&mut txn, state).await;
+        txn.commit()
             .await
-            .expect("managed host state should be advanced");
+            .expect("database transaction should commit");
+    }
+
+    /// Advances this fixture to a stable Ready state after recording its
+    /// current desired boot interface as verified.
+    ///
+    /// This models the invariant established by the machine controller before
+    /// it returns a host to Ready. Use [`Self::advance_state`] instead when a
+    /// test intentionally needs a Ready host with pending boot configuration.
+    pub async fn advance_to_converged_ready(&self) {
+        let mut txn = self
+            .api
+            .database_connection
+            .begin()
+            .await
+            .expect("database transaction should start");
+        let machine = self.host.db_machine(&mut txn).await;
+        let desired_version = machine
+            .config
+            .desired_boot_interface
+            .as_ref()
+            .expect("test host should have a desired boot interface")
+            .version;
+        assert!(
+            db::machine_desired_boot_interface::mark_verified(
+                txn.as_mut(),
+                &self.host.id,
+                desired_version,
+                Utc::now(),
+            )
+            .await
+            .expect("boot-interface verification should be recorded"),
+            "test host's desired boot interface should still be current"
+        );
+        machine
+            .advance_state(&mut txn, ManagedHostState::Ready)
+            .await;
         txn.commit()
             .await
             .expect("database transaction should commit");

@@ -12,7 +12,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/api/pkg/api/model/util"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	cipam "github.com/NVIDIA/infra-controller/rest-api/ipam"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 const (
@@ -86,22 +86,29 @@ func (scr *APISubnetCreateRequest) Validate() error {
 // The method trusts that the request has already been Validated and
 // that the handler has performed any cross-context checks Validate
 // cannot see.
-func (scr *APISubnetCreateRequest) ToProto(subnet *cdbm.Subnet, vpc *cdbm.Vpc, reservedIPCount int32) *cwssaws.NetworkSegmentCreationRequest {
+func (scr *APISubnetCreateRequest) ToProto(subnet *cdbm.Subnet, vpc *cdbm.Vpc, reservedIPCount int32) *corev1.NetworkSegmentCreationRequest {
 	subnetProto := subnet.ToProto()
-	// `prefixes` aliases `subnetProto.Prefixes`; the slice + its `NetworkPrefix`
+	cfg := subnetProto.GetConfig()
+	// `prefixes` aliases `cfg.Prefixes`; the slice + its `NetworkPrefix`
 	// elements are freshly allocated by `subnet.ToProto()` on every call, so
 	// mutating `ReserveFirst` here is safe -- nothing else holds a reference
 	// to those values.
-	prefixes := subnetProto.Prefixes
+	prefixes := cfg.GetPrefixes()
 	for _, p := range prefixes {
 		p.ReserveFirst = reservedIPCount
 	}
-	return &cwssaws.NetworkSegmentCreationRequest{
+	var subdomainID *corev1.DomainId
+	var mtu *int32
+	if cfg != nil {
+		subdomainID = cfg.SubdomainId
+		mtu = cfg.Mtu
+	}
+	return &corev1.NetworkSegmentCreationRequest{
 		Id:          subnetProto.Id,
-		Name:        subnetProto.Name,
-		SubdomainId: subnetProto.SubdomainId,
-		VpcId:       &cwssaws.VpcId{Value: vpc.GetSiteID().String()},
-		Mtu:         subnetProto.Mtu,
+		Name:        subnetProto.GetMetadata().GetName(),
+		SubdomainId: subdomainID,
+		VpcId:       &corev1.VpcId{Value: vpc.GetSiteID().String()},
+		Mtu:         mtu,
 		Prefixes:    prefixes,
 	}
 }

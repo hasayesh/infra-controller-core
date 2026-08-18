@@ -27,7 +27,8 @@ use carbide_uuid::machine::MachineId;
 use libredfish::SystemPowerControl;
 use model::machine::{
     DpfState, DpuInitState, FailureCause, FailureDetails, FailureSource, InstanceState, Machine,
-    ManagedHostState, ManagedHostStateSnapshot, ReprovisionState, StateMachineArea,
+    ManagedHostState, ManagedHostStateSnapshot, PerformPowerOperation, ReprovisionState,
+    StateMachineArea,
 };
 use state_controller::state_handler::{
     ExternalServiceError, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
@@ -43,7 +44,7 @@ fn dpf_error(error: DpfError) -> StateHandlerError {
 }
 
 fn bmc_ip(machine: &Machine) -> Result<IpAddr, StateHandlerError> {
-    machine.bmc_info.ip.ok_or_else(|| {
+    machine.status.bmc_info.ip.ok_or_else(|| {
         StateHandlerError::GenericError(eyre::eyre!("BMC IP is not set for machine {}", machine.id))
     })
 }
@@ -175,10 +176,12 @@ fn waiting_for_ready_exit_state(
 
 async fn create_and_register_dpudevices_and_dpunode(
     state: &ManagedHostStateSnapshot,
+    ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     dpf_sdk: &dyn DpfOperations,
 ) -> Result<(), StateHandlerError> {
     let primary_dpu_id = state
         .host_snapshot
+        .status
         .interfaces
         .iter()
         .find(|iface| iface.primary_interface)
@@ -188,13 +191,23 @@ async fn create_and_register_dpudevices_and_dpunode(
             missing: "primary_dpu",
         })?;
 
+    let astra_nics = machine_has_astra_nics(state, ctx).await?;
+
     for dpu in &state.dpu_snapshots {
         let serial_number = dpu
+            .status
             .hardware_info
             .as_ref()
             .and_then(|x| x.dmi_data.as_ref())
             .map(|x| x.product_serial.as_str())
             .unwrap_or_default();
+        if serial_number.is_empty() {
+            tracing::warn!(
+                dpu_machine_id = %dpu.id,
+                host_machine_id = %state.host_snapshot.id,
+                "DPU product serial is missing; registering DPU device with DPF using an empty serial"
+            );
+        }
         let device_info = carbide_dpf::DpuDeviceInfo {
             device_id: dpf_id(dpu)?,
             dpu_bmc_ip: bmc_ip(dpu)?,
@@ -209,6 +222,19 @@ async fn create_and_register_dpudevices_and_dpunode(
             .map_err(dpf_error)?;
     }
 
+    let primary_dpu = state
+        .dpu_snapshots
+        .iter()
+        .find(|dpu| dpu.id == primary_dpu_id)
+        .ok_or_else(|| StateHandlerError::MissingData {
+            object_id: state.host_snapshot.id.to_string(),
+            missing: "primary_dpu_snapshot",
+        })?;
+
+    let deployment_type = dpf_sdk
+        .deployment_type_for_dpu(primary_dpu, astra_nics)
+        .map_err(dpf_error)?;
+
     let device_ids: Vec<String> = state
         .dpu_snapshots
         .iter()
@@ -218,6 +244,7 @@ async fn create_and_register_dpudevices_and_dpunode(
         node_id: dpf_id(&state.host_snapshot)?,
         host_bmc_ip: bmc_ip(&state.host_snapshot)?,
         device_ids,
+        deployment_type,
     };
     dpf_sdk
         .register_dpu_node(node_info)
@@ -227,33 +254,56 @@ async fn create_and_register_dpudevices_and_dpunode(
     Ok(())
 }
 
-fn dpf_cr_creation_failed(
+/// Build the correct failure state depending on whether the host is currently
+/// `Assigned` (DPU reprovision path). When `Assigned`, we preserve the outer
+/// state and embed the failure as `InstanceState::Failed`; otherwise we use
+/// the top-level `ManagedHostState::Failed`.
+fn make_failure_state(
+    state: &ManagedHostStateSnapshot,
+    details: FailureDetails,
     machine_id: MachineId,
+) -> ManagedHostState {
+    if matches!(state.managed_state, ManagedHostState::Assigned { .. }) {
+        ManagedHostState::Assigned {
+            instance_state: InstanceState::Failed {
+                details,
+                machine_id,
+            },
+        }
+    } else {
+        ManagedHostState::Failed {
+            details,
+            machine_id,
+            retry_count: 0,
+        }
+    }
+}
+
+fn dpf_cr_creation_failed(
+    state: &ManagedHostStateSnapshot,
     err: &StateHandlerError,
 ) -> StateHandlerOutcome<ManagedHostState> {
-    StateHandlerOutcome::transition(ManagedHostState::Failed {
-        details: FailureDetails {
-            cause: FailureCause::DpfProvisioning {
-                err: format!(
-                    "DPUDevice/DPUNode creation failed. Force-delete again to clean old values. Wait until DPU CR are deleted. {err}"
-                ),
-            },
-            failed_at: chrono::Utc::now(),
-            source: FailureSource::StateMachineArea(StateMachineArea::MainFlow),
+    let details = FailureDetails {
+        cause: FailureCause::DpfProvisioning {
+            err: format!(
+                "DPUDevice/DPUNode creation failed. Force-delete/restart reprovisioning (reprovisioning case) to clean old values. Wait until DPU CR are deleted. {err}"
+            ),
         },
-        machine_id,
-        retry_count: 0,
-    })
+        failed_at: chrono::Utc::now(),
+        source: FailureSource::StateMachineArea(StateMachineArea::MainFlow),
+    };
+    StateHandlerOutcome::transition(make_failure_state(state, details, state.host_snapshot.id))
 }
 
 /// Handle DpfState::Provisioning: register all DPU devices and the node, then
 /// transition all DPUs to WaitingForReady.
 async fn handle_dpf_provisioning(
     state: &ManagedHostStateSnapshot,
+    ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     dpf_sdk: &dyn DpfOperations,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
-    if let Err(err) = create_and_register_dpudevices_and_dpunode(state, dpf_sdk).await {
-        return Ok(dpf_cr_creation_failed(state.host_snapshot.id, &err));
+    if let Err(err) = create_and_register_dpudevices_and_dpunode(state, ctx, dpf_sdk).await {
+        return Ok(dpf_cr_creation_failed(state, &err));
     }
 
     let next =
@@ -261,22 +311,35 @@ async fn handle_dpf_provisioning(
     Ok(StateHandlerOutcome::transition(next))
 }
 
-/// Power-cycle the host for a DPF reboot request. ForceOff then On across
-/// iterations; calls `reboot_complete` as soon as the On command is issued.
-async fn handle_dpf_reboot(
+/// Handle `DpfState::HandleReboot`: drive a DPF-requested power cycle using
+/// explicit per-step state rather than timestamp heuristics.
+///
+/// Transitions:
+/// - `Off`: wait for `power_state == Off` + delay → persist
+///   `HandleReboot { On, 0 }`
+/// - `On`: wait for `power_state == On`  + delay → `reboot_complete` →
+///   `WaitingForReady`
+async fn handle_dpf_handle_reboot(
     state: &ManagedHostStateSnapshot,
-    dpu_snapshot: &Machine,
-    waiting_phase_detail: &Option<String>,
-    current_phase: &DpuPhase,
+    op: &PerformPowerOperation,
+    retry_count: u32,
     node_name: &str,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     dpf_sdk: &dyn DpfOperations,
+    power_down_wait: chrono::Duration,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
-    let reboot_already_requested = state
-        .host_snapshot
-        .last_reboot_requested
-        .as_ref()
-        .is_some_and(|r| r.time > state.host_snapshot.state.version.timestamp());
+    const MAX_RETRIES: u32 = 3;
+
+    // Due to enqueue based event handling, On is triggered immedietely after Off while chassis is
+    // not able to process Off completely. So this time delay is needed.
+    if super::wait(
+        &state.host_snapshot.state.version.timestamp(),
+        power_down_wait,
+    ) {
+        return Ok(StateHandlerOutcome::wait(
+            "waiting for power transition delay".into(),
+        ));
+    }
 
     let power_state = {
         let redfish_client = ctx
@@ -286,23 +349,85 @@ async fn handle_dpf_reboot(
         host_power_state(redfish_client.as_ref()).await?
     };
 
-    if !reboot_already_requested && power_state != libredfish::PowerState::Off {
-        handler_host_power_control(state, ctx, SystemPowerControl::ForceOff).await?;
-    } else if power_state == libredfish::PowerState::Off {
-        handler_host_power_control(state, ctx, SystemPowerControl::On).await?;
-        dpf_sdk
-            .reboot_complete(node_name)
-            .await
-            .map_err(dpf_error)?;
+    match op {
+        PerformPowerOperation::Off => {
+            if power_state == libredfish::PowerState::Off {
+                let next = transition_all_dpus_to_dpf_state(
+                    DpfState::HandleReboot {
+                        op: PerformPowerOperation::On,
+                        retry_count: 0,
+                    },
+                    state,
+                )?;
+                Ok(StateHandlerOutcome::transition(next))
+            } else if retry_count < MAX_RETRIES {
+                tracing::warn!(
+                    host = %state.host_snapshot.id,
+                    retry_count,
+                    "Host did not power off; retrying ForceOff"
+                );
+                handler_host_power_control(state, ctx, SystemPowerControl::ForceOff).await?;
+                let next = transition_all_dpus_to_dpf_state(
+                    DpfState::HandleReboot {
+                        op: PerformPowerOperation::Off,
+                        retry_count: retry_count + 1,
+                    },
+                    state,
+                )?;
+                Ok(StateHandlerOutcome::transition(next))
+            } else {
+                tracing::error!(
+                    host = %state.host_snapshot.id,
+                    max_retries = MAX_RETRIES,
+                    "Host did not power off after max retries; manual intervention required"
+                );
+                Err(StateHandlerError::ManualInterventionRequired(
+                    "host did not power off; manual intervention required".into(),
+                ))
+            }
+        }
+        PerformPowerOperation::On => {
+            if power_state == libredfish::PowerState::On {
+                dpf_sdk
+                    .reboot_complete(node_name)
+                    .await
+                    .map_err(dpf_error)?;
+                let next = transition_all_dpus_to_dpf_state(
+                    DpfState::WaitingForReady { phase_detail: None },
+                    state,
+                )?;
+                Ok(StateHandlerOutcome::transition(next))
+            } else if retry_count <= MAX_RETRIES {
+                // Zero means the On intent is durable but its initial command
+                // has not yet been issued. Later attempts are retries.
+                if retry_count > 0 {
+                    tracing::warn!(
+                        host = %state.host_snapshot.id,
+                        retry_count,
+                        "Host did not power on; retrying On"
+                    );
+                }
+                handler_host_power_control(state, ctx, SystemPowerControl::On).await?;
+                let next = transition_all_dpus_to_dpf_state(
+                    DpfState::HandleReboot {
+                        op: PerformPowerOperation::On,
+                        retry_count: retry_count + 1,
+                    },
+                    state,
+                )?;
+                Ok(StateHandlerOutcome::transition(next))
+            } else {
+                tracing::error!(
+                    host = %state.host_snapshot.id,
+                    max_retries = MAX_RETRIES,
+                    "Host did not power on after max retries; manual intervention required"
+                );
+                Err(StateHandlerError::ManualInterventionRequired(
+                    "host did not power on; manual intervention required".into(),
+                ))
+            }
+        }
     }
-
-    update_phase_detail_or_wait(
-        state,
-        &dpu_snapshot.id,
-        waiting_phase_detail,
-        current_phase,
-        "Power cycling host for DPF reboot",
-    )
 }
 
 /// Handle DpfState::WaitingForReady: release hold, reboot handling,
@@ -316,53 +441,92 @@ async fn handle_dpf_waiting_for_ready(
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     let node_name = dpu_node_cr_name(&dpf_id(&state.host_snapshot)?);
     let dpu_device_name = dpf_id(dpu_snapshot)?;
-    let current_phase = dpf_sdk
-        .get_dpu_phase(&dpu_device_name, &node_name)
-        .await
-        .map_err(dpf_error)?;
+    let current_phase = match dpf_sdk.get_dpu_phase(&dpu_device_name, &node_name).await {
+        Ok(phase) => phase,
+        // The operator briefly removes the old DPU CR before recreating a fresh one
+        // during reprovision; treat that window as "keep waiting" rather than erroring.
+        Err(DpfError::NotFound { .. }) => {
+            return Ok(StateHandlerOutcome::wait(
+                "DPU CR not yet recreated after reprovision".to_string(),
+            ));
+        }
+        Err(err) => return Err(dpf_error(err)),
+    };
+
+    // A DPU with a deletionTimestamp is a terminating old CR (get_dpu_phase maps that to
+    // Deleting; its status.phase is still stale, often Ready or Error). Do nothing until
+    // the operator has deleted it and created the fresh CR: don't release the maintenance
+    // hold, don't trigger a reboot, and don't read Ready/Error off it. This is what lets a
+    // reprovision of an *errored* DPU proceed instead of immediately re-failing on the old
+    // CR's stale Error phase.
+    if current_phase == DpuPhase::Deleting {
+        return Ok(StateHandlerOutcome::wait(
+            "DPU CR is being deleted (reprovision in progress); waiting for the new CR".to_string(),
+        ));
+    }
 
     dpf_sdk
         .release_maintenance_hold(&node_name)
         .await
         .map_err(dpf_error)?;
 
+    // The watcher records a pending service sync for any DPU it sees in the
+    // NodeEffect phase, because the phase does not say why the DPU is parked --
+    // a provisioning pass produces one just as a DPUService change does. This
+    // release satisfies whichever it was, so retire the marker here rather than
+    // leave the Ready handler to rediscover it and call Kubernetes for work that
+    // has already happened.
+    //
+    // Bookkeeping only: a failure here costs a redundant check later, so it must
+    // not fail provisioning.
+    if let Err(error) =
+        super::dpu_action_handler::complete_pending_sync(ctx, &state.host_snapshot).await
+    {
+        tracing::warn!(
+            machine_id = %state.host_snapshot.id,
+            node = %node_name,
+            %error,
+            "Could not retire the host's pending DPU service sync after releasing its hold"
+        );
+    }
+
     if dpf_sdk
         .is_reboot_required(&node_name)
         .await
         .map_err(dpf_error)?
     {
-        return handle_dpf_reboot(
+        handler_host_power_control(state, ctx, SystemPowerControl::ForceOff).await?;
+        let next = transition_all_dpus_to_dpf_state(
+            DpfState::HandleReboot {
+                op: PerformPowerOperation::Off,
+                retry_count: 0,
+            },
             state,
-            dpu_snapshot,
-            waiting_phase_detail,
-            &current_phase,
-            &node_name,
-            ctx,
-            dpf_sdk,
-        )
-        .await;
+        )?;
+        return Ok(StateHandlerOutcome::transition(next));
     }
 
     if current_phase == carbide_dpf::DpuPhase::Error {
         tracing::error!(
-            host = %state.host_snapshot.id,
-            dpu = %dpu_snapshot.id,
+            machine_id = %state.host_snapshot.id,
+            dpu_machine_id = %dpu_snapshot.id,
             "DPU entered error phase during DPF provisioning"
         );
-        return Ok(StateHandlerOutcome::transition(ManagedHostState::Failed {
-            details: FailureDetails {
-                cause: FailureCause::DpfProvisioning {
-                    err: format!(
-                        "DPU {} entered error phase during DPF provisioning",
-                        dpu_snapshot.id
-                    ),
-                },
-                failed_at: chrono::Utc::now(),
-                source: FailureSource::StateMachineArea(StateMachineArea::MainFlow),
+        let details = FailureDetails {
+            cause: FailureCause::DpfProvisioning {
+                err: format!(
+                    "DPU {} entered error phase during DPF provisioning",
+                    dpu_snapshot.id
+                ),
             },
-            machine_id: dpu_snapshot.id,
-            retry_count: 0,
-        }));
+            failed_at: chrono::Utc::now(),
+            source: FailureSource::StateMachineArea(StateMachineArea::MainFlow),
+        };
+        return Ok(StateHandlerOutcome::transition(make_failure_state(
+            state,
+            details,
+            dpu_snapshot.id,
+        )));
     }
     // wait for dpf to report that the dpu is ready
     if current_phase != carbide_dpf::DpuPhase::Ready {
@@ -411,11 +575,11 @@ async fn handle_dpf_reprovisioning(
             .map_err(dpf_error)?;
     if dpf_dpudevices_and_dpunode_crs_noexist {
         tracing::info!(
-            host = %state.host_snapshot.id,
+            machine_id = %state.host_snapshot.id,
             "DPUDevice/DPUNode CRs do not exist, creating them before reprovisioning"
         );
-        if let Err(err) = create_and_register_dpudevices_and_dpunode(state, dpf_sdk).await {
-            return Ok(dpf_cr_creation_failed(state.host_snapshot.id, &err));
+        if let Err(err) = create_and_register_dpudevices_and_dpunode(state, ctx, dpf_sdk).await {
+            return Ok(dpf_cr_creation_failed(state, &err));
         }
         let next = transition_all_dpus_to_dpf_state(
             DpfState::WaitingForReady { phase_detail: None },
@@ -429,7 +593,7 @@ async fn handle_dpf_reprovisioning(
         return Ok(outcome.with_txn(txn));
     }
 
-    tracing::info!("DPF initiate reprovision of DPU {}", dpu_snapshot.id);
+    tracing::info!(machine_id = %dpu_snapshot.id, "DPF initiate reprovision of DPU");
     dpf_sdk
         .reprovision_dpu(&dpf_id(dpu_snapshot)?, &node_name)
         .await
@@ -442,57 +606,144 @@ async fn handle_dpf_reprovisioning(
     Ok(StateHandlerOutcome::transition(next))
 }
 
+// Early in machine ingestion, the dpa_intetrfaces objects for the host are not populated.
+// So we will have to check the expected_machine table for the given host to see if it has
+// any NICs of type CX9. If so, return true. Otherwise, return false.
+async fn machine_has_astra_nics(
+    state: &ManagedHostStateSnapshot,
+    ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
+) -> Result<bool, StateHandlerError> {
+    // its unlikely we got here without a bmc mac
+    let Some(bmc_mac_address) = state.host_snapshot.status.bmc_info.mac else {
+        tracing::error!(
+            machine_id = %state.host_snapshot.id,
+            "machine_has_astra_nics: No BMC MAC address configured"
+        );
+        return Err(StateHandlerError::MissingData {
+            object_id: state.host_snapshot.id.to_string(),
+            missing: "bmc_mac_address",
+        });
+    };
+
+    let mut txn = ctx.services.db_pool.begin().await?;
+
+    // Retrieve the expected_machines table entry for this managed host.
+    let expected_machine = db::expected_machine::find_by_bmc_mac_address(
+        txn.as_mut(),
+        bmc_mac_address,
+    )
+    .await
+    .map_err(|err| {
+        tracing::error!(
+            machine_id = %state.host_snapshot.id,
+            %bmc_mac_address,
+            error = %err,
+            "machine_has_astra_nics: Failed to look up expected machine for Astra enablement"
+        );
+        StateHandlerError::DBError(Box::new(err))
+    })?;
+
+    txn.commit().await?;
+
+    // No expected-machine entry means there are no declared host NICs to act on.
+    let Some(expected_machine) = expected_machine else {
+        tracing::info!(
+            machine_id = %state.host_snapshot.id,
+            "machine_has_astra_nics: No expected-machine entry found"
+        );
+        return Ok(false);
+    };
+
+    let host_nics = expected_machine.data.interfaces;
+    if host_nics.is_empty() {
+        tracing::info!(
+            machine_id = %state.host_snapshot.id,
+            "machine_has_astra_nics: No host NICs found"
+        );
+        return Ok(false);
+    }
+
+    // At this point, we need to use Redfish to get all the CX cards in the host.
+    // The end point to explore is /redfish/v1/Chassis/CX_$i
+
+    let has_cx9 = host_nics
+        .iter()
+        .any(|nic| nic.nic_type.as_deref() == Some("CX9"));
+
+    Ok(has_cx9)
+}
+
 /// Handle DPF state transitions.
 ///
 /// Provisioning registers all DPUs at once and moves them to WaitingForReady
 /// together. All other states (Reprovisioning, WaitingForReady, DeviceReady)
 /// advance the given `dpu_snapshot` independently. DeviceReady acts as a sync
 /// barrier that waits for all DPUs before proceeding.
-pub async fn handle_dpf_state(
+pub(super) async fn handle_dpf_state(
     state: &ManagedHostStateSnapshot,
     dpu_snapshot: &Machine,
     dpf_state: &DpfState,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     dpf_sdk: &dyn DpfOperations,
+    power_down_wait: chrono::Duration,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     let node_name = dpu_node_cr_name(&dpf_id(&state.host_snapshot)?);
+
+    let astra_nics = machine_has_astra_nics(state, ctx).await?;
+
+    let deployment_type = dpf_sdk
+        .deployment_type_for_dpu(dpu_snapshot, astra_nics)
+        .map_err(dpf_error)?;
     if !dpf_sdk
-        .verify_node_labels(&node_name)
+        .verify_node_labels(&node_name, deployment_type)
         .await
         .map_err(dpf_error)?
     {
         tracing::error!(
-            host = %state.host_snapshot.id,
+            machine_id = %state.host_snapshot.id,
             node = %node_name,
             "DPUNode has stale labels, failing for reprovisioning"
         );
-        return Ok(StateHandlerOutcome::transition(ManagedHostState::Failed {
-            details: FailureDetails {
-                cause: FailureCause::DpfProvisioning {
-                    err: format!(
-                        "DPUNode {node_name} has stale labels; \
-                         must be deleted and reprovisioned"
-                    ),
-                },
-                failed_at: chrono::Utc::now(),
-                source: FailureSource::StateMachineArea(StateMachineArea::MainFlow),
+        let details = FailureDetails {
+            cause: FailureCause::DpfProvisioning {
+                err: format!(
+                    "DPUNode {node_name} has stale labels; \
+                     must be deleted and reprovisioned"
+                ),
             },
-            machine_id: state.host_snapshot.id,
-            retry_count: 0,
-        }));
+            failed_at: chrono::Utc::now(),
+            source: FailureSource::StateMachineArea(StateMachineArea::MainFlow),
+        };
+        return Ok(StateHandlerOutcome::transition(make_failure_state(
+            state,
+            details,
+            state.host_snapshot.id,
+        )));
     }
 
     match dpf_state {
-        DpfState::Provisioning => handle_dpf_provisioning(state, dpf_sdk).await,
+        DpfState::Provisioning => handle_dpf_provisioning(state, ctx, dpf_sdk).await,
         DpfState::WaitingForReady { phase_detail } => {
             handle_dpf_waiting_for_ready(state, dpu_snapshot, phase_detail, ctx, dpf_sdk).await
+        }
+        DpfState::HandleReboot { op, retry_count } => {
+            handle_dpf_handle_reboot(
+                state,
+                op,
+                *retry_count,
+                &node_name,
+                ctx,
+                dpf_sdk,
+                power_down_wait,
+            )
+            .await
         }
         DpfState::DeviceReady => handle_dpf_device_ready(state),
         DpfState::Reprovisioning => {
             handle_dpf_reprovisioning(state, dpu_snapshot, ctx, dpf_sdk).await
         }
         DpfState::Unknown => {
-            tracing::warn!(dpu_id = %dpu_snapshot.id, "unknown DPF state in DB, transitioning to provisioning");
+            tracing::warn!(dpu_machine_id = %dpu_snapshot.id, "unknown DPF state in DB, transitioning to provisioning");
             let next = set_one_dpu_dpf_state(state, &dpu_snapshot.id, DpfState::Provisioning)?;
             Ok(StateHandlerOutcome::transition(next))
         }

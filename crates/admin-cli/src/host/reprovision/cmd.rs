@@ -24,7 +24,8 @@ use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::machine::{HealthReportTemplates, get_health_report};
 use crate::rpc::ApiClient;
 
-pub async fn trigger_reprovisioning_set(
+#[allow(deprecated)]
+pub(super) async fn trigger_reprovisioning_set(
     data: ReprovisionSet,
     api_client: &ApiClient,
 ) -> CarbideCliResult<()> {
@@ -63,7 +64,7 @@ pub async fn trigger_reprovisioning_set(
     Ok(())
 }
 
-pub async fn trigger_reprovisioning_clear(
+pub(super) async fn trigger_reprovisioning_clear(
     data: ReprovisionClear,
     api_client: &ApiClient,
 ) -> CarbideCliResult<()> {
@@ -71,13 +72,13 @@ pub async fn trigger_reprovisioning_clear(
     Ok(())
 }
 
-pub async fn list_hosts_pending(api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn list_hosts_pending(api_client: &ApiClient) -> CarbideCliResult<()> {
     let response = api_client.0.list_hosts_waiting_for_reprovisioning().await?;
     print_pending_hosts(response);
     Ok(())
 }
 
-pub async fn mark_manual_firmware_upgrade_complete(
+pub(super) async fn mark_manual_firmware_upgrade_complete(
     machine_id: MachineId,
     api_client: &ApiClient,
 ) -> CarbideCliResult<()> {

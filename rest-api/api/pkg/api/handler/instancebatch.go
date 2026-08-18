@@ -31,7 +31,7 @@ import (
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 )
 
@@ -65,7 +65,7 @@ func NewBatchCreateInstanceHandler(dbSession *cdb.Session, tc temporalClient.Cli
 // buildBatchInstanceCreateRequestOsConfig validates and retrieves OS configuration for batch instance creation.
 // This mirrors the behavior of CreateInstanceHandler.buildInstanceCreateRequestOsConfig.
 // Returns: osConfig, osID, and error (matching single API pattern)
-func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c echo.Context, logger *zerolog.Logger, apiRequest *model.APIBatchInstanceCreateRequest, site *cdbm.Site) (*cwssaws.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
+func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c echo.Context, logger *zerolog.Logger, apiRequest *model.APIBatchInstanceCreateRequest, site *cdbm.Site) (*corev1.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
 
 	ctx := c.Request().Context()
 
@@ -77,11 +77,11 @@ func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c
 			return nil, nil, cutil.NewAPIError(http.StatusBadRequest, "Failed to validate OperatingSystem data", err)
 		}
 
-		return &cwssaws.InstanceOperatingSystemConfig{
+		return &corev1.InstanceOperatingSystemConfig{
 			RunProvisioningInstructionsOnEveryBoot: *apiRequest.AlwaysBootWithCustomIpxe, // Set by the earlier call to ValidateAndSetOperatingSystemData
 			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled,         // Set by the earlier call to ValidateAndSetOperatingSystemData
-			Variant: &cwssaws.InstanceOperatingSystemConfig_Ipxe{
-				Ipxe: &cwssaws.InlineIpxe{
+			Variant: &corev1.InstanceOperatingSystemConfig_Ipxe{
+				Ipxe: &corev1.InlineIpxe{
 					IpxeScript: *apiRequest.IpxeScript,
 				},
 			},
@@ -123,9 +123,10 @@ func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c
 		return c.Str("OperatingSystem ID", os.ID.String())
 	})
 
-	// Confirm ownership between tenant and OS.
-	if os.TenantID.String() != apiRequest.TenantID {
-		logger.Error().Msg("OperatingSystem in request is not owned by tenant")
+	// Confirm the Tenant can use the OS. Provider-owned Templated iPXE OSes are
+	// shared through synchronized Site associations validated below.
+	if !os.IsTenantUsable(apiRequest.TenantID) {
+		logger.Error().Msg("OperatingSystem in request is not usable by tenant")
 		return nil, nil, cutil.NewAPIError(http.StatusBadRequest, "OperatingSystem specified in request is not owned by Tenant", nil)
 	}
 
@@ -176,21 +177,35 @@ func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c
 	// earlier call to ValidateAndSetOperatingSystemData
 
 	if os.Type == cdbm.OperatingSystemTypeIPXE {
-		return &cwssaws.InstanceOperatingSystemConfig{
+		return &corev1.InstanceOperatingSystemConfig{
 			RunProvisioningInstructionsOnEveryBoot: *apiRequest.AlwaysBootWithCustomIpxe,
 			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled,
-			Variant: &cwssaws.InstanceOperatingSystemConfig_Ipxe{
-				Ipxe: &cwssaws.InlineIpxe{
+			Variant: &corev1.InstanceOperatingSystemConfig_Ipxe{
+				Ipxe: &corev1.InlineIpxe{
 					IpxeScript: *apiRequest.IpxeScript,
 				},
 			},
 			UserData: apiRequest.UserData,
 		}, osID, nil
+	} else if os.Type == cdbm.OperatingSystemTypeTemplatedIPXE {
+		if apiErr := validateTemplatedIpxeOsForSite(ctx, bcih.dbSession, logger, os, site.ID); apiErr != nil {
+			return nil, nil, apiErr
+		}
+		return &corev1.InstanceOperatingSystemConfig{
+			RunProvisioningInstructionsOnEveryBoot: *apiRequest.AlwaysBootWithCustomIpxe,
+			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled,
+			Variant: &corev1.InstanceOperatingSystemConfig_OperatingSystemId{
+				OperatingSystemId: &corev1.OperatingSystemId{
+					Value: os.ID.String(),
+				},
+			},
+			UserData: apiRequest.UserData,
+		}, osID, nil
 	} else {
-		return &cwssaws.InstanceOperatingSystemConfig{
+		return &corev1.InstanceOperatingSystemConfig{
 			PhoneHomeEnabled: *apiRequest.PhoneHomeEnabled,
-			Variant: &cwssaws.InstanceOperatingSystemConfig_OsImageId{
-				OsImageId: &cwssaws.UUID{
+			Variant: &corev1.InstanceOperatingSystemConfig_OsImageId{
+				OsImageId: &corev1.UUID{
 					Value: os.ID.String(),
 				},
 			},
@@ -219,7 +234,7 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 	// 2. Request Validation
 	//    - Bind and validate batch request data (count, namePrefix, topology flag)
 	//    - Validate tenant, instance type, VPC, site
-	//    - Load and validate Interfaces (Subnets, VPC Prefixes) - shared across all instances
+	//    - Load and validate Interfaces (Subnets, VPC Prefixes, or VPC selection; shared across all instances)
 	//    - Load and validate DPU Extension Service Deployments - shared across all instances
 	//    - Load and validate Network Security Groups - shared across all instances
 	//    - Load and validate SSH Key Groups - shared across all instances
@@ -499,10 +514,18 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 		}
 	}
 
+	// Load VPCs only for interfaces using Core-managed prefix selection.
+	interfaceVpcIDMap, interfaceVpcErr := loadInstanceInterfaceVpcs(ctx, &logger, bcih.dbSession, apiRequest.Interfaces, tenant.ID, site.ID)
+	if interfaceVpcErr != nil {
+		logger.Warn().Err(interfaceVpcErr).Msg("failed to validate VPCs specified by batch Instance interfaces")
+		return cutil.NewAPIErrorResponse(c, interfaceVpcErr.Code, interfaceVpcErr.Message, interfaceVpcErr.Data)
+	}
+
 	// Validate each Interface against fetched data and build dbInterfaces
 	dbInterfaces := []cdbm.Interface{}
 	isDeviceInfoPresent := false
 	pfWithinVPC := []uuid.UUID{}
+	primaryPhysicalInterfaceUsesVpcSelection := false
 	allFoundVpcIds := goset.NewSet[uuid.UUID]()
 
 	// Prepare the unique set of all VPC IDs for this batch request.
@@ -618,8 +641,10 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 				// is by definition not the primary.
 				if !isDeviceInfoPresent {
 					pfWithinVPC = append(pfWithinVPC, vpcPrefix.VpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
 					pfWithinVPC = []uuid.UUID{vpcPrefix.VpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				}
 			}
 
@@ -627,6 +652,46 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 				VpcPrefixID:          &vpcPrefixUUID,
 				VpcPrefix:            vpcPrefix,
 				RequestedIpAddress:   nil, // Explicit IPs are not supported for batch create.
+				InlineRoutingProfile: ifc.InlineRoutingProfile.ToDB(),
+				Device:               ifc.Device,
+				DeviceInstance:       ifc.DeviceInstance,
+				VirtualFunctionID:    ifc.VirtualFunctionID,
+				IsPhysical:           ifc.IsPhysical,
+				Status:               cdbm.InterfaceStatusPending,
+			})
+		}
+
+		if ifc.VpcID != nil {
+			interfaceVpcID := uuid.MustParse(*ifc.VpcID)
+			interfaceVpc := interfaceVpcIDMap[interfaceVpcID]
+			if vpc.NetworkVirtualizationType == nil || *vpc.NetworkVirtualizationType != cdbm.VpcFNN {
+				logger.Warn().Msg(fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", vpc.ID))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", vpc.ID), nil)
+			}
+
+			if !allRequestedVpcIds.Contains(interfaceVpcID) {
+				logger.Error().Msgf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID)
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID), nil)
+			}
+
+			allFoundVpcIds.Add(interfaceVpcID)
+			if ifc.Device != nil && ifc.DeviceInstance != nil {
+				isDeviceInfoPresent = true
+			}
+			if ifc.IsPhysical {
+				if !isDeviceInfoPresent {
+					pfWithinVPC = append(pfWithinVPC, interfaceVpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
+					pfWithinVPC = []uuid.UUID{interfaceVpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				}
+			}
+
+			dbInterfaces = append(dbInterfaces, cdbm.Interface{
+				VpcID:                &interfaceVpcID,
+				Vpc:                  interfaceVpc,
+				VpcIPFamilyMode:      cutil.GetPtr(ifc.VpcIPFamilyMode()),
 				InlineRoutingProfile: ifc.InlineRoutingProfile.ToDB(),
 				Device:               ifc.Device,
 				DeviceInstance:       ifc.DeviceInstance,
@@ -645,6 +710,17 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 		// Throw an error if there are somehow no PFs, or if the VPC of the first
 		// PF doesn't match the primary VPC of the batch request.
 		if len(pfWithinVPC) == 0 || pfWithinVPC[0] != vpc.ID {
+			// Use the VPC-selection response when the primary physical Interface selects a VPC
+			// by ID. If no primary physical Interface was found, any Interface selecting a VPC
+			// by ID is enough to prefer this response over the legacy VPC Prefix response.
+			if primaryPhysicalInterfaceUsesVpcSelection || (len(pfWithinVPC) == 0 && len(interfaceVpcIDMap) > 0) {
+				logger.Error().Msg("the primary physical interface must use the Instance VPC")
+				if !isDeviceInfoPresent {
+					return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The primary physical Interface must use the VPC specified in `vpcId`", nil)
+				}
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The primary physical Interface for deviceInstance: 0 must use the VPC specified in `vpcId`", nil)
+			}
+
 			logger.Error().Msg("the primary physical interface must use a VPC prefix that matches with Instance VPC")
 
 			if !isDeviceInfoPresent {
@@ -657,6 +733,12 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 		// Reject the request if the requested VPC associations don't match
 		// the VPC associations actually found based on interface definitions.
 		if allRequestedVpcIds.Cardinality() != allFoundVpcIds.Cardinality() {
+			// If any Interface selects a VPC by ID, use the generalized error because
+			// either VPC IDs or VPC Prefixes can account for a mismatch with `vpcId` or `secondaryVpcIds`.
+			if len(interfaceVpcIDMap) > 0 {
+				logger.Error().Msg("one or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data")
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data", nil)
+			}
 			logger.Error().Msg("one or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`")
 			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`", nil)
 		}
@@ -1155,10 +1237,10 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 		desds    []cdbm.DpuExtensionServiceDeployment
 		ssd      *cdbm.StatusDetail
 		// Temporal workflow configs
-		interfaceConfigs    []*cwssaws.InstanceInterfaceConfig
-		ibInterfaceConfigs  []*cwssaws.InstanceIBInterfaceConfig
-		nvlInterfaceConfigs []*cwssaws.InstanceNVLinkGpuConfig
-		desdConfigs         []*cwssaws.InstanceDpuExtensionServiceConfig
+		interfaceConfigs    []*corev1.InstanceInterfaceConfig
+		ibInterfaceConfigs  []*corev1.InstanceIBInterfaceConfig
+		nvlInterfaceConfigs []*corev1.InstanceNVLinkGpuConfig
+		desdConfigs         []*corev1.InstanceDpuExtensionServiceConfig
 	}
 
 	// Values populated inside the transaction closure that are needed for
@@ -1332,6 +1414,8 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 				ifcInputs = append(ifcInputs, cdbm.InterfaceCreateInput{
 					InstanceID:           inst.ID,
 					SubnetID:             dbifc.SubnetID,
+					VpcID:                dbifc.VpcID,
+					VpcIPFamilyMode:      dbifc.VpcIPFamilyMode,
 					VpcPrefixID:          dbifc.VpcPrefixID,
 					Device:               dbifc.Device,
 					DeviceInstance:       dbifc.DeviceInstance,
@@ -1481,10 +1565,10 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 				ibifcs:              make([]cdbm.InfiniBandInterface, 0, len(dbibic)),
 				nvlifcs:             make([]cdbm.NVLinkInterface, 0, len(dbnvlic)),
 				desds:               make([]cdbm.DpuExtensionServiceDeployment, 0, len(dpuServiceIDs)),
-				interfaceConfigs:    make([]*cwssaws.InstanceInterfaceConfig, 0, len(dbInterfaces)),
-				ibInterfaceConfigs:  make([]*cwssaws.InstanceIBInterfaceConfig, 0, len(dbibic)),
-				nvlInterfaceConfigs: make([]*cwssaws.InstanceNVLinkGpuConfig, 0, len(dbnvlic)),
-				desdConfigs:         make([]*cwssaws.InstanceDpuExtensionServiceConfig, 0, len(dpuServiceIDs)),
+				interfaceConfigs:    make([]*corev1.InstanceInterfaceConfig, 0, len(dbInterfaces)),
+				ibInterfaceConfigs:  make([]*corev1.InstanceIBInterfaceConfig, 0, len(dbibic)),
+				nvlInterfaceConfigs: make([]*corev1.InstanceNVLinkGpuConfig, 0, len(dbnvlic)),
+				desdConfigs:         make([]*corev1.InstanceDpuExtensionServiceConfig, 0, len(dpuServiceIDs)),
 			}
 		}
 
@@ -1497,10 +1581,12 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 		// Distribute Interfaces and build workflow configs
 		for _, ifc := range createdIfcsAll {
 			idx := instanceIDToIdx[ifc.InstanceID]
+			if ifc.VpcID != nil {
+				ifc.Vpc = interfaceVpcIDMap[*ifc.VpcID]
+			}
 
-			// NewAPIInstance derives SecondaryVpcIDs from prefix-backed interface relations.
-			// Reattach the already-validated VpcPrefix relation here because CreateMultiple
-			// returns interfaces with IDs populated but without related objects preloaded.
+			// NewAPIInstance derives SecondaryVpcIDs from VPC intent or explicit-prefix
+			// relations. Reattach validated relations because CreateMultiple does not preload them.
 			if ifc.VpcPrefixID != nil {
 				ifc.VpcPrefix = vpcPrefixIDMap[*ifc.VpcPrefixID]
 			}
@@ -1508,26 +1594,33 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 			createdInstancesData[idx].ifcs = append(createdInstancesData[idx].ifcs, ifc)
 
 			// Build temporal workflow config
-			interfaceConfig := &cwssaws.InstanceInterfaceConfig{
-				FunctionType: cwssaws.InterfaceFunctionType_VIRTUAL_FUNCTION,
+			interfaceConfig := &corev1.InstanceInterfaceConfig{
+				FunctionType: corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
 			}
 			if ifc.SubnetID != nil {
-				interfaceConfig.NetworkSegmentId = &cwssaws.NetworkSegmentId{
+				interfaceConfig.NetworkSegmentId = &corev1.NetworkSegmentId{
 					Value: subnetIDMap[*ifc.SubnetID].ControllerNetworkSegmentID.String(),
 				}
-				interfaceConfig.NetworkDetails = &cwssaws.InstanceInterfaceConfig_SegmentId{
-					SegmentId: &cwssaws.NetworkSegmentId{
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_SegmentId{
+					SegmentId: &corev1.NetworkSegmentId{
 						Value: subnetIDMap[*ifc.SubnetID].ControllerNetworkSegmentID.String(),
 					},
 				}
 			}
-			if ifc.VpcPrefixID != nil {
-				interfaceConfig.NetworkDetails = &cwssaws.InstanceInterfaceConfig_VpcPrefixId{
-					VpcPrefixId: &cwssaws.VpcPrefixId{Value: ifc.VpcPrefixID.String()},
+			vpcSelection, ierr := instanceInterfaceVpcSelection(&ifc)
+			if ierr != nil {
+				logger.Error().Err(ierr).Msg("failed to build VPC selection for batch Instance Interface")
+				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to build VPC selection for batch Instance Interface", nil)
+			}
+			if vpcSelection != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_Vpc{Vpc: vpcSelection}
+			} else if ifc.VpcPrefixID != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_VpcPrefixId{
+					VpcPrefixId: &corev1.VpcPrefixId{Value: ifc.VpcPrefixID.String()},
 				}
 			}
 			if ifc.IsPhysical {
-				interfaceConfig.FunctionType = cwssaws.InterfaceFunctionType_PHYSICAL_FUNCTION
+				interfaceConfig.FunctionType = corev1.InterfaceFunctionType_PHYSICAL_FUNCTION
 			}
 			if ifc.Device != nil && ifc.DeviceInstance != nil {
 				interfaceConfig.Device = ifc.Device
@@ -1549,15 +1642,15 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 			createdInstancesData[idx].ibifcs = append(createdInstancesData[idx].ibifcs, ibifc)
 
 			// Build temporal workflow config
-			ibInterfaceConfig := &cwssaws.InstanceIBInterfaceConfig{
+			ibInterfaceConfig := &corev1.InstanceIBInterfaceConfig{
 				Device:         ibifc.Device,
 				Vendor:         ibifc.Vendor,
 				DeviceInstance: uint32(ibifc.DeviceInstance),
-				FunctionType:   cwssaws.InterfaceFunctionType_PHYSICAL_FUNCTION,
-				IbPartitionId:  &cwssaws.IBPartitionId{Value: ibifc.InfiniBandPartitionID.String()},
+				FunctionType:   corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+				IbPartitionId:  &corev1.IBPartitionId{Value: ibifc.InfiniBandPartitionID.String()},
 			}
 			if !ibifc.IsPhysical {
-				ibInterfaceConfig.FunctionType = cwssaws.InterfaceFunctionType_VIRTUAL_FUNCTION
+				ibInterfaceConfig.FunctionType = corev1.InterfaceFunctionType_VIRTUAL_FUNCTION
 				if ibifc.VirtualFunctionID != nil {
 					vfID := uint32(*ibifc.VirtualFunctionID)
 					ibInterfaceConfig.VirtualFunctionId = &vfID
@@ -1572,9 +1665,9 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 			createdInstancesData[idx].nvlifcs = append(createdInstancesData[idx].nvlifcs, nvlifc)
 
 			// Build temporal workflow config
-			nvlInterfaceConfig := &cwssaws.InstanceNVLinkGpuConfig{
+			nvlInterfaceConfig := &corev1.InstanceNVLinkGpuConfig{
 				DeviceInstance:     uint32(nvlifc.DeviceInstance),
-				LogicalPartitionId: &cwssaws.NVLinkLogicalPartitionId{Value: nvlifc.NVLinkLogicalPartitionID.String()},
+				LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvlifc.NVLinkLogicalPartitionID.String()},
 			}
 			createdInstancesData[idx].nvlInterfaceConfigs = append(createdInstancesData[idx].nvlInterfaceConfigs, nvlInterfaceConfig)
 		}
@@ -1585,7 +1678,7 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 			createdInstancesData[idx].desds = append(createdInstancesData[idx].desds, desd)
 
 			// Build temporal workflow config
-			desdConfig := &cwssaws.InstanceDpuExtensionServiceConfig{
+			desdConfig := &corev1.InstanceDpuExtensionServiceConfig{
 				ServiceId: desd.DpuExtensionServiceID.String(),
 				Version:   desd.Version,
 			}
@@ -1614,8 +1707,8 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		// Build batch workflow request using pre-built configs (no DB queries)
-		batchRequest := &cwssaws.BatchInstanceAllocationRequest{
-			InstanceRequests: make([]*cwssaws.InstanceAllocationRequest, 0, len(createdInstancesData)),
+		batchRequest := &corev1.BatchInstanceAllocationRequest{
+			InstanceRequests: make([]*corev1.InstanceAllocationRequest, 0, len(createdInstancesData)),
 		}
 
 		for _, data := range createdInstancesData {
@@ -1629,29 +1722,29 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 			}
 
 			// Build instance allocation request using pre-built configs
-			instanceRequest := &cwssaws.InstanceAllocationRequest{
-				InstanceId: &cwssaws.InstanceId{Value: instance.GetSiteID().String()},
-				MachineId:  &cwssaws.MachineId{Id: *instance.MachineID},
-				Metadata: &cwssaws.Metadata{
+			instanceRequest := &corev1.InstanceAllocationRequest{
+				InstanceId: &corev1.InstanceId{Value: instance.GetSiteID().String()},
+				MachineId:  &corev1.MachineId{Id: *instance.MachineID},
+				Metadata: &corev1.Metadata{
 					Name:        instance.Name,
 					Description: description,
 					Labels:      createLabels,
 				},
-				Config: &cwssaws.InstanceConfig{
+				Config: &corev1.InstanceConfig{
 					NetworkSecurityGroupId: instance.NetworkSecurityGroupID,
-					Tenant: &cwssaws.TenantConfig{
+					Tenant: &corev1.TenantConfig{
 						TenantOrganizationId: tenant.Org,
 						TenantKeysetIds:      instanceSshKeyGroupIds,
 					},
 					Os:      osConfig,
-					Network: buildInstanceNetworkConfig(instance.AutoNetwork, data.interfaceConfigs),
-					Infiniband: &cwssaws.InstanceInfinibandConfig{
+					Network: buildInstanceNetworkConfig(instance.AutoNetwork, data.interfaceConfigs, vpc.ControllerVpcID),
+					Infiniband: &corev1.InstanceInfinibandConfig{
 						IbInterfaces: data.ibInterfaceConfigs,
 					},
-					DpuExtensionServices: &cwssaws.InstanceDpuExtensionServicesConfig{
+					DpuExtensionServices: &corev1.InstanceDpuExtensionServicesConfig{
 						ServiceConfigs: data.desdConfigs,
 					},
-					Nvlink: &cwssaws.InstanceNVLinkConfig{
+					Nvlink: &corev1.InstanceNVLinkConfig{
 						GpuConfigs: data.nvlInterfaceConfigs,
 					},
 				},
@@ -1924,7 +2017,7 @@ func allocateMachinesForBatch(
 // Returns empty string if the machine has no NVLink domain information.
 func getNVLinkDomainID(machine *cdbm.Machine) string {
 	if machine.Metadata != nil {
-		if nvlinkInfo := machine.Metadata.GetNvlinkInfo(); nvlinkInfo != nil {
+		if nvlinkInfo := machine.Metadata.GetStatus().GetNvlinkInfo(); nvlinkInfo != nil {
 			if domainUuid := nvlinkInfo.GetDomainUuid(); domainUuid != nil {
 				return domainUuid.GetValue()
 			}

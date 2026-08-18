@@ -34,19 +34,19 @@ use sqlx::PgConnection;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::CarbideResult;
 use crate::cfg::file::CarbideConfig;
 use crate::machine_update_manager::MachineUpdateManager;
 use crate::machine_update_manager::machine_update_module::MachineUpdateModule;
 use crate::tests::common;
 use crate::tests::common::api_fixtures::create_managed_host;
+use crate::{CarbideError, CarbideResult};
 
 const TEST_DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/cfg/test_data");
 
 #[derive(Clone)]
 struct TestUpdateModule {
-    pub updates_in_progress: Vec<MachineId>,
-    pub updates_started: HashSet<MachineId>,
+    pub(in crate::tests) updates_in_progress: Vec<MachineId>,
+    pub(in crate::tests) updates_started: HashSet<MachineId>,
     start_updates_called: Arc<Mutex<i32>>,
     clear_completed_updates_called: Arc<Mutex<i32>>,
 }
@@ -91,7 +91,10 @@ impl MachineUpdateModule for TestUpdateModule {
 }
 
 impl TestUpdateModule {
-    pub fn new(updates_in_progress: Vec<MachineId>, updates_started: HashSet<MachineId>) -> Self {
+    pub(in crate::tests) fn new(
+        updates_in_progress: Vec<MachineId>,
+        updates_started: HashSet<MachineId>,
+    ) -> Self {
         TestUpdateModule {
             updates_in_progress,
             updates_started,
@@ -99,11 +102,11 @@ impl TestUpdateModule {
             clear_completed_updates_called: Arc::new(Mutex::new(0)),
         }
     }
-    pub fn get_start_updates_called(&self) -> i32 {
+    pub(in crate::tests) fn get_start_updates_called(&self) -> i32 {
         *self.start_updates_called.lock().unwrap()
     }
 
-    pub fn get_clear_completed_updates_called(&self) -> i32 {
+    pub(in crate::tests) fn get_clear_completed_updates_called(&self) -> i32 {
         *self.clear_completed_updates_called.lock().unwrap()
     }
 }
@@ -165,6 +168,7 @@ async fn test_remove_machine_update_markers(
         host_machine_id,
         dpu_machine_id,
         firmware_version: "1".to_owned(),
+        dpf_managed: false,
     };
 
     let reference = &DpuReprovisionInitiator::Automatic(AutomaticFirmwareUpdateReference {
@@ -263,6 +267,48 @@ fn test_start(pool: sqlx::PgPool) {
     assert_eq!(start_count, end_count);
 }
 
+/// A lock acquisition that fails for infrastructure reasons (here: the work
+/// lock manager is gone, so the command channel is closed) must propagate out
+/// of `run_single_iteration` as an error rather than being swallowed as a
+/// benign yield -- it is what flips the loop's heartbeat to `outcome=error`.
+#[crate::sqlx_test()]
+fn test_run_single_iteration_propagates_lock_infrastructure_failure(pool: sqlx::PgPool) {
+    let test_module = Box::new(TestUpdateModule::new(vec![], HashSet::default()));
+    let mut join_set = JoinSet::new();
+    let work_lock_manager_handle =
+        db::work_lock_manager::start(&mut join_set, pool.clone(), Default::default())
+            .await
+            .unwrap();
+    join_set.shutdown().await;
+
+    let config: Arc<CarbideConfig> = Arc::new(
+        Figment::new()
+            .merge(Toml::file(format!("{TEST_DATA_DIR}/full_config.toml")))
+            .extract()
+            .unwrap(),
+    );
+    let update_manager = MachineUpdateManager::new_with_modules(
+        pool,
+        config,
+        vec![test_module],
+        work_lock_manager_handle,
+    );
+
+    let err = update_manager
+        .run_single_iteration()
+        .await
+        .expect_err("a dead work lock manager is an infrastructure failure, not a yield");
+    assert!(
+        matches!(err, CarbideError::Internal { .. }),
+        "expected CarbideError::Internal, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("failed to acquire machine update work lock"),
+        "unexpected message: {err}"
+    );
+}
+
 #[crate::sqlx_test]
 async fn test_get_updating_machines(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let env = create_test_env(pool).await;
@@ -279,6 +325,7 @@ async fn test_get_updating_machines(pool: sqlx::PgPool) -> Result<(), Box<dyn st
         host_machine_id: host_machine_id1,
         dpu_machine_id: dpu_machine_id1,
         firmware_version: "1".to_owned(),
+        dpf_managed: false,
     };
 
     let reference = &DpuReprovisionInitiator::Automatic(AutomaticFirmwareUpdateReference {

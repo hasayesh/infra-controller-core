@@ -12,7 +12,7 @@ defaults:
     working-directory: rest-api
 
 env:
-  GO_VERSION: "1.25.4"
+  GO_VERSION: "1.26.4"
 
 jobs:
   style:
@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -30,14 +32,18 @@ jobs:
           cache: true
           cache-dependency-path: rest-api/go.sum
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
       - name: Download dependencies
         run: go mod download
 
-      - name: Install and run revive
+      - name: Run revive
         run: |
-          go install github.com/mgechev/revive@v1.3.9
           pkgs=$(go list ./... | grep -v $(go env GOMODCACHE))
-          go list $pkgs | grep -v $(go env GOMODCACHE) | xargs -L1 revive -config .revive.toml -set_exit_status
+          go list $pkgs | grep -v $(go env GOMODCACHE) | xargs -L1 go tool revive -config .revive.toml -set_exit_status
 
       - name: Run go fmt
         run: |
@@ -51,6 +57,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check REST command bundle contract
+        run: make check-command-bundle
+
   lint-go:
     name: Lint Go
     runs-on: linux-amd64-cpu4
@@ -58,6 +67,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -75,7 +86,7 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.7.2
+          version: v2.12.2
           args: --timeout=10m --issues-exit-code=0 ./...
           working-directory: rest-api
 
@@ -86,6 +97,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up node.js
         uses: actions/setup-node@v6
@@ -105,19 +118,35 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
+
+      - name: Resolve OpenAPI comparison base
+        id: openapi-base
+        run: |
+          set -euo pipefail
+
+          MERGE_BASE="$(git merge-base HEAD origin/main)"
+
+          echo "merge_base=${MERGE_BASE}" >> "${GITHUB_OUTPUT}"
+          echo "Comparing OpenAPI changes against merge-base ${MERGE_BASE}"
 
       - name: Check OpenAPI breaking changes
         uses: oasdiff/oasdiff-action/breaking@a8c7f0e5649d20d623edb5b38446d3ab3d82d43c
         with:
-          base: 'origin/main:rest-api/openapi/spec.yaml'
+          base: '${{ steps.openapi-base.outputs.merge_base }}:rest-api/openapi/spec.yaml'
           revision: ':rest-api/openapi/spec.yaml'
           fail-on: ERR
+          # Allowlist the intentional one-time rename of the BMC credential
+          # `kind` enum values to CapitalCase; see the referenced ignore file.
+          err-ignore: 'rest-api/openapi/oasdiff-breaking-changes-ignore.txt'
 
   check-generated-files:
     name: Check Generated Files
     runs-on: linux-amd64-cpu4
     continue-on-error: false
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: .
@@ -125,9 +154,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
 
-      - name: Check OpenAPI generated files are up to date
+      # The SDK is verified by regeneration in check-generated-sdk. Diffing the Redoc
+      # bundle would cost a doc toolchain install, so it stays a path heuristic.
+      - name: Check OpenAPI docs are up to date
         run: |
           BASE="origin/main"
           if ! git rev-parse --verify "$BASE" >/dev/null 2>&1; then
@@ -138,34 +170,26 @@ jobs:
           CHANGED=$(git diff --name-only "$BASE"...HEAD)
 
           if echo "$CHANGED" | grep -q '^rest-api/openapi/spec.yaml$'; then
-            SDK_UPDATED=false
-            DOCS_UPDATED=false
-            echo "$CHANGED" | grep -q '^rest-api/sdk/standard/' && SDK_UPDATED=true
-            echo "$CHANGED" | grep -q '^rest-api/docs/index.html$' && DOCS_UPDATED=true
-
-            if [ "$SDK_UPDATED" = false ]; then
-              echo "::warning::rest-api/sdk/standard/ was not updated. Please ensure you have run: make generate-sdk"
-            fi
-            if [ "$DOCS_UPDATED" = false ]; then
-              echo "::warning::rest-api/docs/index.html was not updated. Please ensure you have run: make publish-openapi"
-            fi
-
-            if [ "$SDK_UPDATED" = false ] && [ "$DOCS_UPDATED" = false ]; then
-              echo "::error::rest-api/openapi/spec.yaml was modified but neither rest-api/sdk/standard/ nor rest-api/docs/index.html was updated."
+            if ! echo "$CHANGED" | grep -q '^rest-api/docs/index.html$'; then
+              echo "::error::rest-api/openapi/spec.yaml was modified but rest-api/docs/index.html was not updated. Please run: make publish-openapi"
               exit 1
             fi
-            echo "✓ rest-api/openapi/spec.yaml changed and generated files were also updated (sdk=$SDK_UPDATED, docs=$DOCS_UPDATED)."
+            echo "✓ rest-api/openapi/spec.yaml changed and rest-api/docs/index.html was also updated."
           else
-            echo "✓ rest-api/openapi/spec.yaml not changed, skipping generated files check."
+            echo "✓ rest-api/openapi/spec.yaml not changed, skipping docs check."
           fi
 
-  check-protobuf-generated:
-    name: Check Protobuf Generated Code
+  check-generated-sdk:
+    name: Check Generated SDK
     runs-on: linux-amd64-cpu4
     continue-on-error: false
+    permissions:
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -174,40 +198,53 @@ jobs:
           cache: true
           cache-dependency-path: rest-api/go.sum
 
-      - name: Install buf and protoc plugins
-        run: |
-          go install github.com/bufbuild/buf/cmd/buf@latest
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+      # The generator version itself is pinned in rest-api/Makefile.
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
 
-      - name: Regenerate protobuf code
-        run: |
-          cd workflow-schema && buf generate
-          cd flow && buf generate
+      # generate-sdk applies source headers with a Python script.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Regenerate SDK
+        run: make generate-sdk
 
       - name: Check for uncommitted changes
-        run: |
-          UNTRACKED=$(git ls-files --others --exclude-standard)
+        run: >-
+          bash ../scripts/check-repo-clean.sh "REST SDK generation"
+          "make rest-api/generate-sdk (from the repository root)"
 
-          MEANINGFUL_DIFF=$(git diff --unified=0 | grep '^[+-]' | grep -v '^[+-][+-][+-]' | grep -v '^[+-]//.*protoc-gen-go' | grep -v '^[+-]//.*protoc v' || true)
+  check-protobuf-generated:
+    name: Check Protobuf Generated Code
+    runs-on: linux-amd64-cpu4
+    continue-on-error: false
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-          if [ -z "$MEANINGFUL_DIFF" ] && [ -z "$UNTRACKED" ]; then
-            echo "✓ Protobuf generated code is up to date."
-          else
-            echo "::error::Protobuf generated code is out of date. Please run 'make core-protogen' and 'make flow-protogen' and commit the results."
-            echo ""
-            echo "Changed files:"
-            git status --porcelain
-            echo ""
-            echo "Diff:"
-            git -P diff
-            if [ -n "$UNTRACKED" ]; then
-              echo ""
-              echo "Untracked files:"
-              echo "$UNTRACKED"
-            fi
-            exit 1
-          fi
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: rest-api/go.sum
+
+      - name: Regenerate protobuf code
+        run: make core-proto
+
+      - name: Check for uncommitted changes
+        run: >-
+          bash ../scripts/check-repo-clean.sh "REST protobuf generation"
+          "make sync-protobuf (from the repository root)"
 
   test:
     name: Test (${{ matrix.module }})
@@ -226,6 +263,7 @@ jobs:
           - ipam
           - nvswitch-manager
           - powershelf-manager
+          - proto
           - site-agent
           - site-manager
           - site-workflow
@@ -244,6 +282,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5

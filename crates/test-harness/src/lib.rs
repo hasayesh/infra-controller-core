@@ -18,11 +18,12 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+pub use carbide_api_core::cfg::file::CarbideConfig;
 use carbide_api_core::test_support::rpc::forge::forge_server::Forge;
 pub use carbide_api_core::test_support::{self, Api, rpc};
-use carbide_site_explorer::SiteExplorer;
 use carbide_site_explorer::config::SiteExplorerConfig;
 pub use carbide_site_explorer::test_support::{MockEndpointExplorer, TestSiteExplorer};
+use carbide_site_explorer::{EndpointExplorationService, SiteExplorer};
 use carbide_utils::test_support::test_meter::TestMeter;
 use carbide_uuid::machine::MachineId;
 use sqlx::{PgPool, PgTransaction};
@@ -34,10 +35,11 @@ use crate::asset::{TestPowerShelf, TestRack, TestSwitch};
 use crate::builder::TestHarnessBuilder;
 use crate::dns::TestDomain;
 use crate::network::controller::TestNetworkController;
-use crate::network::segment::TestNetworkSegment;
+pub use crate::network::segment::TestNetworkSegment;
 
 pub mod asset;
 pub mod builder;
+pub mod db_machine;
 pub mod dns;
 pub mod machine;
 pub mod machine_dpu;
@@ -47,6 +49,7 @@ pub mod network;
 pub mod prelude;
 pub mod resource_pool;
 
+pub use db_machine::DbMachineExt;
 pub use machine::TestMachine;
 pub use machine_dpu::TestDpuMachine;
 pub use machine_host::TestHostMachine;
@@ -62,7 +65,7 @@ impl TestHarness {
     pub fn builder(db_pool: PgPool) -> TestHarnessBuilder {
         builder::TestHarnessBuilder {
             db_pool,
-            api: None,
+            api_builder_fn: None,
             test_meter: None,
             pools: None,
         }
@@ -120,12 +123,16 @@ impl TestHarness {
     pub fn test_site_explorer(&self, config: SiteExplorerConfig) -> TestSiteExplorer {
         let endpoint_explorer = Arc::new(MockEndpointExplorer::default());
         let api = self.api();
+        let endpoint_exploration_service = Arc::new(EndpointExplorationService::new(
+            api.database_connection.clone(),
+            endpoint_explorer.clone(),
+            Arc::new(api.runtime_config.get_firmware_config()),
+        ));
         let site_explorer = SiteExplorer::new(
             api.database_connection.clone(),
             config,
             self.test_meter.meter(),
-            endpoint_explorer.clone(),
-            Arc::new(api.runtime_config.get_firmware_config()),
+            endpoint_exploration_service,
             api.common_pools().clone(),
             api.work_lock_manager_handle(),
             api.runtime_config.rack_profiles.clone(),

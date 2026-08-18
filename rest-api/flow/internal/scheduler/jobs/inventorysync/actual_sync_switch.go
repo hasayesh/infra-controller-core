@@ -14,9 +14,9 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/common/utils"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/db/model"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/nicoapi"
-	pb "github.com/NVIDIA/infra-controller/rest-api/flow/internal/nicoapi/gen"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/devicetypes"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/types"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 // nvosIPDescriptionKey is the component.description key under which the
@@ -90,7 +90,7 @@ func syncNVSwitchesNICo(
 	}
 
 	// Direct-write external_id for matched components
-	var switchIDs []*pb.SwitchId
+	var switchIDs []*corev1.SwitchId
 	componentsBySwitchID := make(map[string]*model.Component)
 
 	for bmcMac, sw := range expectedByBmcMac {
@@ -109,27 +109,25 @@ func syncNVSwitchesNICo(
 			log.Info().Msgf("NVSwitch %s (BMC %s): set external_id to Core SwitchId %s", sw.ID, bmcMac, switchID)
 		}
 
-		switchIDs = append(switchIDs, &pb.SwitchId{Id: les.SwitchID})
+		switchIDs = append(switchIDs, &corev1.SwitchId{Id: les.SwitchID})
 		componentsBySwitchID[les.SwitchID] = sw
 	}
 
-	// Fetch inventory from Core for all matched switches. A failure here
-	// leaves the serial-mismatch drifts incomplete, so flag the type
-	// not-OK: the caller then preserves the existing drift table this cycle
-	// rather than overwriting it with a partial view.
-	now := time.Now()
-	inventoryOK := true
+	// Fetch inventory from Core for all matched switches. Inventory only feeds
+	// the firmware_version / power_state direct-writes now — drift is keyed on
+	// BMC MAC via the linked RPC above — so a failure here is best-effort and
+	// just leaves those fields stale this cycle; it does not make the drift
+	// table partial.
 	if len(switchIDs) > 0 {
-		invResp, err := nicoClient.GetComponentInventory(ctx, &pb.GetComponentInventoryRequest{
-			Target: &pb.GetComponentInventoryRequest_SwitchIds{
-				SwitchIds: &pb.SwitchIdList{Ids: switchIDs},
+		invResp, err := nicoClient.GetComponentInventory(ctx, &corev1.GetComponentInventoryRequest{
+			Target: &corev1.GetComponentInventoryRequest_SwitchIds{
+				SwitchIds: &corev1.SwitchIdList{Ids: switchIDs},
 			},
 		})
 		if err != nil {
 			log.Error().Msgf("Unable to retrieve switch inventory from NICo: %v", err)
-			inventoryOK = false
 		} else {
-			drifts = append(drifts, applyInventoryToComponents(ctx, pool, invResp, componentsBySwitchID)...)
+			applyInventoryToComponents(ctx, pool, invResp, componentsBySwitchID)
 		}
 	}
 
@@ -138,6 +136,7 @@ func syncNVSwitchesNICo(
 	syncSwitchNvosIPs(ctx, pool, nicoClient, componentsBySwitchID)
 
 	// Build drifts for components that don't have a Core SwitchId yet
+	now := time.Now()
 	for _, sw := range expectedByBmcMac {
 		if sw.ComponentID == nil || *sw.ComponentID == "" {
 			compID := sw.ID
@@ -152,7 +151,7 @@ func syncNVSwitchesNICo(
 	}
 
 	log.Info().Msgf("NVSwitch NICo sync: %d drift(s) out of %d expected", len(drifts), len(expectedSwitches))
-	return received, drifts, inventoryOK
+	return received, drifts, true
 }
 
 // syncSwitchStatuses fetches controller_state for the matched switches and

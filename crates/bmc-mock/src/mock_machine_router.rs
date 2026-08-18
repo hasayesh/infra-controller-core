@@ -24,9 +24,14 @@ use crate::bmc_state::BmcState;
 use crate::injection::InjectionStore;
 use crate::redfish::manager::ManagerState;
 use crate::{
-    Callbacks, HostHardwareType, MachineInfo, SystemPowerControl, auth_router, middleware_router,
-    redfish,
+    Callbacks, HardwareType, MachineInfo, SystemPowerControl, VirtualMediaDeviceConfig,
+    auth_router, middleware_router, redfish,
 };
+
+#[derive(Debug, Default)]
+pub struct MachineRouterOptions {
+    pub virtual_media_devices: Option<Vec<VirtualMediaDeviceConfig>>,
+}
 
 #[derive(Debug)]
 pub enum BmcCommand {
@@ -41,9 +46,9 @@ pub type SetSystemPowerResult = Result<(), SetSystemPowerError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetSystemPowerError {
-    #[error("Mock BMC reported bad request when setting system power: {0}")]
+    #[error("mock BMC reported bad request when setting system power: {0}")]
     BadRequest(String),
-    #[error("Mock BMC failed to send power command: {0}")]
+    #[error("mock BMC failed to send power command: {0}")]
     CommandSendError(String),
 }
 
@@ -62,10 +67,47 @@ impl AddRoutes for Router<BmcState> {
 /// Return an axum::Router that mocks various redfish calls to match
 /// the provided MachineInfo.
 pub fn machine_router(
-    machine_info: MachineInfo,
+    machine_info: &MachineInfo,
     callbacks: Arc<dyn Callbacks>,
     mat_host_id: String,
     redfish_auth: bool,
+    options: MachineRouterOptions,
+) -> (Router, BmcState) {
+    machine_router_inner(
+        machine_info,
+        callbacks,
+        mat_host_id,
+        redfish_auth,
+        Arc::new(InjectionStore::new()),
+        options,
+    )
+}
+
+/// Return a machine router backed by a caller-provided injection store.
+pub fn machine_router_with_injection_store(
+    machine_info: &MachineInfo,
+    callbacks: Arc<dyn Callbacks>,
+    mat_host_id: String,
+    redfish_auth: bool,
+    injection: Arc<InjectionStore>,
+) -> (Router, BmcState) {
+    machine_router_inner(
+        machine_info,
+        callbacks,
+        mat_host_id,
+        redfish_auth,
+        injection,
+        MachineRouterOptions::default(),
+    )
+}
+
+fn machine_router_inner(
+    machine_info: &MachineInfo,
+    callbacks: Arc<dyn Callbacks>,
+    mat_host_id: String,
+    redfish_auth: bool,
+    injection: Arc<InjectionStore>,
+    options: MachineRouterOptions,
 ) -> (Router, BmcState) {
     let system_config = machine_info.system_config(callbacks.clone());
     let chassis_config = machine_info.chassis_config();
@@ -76,25 +118,29 @@ pub fn machine_router(
     let oem_state = machine_info.oem_state();
     let factory_default_account = machine_info.factory_default_account();
     let router = Router::new()
-        .add_routes(crate::injection::add_routes)
         .add_routes(crate::redfish::service_root::add_routes)
         .add_routes(crate::redfish::chassis::add_routes)
         .add_routes(crate::redfish::manager::add_routes)
         .add_routes(crate::redfish::update_service::add_routes)
         .add_routes(crate::redfish::task_service::add_routes)
+        .add_routes(crate::redfish::telemetry_service::add_routes)
         .add_routes(crate::redfish::account_service::add_routes)
         .add_routes(crate::redfish::session_service::add_routes)
         .add_routes(|routes| crate::redfish::computer_system::add_routes(routes, bmc_vendor))
+        .add_routes(crate::redfish::virtual_media::add_routes)
         .add_routes(crate::ipmi::add_routes);
-    let router = match &machine_info {
+    let router = match machine_info {
         MachineInfo::Dpu(_) => {
             router.add_routes(crate::redfish::oem::nvidia::bluefield::add_routes)
         }
-        MachineInfo::Host(_) => router.add_routes(crate::redfish::oem::dell::idrac::add_routes),
+        MachineInfo::Host(_) => router
+            .add_routes(crate::redfish::oem::dell::idrac::add_routes)
+            .add_routes(crate::redfish::oem::supermicro::manager::add_routes),
     };
     let manager = Arc::new(ManagerState::new(&machine_info.manager_config()));
     let system_state = Arc::new(crate::redfish::computer_system::SystemState::from_config(
         system_config,
+        &options,
     ));
     let chassis_state = Arc::new(crate::redfish::chassis::ChassisState::from_config(
         chassis_config,
@@ -102,12 +148,14 @@ pub fn machine_router(
     let update_service_state = Arc::new(
         crate::redfish::update_service::UpdateServiceState::from_config(update_service_config),
     );
+    // Desired firmware versions arrive via UpdateServiceConfig.pending_upgrades and
+    // are stored in UpdateServiceState at construction time via from_config().
+    // No separate pre-staging call is needed here.
     let account_service_state = Arc::new(
         crate::redfish::account_service::AccountServiceState::new(factory_default_account),
     );
     let session_service_state =
         Arc::new(crate::redfish::session_service::SessionServiceState::new());
-    let injection = Arc::new(InjectionStore::new());
     let state = BmcState {
         bmc_vendor,
         bmc_product,
@@ -121,13 +169,20 @@ pub fn machine_router(
         session_service_state,
         injection: injection.clone(),
         callbacks: Some(callbacks.clone()),
+        exposes_computer_systems: machine_info.exposes_computer_systems(),
     };
     let account_service_state = state.account_service_state.clone();
     let session_service_state = state.session_service_state.clone();
     let permit_factory_default_password = matches!(
         &machine_info,
-        MachineInfo::Host(h) if h.hw_type == HostHardwareType::LiteOnPowerShelf
+        MachineInfo::Host(h) if matches!(
+            h.hw_type,
+            HardwareType::LiteOnPowerShelf | HardwareType::DeltaPowerShelf
+        )
     );
+    let router = router
+        .with_state(state.clone())
+        .merge(crate::injection::management_router(injection.clone()));
     let router = ([
         Box::new(redfish::expander_router::append),
         Box::new(move |router| {
@@ -148,6 +203,6 @@ pub fn machine_router(
         }),
     ] as [Box<dyn FnOnce(axum::Router) -> axum::Router>; _])
         .into_iter()
-        .fold(router.with_state(state.clone()), |router, f| f(router));
+        .fold(router, |router, f| f(router));
     (router, state)
 }

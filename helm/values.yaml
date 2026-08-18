@@ -53,6 +53,27 @@ global:
     app.kubernetes.io/part-of: site-controller
 
 ## ---------------------------------------------------------------------------
+## Grafana dashboards (optional)
+## ---------------------------------------------------------------------------
+## Packages the NICo dashboards in a ConfigMap for discovery by a Grafana
+## dashboard sidecar, such as the one included with kube-prometheus-stack.
+## Grafana itself is not installed by this chart.
+grafanaDashboards:
+  enabled: false
+  ## Namespace where the dashboard ConfigMap is installed. An empty value uses
+  ## the Helm release namespace. A non-default namespace must already exist.
+  namespace: ""
+  ## Folder metadata understood by common Grafana dashboard sidecars. Set
+  ## folderAnnotation or folder to an empty string to omit the annotation.
+  folder: NICo
+  folderAnnotation: grafana_folder
+  ## The defaults match kube-prometheus-stack's dashboard sidecar selector.
+  ## Add or replace labels here if the local sidecar uses another selector.
+  labels:
+    grafana_dashboard: "1"
+  annotations: {}
+
+## ---------------------------------------------------------------------------
 ## nico-api — Core API server (gRPC + REST)
 ## Manages machines, provisioning, networking, firmware updates, and web UI.
 ## Requires PostgreSQL and Vault.
@@ -61,11 +82,13 @@ nico-api:
   enabled: true
 
 ## ---------------------------------------------------------------------------
-## nico-bmc-proxy — Standalone BMC proxy
-## Provides an authenticated HTTP proxy to each BMC known by nico
+## nico-bmc-proxy — BMC proxy used by DPS-based power provisioning
+## Provides an authenticated HTTP proxy to each BMC known by nico.
+## Enabled by default as part of NICo Core; set enabled=false only when an
+## external BMC proxy is deployed and wired separately.
 ## ---------------------------------------------------------------------------
 nico-bmc-proxy:
-  enabled: false
+  enabled: true
 
 ## ---------------------------------------------------------------------------
 ## nico-dhcp — DHCP server (Kea-based)
@@ -124,6 +147,12 @@ nico-ntp:
 ## ---------------------------------------------------------------------------
 nico-pxe:
   enabled: true
+  ## Optional CA bundle served to bootstrapping clients. Set at most one object
+  ## name; leaving both empty preserves the PXE workload CA fallback.
+  bootstrapRootCa:
+    configMapName: ""
+    secretName: ""
+    key: ca.crt
 
 ## ---------------------------------------------------------------------------
 ## nico-ssh-console-rs — SSH console proxy
@@ -143,4 +172,14 @@ nico-ssh-console-rs:
 ##       Reads .Values.imagePullSecrets (not global) for pull secrets.
 ## ---------------------------------------------------------------------------
 unbound:
+  enabled: false
+
+## ---------------------------------------------------------------------------
+## nico-machine-a-tron - Mock machine simulator (development/testing only)
+## Simulates bare-metal machines, DPUs, switches and power shelves for
+## testing NICo without physical hardware. NOT for production use.
+## Deploy standalone for dev environments:
+##   helm install mat ./helm/charts/nico-machine-a-tron -n nico-system ...
+## ---------------------------------------------------------------------------
+nico-machine-a-tron:
   enabled: false

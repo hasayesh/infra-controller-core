@@ -21,13 +21,17 @@ use bmc_mock::{DUMMY_FACTORY_PASSWORD, DUMMY_FACTORY_USERNAME, MachineInfo};
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::machine::{MachineId, MachineInterfaceId};
 use carbide_uuid::machine_validation::MachineValidationId;
+use carbide_uuid::power_shelf::PowerShelfId;
+use carbide_uuid::rack::{RackId, RackProfileId};
+use carbide_uuid::switch::SwitchId;
 use mac_address::MacAddress;
+use model::expected_machine::HostDpuPolicy;
 use rpc::forge::instance_operating_system_config::Variant;
 use rpc::forge::machine_cleanup_info::CleanupStepResult;
 use rpc::forge::{
-    ConfigSetting, ExpectedMachine, ExpectedPowerShelf, ExpectedSwitch, InlineIpxe,
-    InstanceOperatingSystemConfig, MachinesByIdsRequest, SetDynamicConfigRequest,
-    VpcVirtualizationType,
+    ConfigSetting, ExpectedInterface, ExpectedMachine, ExpectedPowerShelf, ExpectedRack,
+    ExpectedRackRequest, ExpectedSwitch, InlineIpxe, InstanceOperatingSystemConfig,
+    MachinesByIdsRequest, SetDynamicConfigRequest, VpcVirtualizationType,
 };
 use rpc::protos::forge_api_client::ForgeApiClient;
 
@@ -35,13 +39,13 @@ use crate::MachineConfig;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ClientApiError {
-    #[error("Configuration error: {0}")]
+    #[error("configuration error: {0}")]
     ConfigError(String),
 
-    #[error("Unable to connect to carbide API: {0}")]
+    #[error("unable to connect to carbide API: {0}")]
     ConnectFailed(String),
 
-    #[error("The API call to the Forge API server returned {0}")]
+    #[error("the API call to the forge API server returned {0}")]
     InvocationError(#[from] tonic::Status),
 }
 
@@ -55,6 +59,8 @@ pub struct MockDiscoveryData {
 
 static SUBNET_COUNTER: AtomicU32 = AtomicU32::new(0);
 static VPC_COUNTER: AtomicU32 = AtomicU32::new(0);
+const DUMMY_NVOS_USERNAME: &str = "admin";
+const DUMMY_NVOS_PASSWORD: &str = "factory_password";
 
 #[derive(Debug, Clone)]
 pub struct ApiClient(pub ForgeApiClient);
@@ -79,26 +85,21 @@ impl ApiClient {
     pub async fn discover_dhcp(
         &self,
         mac_address: MacAddress,
-        template_dir: String,
         relay_address: String,
         circuit_id: Option<String>,
+        vendor_class: Option<&str>,
     ) -> ClientApiResult<rpc::forge::DhcpRecord> {
-        let json_path = format!("{}/{}", &template_dir, "dhcp_discovery.json");
-        let dhcp_string = std::fs::read_to_string(&json_path).map_err(|e| {
-            ClientApiError::ConfigError(format!("Unable to read {json_path}: {e}",))
-        })?;
-        let default_data: rpc::forge::DhcpDiscovery =
-            serde_json::from_str(&dhcp_string).map_err(|e| {
-                ClientApiError::ConfigError(format!(
-                    "{template_dir}/dhcp_discovery.json does not have correct format: {e}"
-                ))
-            })?;
-
         let dhcp_discovery = rpc::forge::DhcpDiscovery {
             mac_address: mac_address.to_string(),
-            circuit_id,
             relay_address,
-            ..default_data
+            vendor_string: vendor_class.map(str::to_owned),
+            link_address: None,
+            circuit_id,
+            remote_id: None,
+            desired_address: None,
+            address_family: None,
+            message_kind: None,
+            duid: None,
         };
         let out = self
             .0
@@ -135,7 +136,7 @@ impl ApiClient {
             machine_interface_id,
             tpm_ek_certificate,
         } = discovery_data;
-        let mut machine_discovery_info = machine_info.discovery_info();
+        let mut machine_discovery_info = crate::discovery_info::for_machine(machine_info);
         if matches!(machine_info, MachineInfo::Host(_)) {
             machine_discovery_info.tpm_ek_certificate =
                 Some(BASE64_STANDARD.encode(tpm_ek_certificate.ok_or(
@@ -217,6 +218,7 @@ impl ApiClient {
                 last_dhcp_requests: vec![],
                 dpu_extension_service_version: None,
                 dpu_extension_services: vec![],
+                astra_config_status: None,
             })
             .await
             .map_err(ClientApiError::InvocationError)
@@ -288,13 +290,16 @@ impl ApiClient {
             }),
             network: Some(rpc::InstanceNetworkConfig {
                 interfaces: vec![interface_config],
+                #[allow(deprecated)]
                 auto: false,
+                auto_config: None,
             }),
             network_security_group_id: None,
             infiniband: None,
             dpu_extension_services: None,
             nvlink: None,
             spxconfig: None,
+            power_profile: None,
         };
 
         let instance_request = rpc::InstanceAllocationRequest {
@@ -330,6 +335,68 @@ impl ApiClient {
             .map_err(ClientApiError::InvocationError)
     }
 
+    pub async fn force_delete_switch_by_bmc(
+        &self,
+        bmc_mac: String,
+    ) -> ClientApiResult<Option<SwitchId>> {
+        let mut ids = self
+            .0
+            .find_switch_ids(rpc::forge::SwitchSearchFilter {
+                bmc_mac: Some(bmc_mac.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(ClientApiError::InvocationError)?
+            .ids;
+        if ids.len() > 1 {
+            return Err(ClientApiError::ConfigError(format!(
+                "multiple switches found for BMC MAC address {bmc_mac}"
+            )));
+        }
+        let Some(switch_id) = ids.pop() else {
+            return Ok(None);
+        };
+        self.0
+            .admin_force_delete_switch(rpc::forge::AdminForceDeleteSwitchRequest {
+                switch_id: Some(switch_id),
+                delete_interfaces: true,
+            })
+            .await
+            .map_err(ClientApiError::InvocationError)?;
+        Ok(Some(switch_id))
+    }
+
+    pub async fn force_delete_power_shelf_by_bmc(
+        &self,
+        bmc_mac: String,
+    ) -> ClientApiResult<Option<PowerShelfId>> {
+        let mut ids = self
+            .0
+            .find_power_shelf_ids(rpc::forge::PowerShelfSearchFilter {
+                bmc_mac: Some(bmc_mac.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(ClientApiError::InvocationError)?
+            .ids;
+        if ids.len() > 1 {
+            return Err(ClientApiError::ConfigError(format!(
+                "multiple power shelves found for BMC MAC address {bmc_mac}"
+            )));
+        }
+        let Some(power_shelf_id) = ids.pop() else {
+            return Ok(None);
+        };
+        self.0
+            .admin_force_delete_power_shelf(rpc::forge::AdminForceDeletePowerShelfRequest {
+                power_shelf_id: Some(power_shelf_id),
+                delete_interfaces: true,
+            })
+            .await
+            .map_err(ClientApiError::InvocationError)?;
+        Ok(Some(power_shelf_id))
+    }
+
     pub async fn create_network_segment(
         &self,
         vpc_name: &String,
@@ -350,14 +417,14 @@ impl ApiClient {
             Ok(vpc_id_list) => {
                 match vpc_id_list.vpc_ids.len() {
                     0 => tracing::error!(
-                        "There are no VPC ids associated with {}. Should not have happened.",
-                        *vpc_name
+                        vpc_name = %*vpc_name,
+                        "No VPC IDs are associated with VPC name; this should not happen",
                     ),
                     1 => {}
                     _ => tracing::warn!(
-                        "There are {} VPC ids associated with {}. Should not have happened. Clean up DB and start over.",
-                        vpc_id_list.vpc_ids.len(),
-                        vpc_name
+                        vpc_id_count = vpc_id_list.vpc_ids.len(),
+                        vpc_name = %vpc_name,
+                        "Multiple VPC IDs are associated with VPC name; clean up the database and restart",
                     ),
                 }
 
@@ -370,6 +437,8 @@ impl ApiClient {
                     reserve_first: 1,
                     free_ip_count: 0,
                     svi_ip: None,
+                    free_ip_count_v2: None,
+                    free_ip_count_saturated: false,
                 }];
 
                 if is_fnn {
@@ -380,6 +449,8 @@ impl ApiClient {
                         reserve_first: 1,
                         free_ip_count: 0,
                         svi_ip: None,
+                        free_ip_count_v2: None,
+                        free_ip_count_saturated: false,
                     });
                 }
 
@@ -392,6 +463,7 @@ impl ApiClient {
                         prefixes,
                         mtu: Some(1500),
                         subdomain_id: None,
+                        infer_slaac_eui64_addresses: false,
                     })
                     .await
                     .map_err(ClientApiError::InvocationError)
@@ -417,6 +489,8 @@ impl ApiClient {
                 network_virtualization_type: network_virtualization_type.map(|t| t as i32),
                 vni: None,
                 routing_profile_type: None,
+                routing_profile_overrides: None,
+                power_resource_group: None,
                 metadata: Some(rpc::forge::Metadata {
                     name: format!("vpc_{vpc_count}"),
                     description: "".to_string(),
@@ -489,13 +563,16 @@ impl ApiClient {
 
     /// Registers a mock expected machine. Static BMC (`bmc_ip_address`) is left unset here;
     /// real environments set it through the admin CLI / API when DHCP discovery is not used.
-    /// `dpu_mode` is the per-host operating mode -- pass `Some(NoDpu)` for zero-DPU mock hosts
-    /// or `Some(NicMode)` for DPU-in-NIC-mode mock hosts; `None` for normal DPU hosts.
+    /// `dpu_policy` is the per-host policy -- pass `Some(Ignore)` for zero-DPU
+    /// mock hosts or `Some(Nic)` for DPU-in-NIC-mode mock hosts; `None` for
+    /// normal DPU hosts.
     pub async fn add_expected_machine(
         &self,
         bmc_mac_address: String,
         chassis_serial_number: String,
-        dpu_mode: Option<rpc::forge::DpuMode>,
+        rack_id: Option<RackId>,
+        dpu_policy: Option<HostDpuPolicy>,
+        interfaces: Vec<ExpectedInterface>,
     ) -> ClientApiResult<()> {
         self.0
             .add_expected_machine(ExpectedMachine {
@@ -507,15 +584,17 @@ impl ApiClient {
                 metadata: None,
                 sku_id: None,
                 id: None,
-                host_nics: vec![],
-                rack_id: None,
+                host_nics: interfaces,
+                replace_host_nics: false,
+                rack_id,
                 default_pause_ingestion_and_poweron: None,
                 #[allow(deprecated)]
                 dpf_enabled: true,
                 is_dpf_enabled: Some(true),
                 bmc_ip_address: None,
                 bmc_retain_credentials: None,
-                dpu_mode: dpu_mode.map(|m| m as i32),
+                dpu_mode: dpu_policy.map(|policy| rpc::forge::DpuMode::from(policy) as i32),
+                bmc_ip_allocation: None,
                 host_lifecycle_profile: None,
             })
             .await
@@ -527,6 +606,7 @@ impl ApiClient {
         &self,
         bmc_mac_address: String,
         shelf_serial_number: String,
+        rack_id: Option<RackId>,
     ) -> ClientApiResult<()> {
         self.0
             .add_expected_power_shelf(ExpectedPowerShelf {
@@ -537,7 +617,7 @@ impl ApiClient {
                 shelf_serial_number,
                 bmc_ip_address: String::new(),
                 metadata: None,
-                rack_id: None,
+                rack_id,
                 bmc_retain_credentials: Some(true),
             })
             .await
@@ -550,6 +630,7 @@ impl ApiClient {
         bmc_mac_address: String,
         switch_serial_number: String,
         nvos_mac_addresses: Vec<String>,
+        rack_id: Option<RackId>,
     ) -> ClientApiResult<()> {
         self.0
             .add_expected_switch(ExpectedSwitch {
@@ -559,15 +640,53 @@ impl ApiClient {
                 bmc_username: DUMMY_FACTORY_USERNAME.to_string(),
                 bmc_password: DUMMY_FACTORY_PASSWORD.to_string(),
                 switch_serial_number,
-                nvos_username: None,
-                nvos_password: None,
+                nvos_username: Some(DUMMY_NVOS_USERNAME.to_string()),
+                nvos_password: Some(DUMMY_NVOS_PASSWORD.to_string()),
                 bmc_ip_address: String::new(),
                 nvos_ip_address: None,
                 metadata: None,
-                rack_id: None,
+                rack_id,
                 bmc_retain_credentials: None,
             })
             .await
             .map_err(ClientApiError::InvocationError)
+    }
+
+    pub async fn ensure_expected_rack(
+        &self,
+        rack_id: RackId,
+        rack_profile_id: RackProfileId,
+    ) -> ClientApiResult<()> {
+        let expected_rack = ExpectedRack {
+            rack_id: Some(rack_id.clone()),
+            rack_profile_id: Some(rack_profile_id.clone()),
+            metadata: None,
+        };
+
+        match self.0.add_expected_rack(expected_rack).await {
+            Ok(()) => Ok(()),
+            Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                let existing = self
+                    .0
+                    .get_expected_rack(ExpectedRackRequest {
+                        rack_id: rack_id.to_string(),
+                    })
+                    .await
+                    .map_err(ClientApiError::InvocationError)?;
+                if existing.rack_profile_id.as_ref() == Some(&rack_profile_id) {
+                    Ok(())
+                } else {
+                    let existing_profile_id = existing
+                        .rack_profile_id
+                        .as_ref()
+                        .map(RackProfileId::as_str)
+                        .unwrap_or("<missing>");
+                    Err(ClientApiError::ConfigError(format!(
+                        "Expected rack {rack_id} already exists with rack_profile_id {existing_profile_id}, not {rack_profile_id}"
+                    )))
+                }
+            }
+            Err(status) => Err(ClientApiError::InvocationError(status)),
+        }
     }
 }

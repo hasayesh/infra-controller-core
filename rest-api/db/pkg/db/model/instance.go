@@ -15,7 +15,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 const (
@@ -279,9 +279,9 @@ func (i *Instance) GetSiteID() *uuid.UUID {
 // ToReleaseRequestProto builds the workflow request that asks a Site to
 // release (delete) this Instance. The handler may further set the
 // optional Issue field for break-fix flows after calling this.
-func (i *Instance) ToReleaseRequestProto() *cwssaws.InstanceReleaseRequest {
-	return &cwssaws.InstanceReleaseRequest{
-		Id: &cwssaws.InstanceId{Value: i.GetSiteID().String()},
+func (i *Instance) ToReleaseRequestProto() *corev1.InstanceReleaseRequest {
+	return &corev1.InstanceReleaseRequest{
+		Id: &corev1.InstanceId{Value: i.GetSiteID().String()},
 	}
 }
 
@@ -623,12 +623,12 @@ func (isd InstanceSQLDAO) setQueryWithFilter(filter InstanceFilterInput, query *
 
 		isd.tracerSpan.SetAttribute(instanceDAOSpan, "vpc_ids", filter.VpcIDs)
 
-		// Filter on VPC IDs
-		// Match instances by either their primary VPC (`i.vpc_id`) or any
-		// interface-attached VPC prefix (`vp.vpc_id`).
-		// We need to check for both so that we cover legacy VPCs with network segments and
-		// VPCs with VPC prefixes.
-		query = query.Where("(vp.vpc_id IN (?) OR i.vpc_id IN (?))", bun.In(filter.VpcIDs), bun.In(filter.VpcIDs))
+		// Match instances by their primary VPC, direct interface VPC selection,
+		// or an interface-attached explicit or resolved VPC prefix.
+		query = query.Where(
+			"(ifc.vpc_id IN (?) OR vp.vpc_id IN (?) OR i.vpc_id IN (?))",
+			bun.In(filter.VpcIDs), bun.In(filter.VpcIDs), bun.In(filter.VpcIDs),
+		)
 
 		// Now boil everything down to only the unique instance records.
 		query = query.Distinct()

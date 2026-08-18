@@ -55,6 +55,7 @@ impl StateControllerIO for VpcPrefixStateControllerIO {
         db::vpc_prefix::search(
             txn,
             vpc_prefix::VpcPrefixSearch {
+                site_prefix_id: None,
                 deleted_filter: DeletedFilter::Include,
                 ..Default::default()
             },
@@ -82,7 +83,7 @@ impl StateControllerIO for VpcPrefixStateControllerIO {
                 "db::vpc_prefix::get_by_id()",
                 sqlx::Error::Decode(
                     eyre::eyre!(
-                        "Searching for VpcPrefix {} returned multiple results",
+                        "searching for VpcPrefix {} returned multiple results",
                         vpc_prefix_id
                     )
                     .into(),

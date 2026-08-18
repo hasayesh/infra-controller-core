@@ -14,6 +14,7 @@ import (
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
+	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	sc "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/client/site"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,7 +30,7 @@ import (
 	cwm "github.com/NVIDIA/infra-controller/rest-api/workflow/internal/metrics"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
 
-	cwsv1 "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	"os"
 
@@ -56,6 +57,313 @@ func testTemporalSiteClientPool(t *testing.T) *sc.ClientPool {
 	return tSiteClientPool
 }
 
+func TestPrimaryResolvedVpcPrefixID(t *testing.T) {
+	ipv4 := &corev1.VpcPrefixId{Value: uuid.NewString()}
+	ipv6 := &corev1.VpcPrefixId{Value: uuid.NewString()}
+
+	tests := []struct {
+		name     string
+		prefixes *corev1.InstanceInterfaceResolvedVpcPrefixes
+		want     *corev1.VpcPrefixId
+	}{
+		{name: "unresolved", prefixes: nil, want: nil},
+		{
+			name: "IPv4-only uses IPv4",
+			prefixes: &corev1.InstanceInterfaceResolvedVpcPrefixes{
+				Ipv4VpcPrefixId: ipv4,
+			},
+			want: ipv4,
+		},
+		{
+			name: "IPv6-only uses IPv6",
+			prefixes: &corev1.InstanceInterfaceResolvedVpcPrefixes{
+				Ipv6VpcPrefixId: ipv6,
+			},
+			want: ipv6,
+		},
+		{
+			name: "dual-stack keeps IPv4 primary",
+			prefixes: &corev1.InstanceInterfaceResolvedVpcPrefixes{
+				Ipv4VpcPrefixId: ipv4,
+				Ipv6VpcPrefixId: ipv6,
+			},
+			want: ipv4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, primaryResolvedVpcPrefixID(tt.prefixes))
+		})
+	}
+}
+
+// TestManageInstance_UpdateInstancesInDBVpcSelectionInventory verifies that
+// inventory caches and authoritatively clears Core-resolved prefixes while
+// preserving the VPC selection intent used for prefix accounting.
+func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
+	ctx := context.Background()
+	dbSession := util.TestInitDB(t)
+	defer dbSession.Close()
+	util.TestSetupSchema(t, dbSession)
+
+	ipOrg := "test-vpc-selection-provider"
+	ipu := util.TestBuildUser(t, dbSession, uuid.NewString(), []string{ipOrg}, []string{"FORGE_PROVIDER_ADMIN"})
+	ip := util.TestBuildInfrastructureProvider(t, dbSession, "test-vpc-selection-ip", ipOrg, ipu)
+	tenantOrg := "test-vpc-selection-tenant"
+	tnu := util.TestBuildUser(t, dbSession, uuid.NewString(), []string{tenantOrg}, []string{"FORGE_TENANT_ADMIN"})
+	tenant := util.TestBuildTenant(t, dbSession, tenantOrg, "VPC Selection Tenant", &cdbm.TenantConfig{}, tnu)
+	site := util.TestBuildSite(t, dbSession, ip, "test-vpc-selection-site", cdbm.SiteStatusPending, nil, ipu)
+	vpc := util.TestBuildVpc(t, dbSession, ip, site, tenant, "test-vpc-selection-vpc")
+	controllerVpcID := uuid.New()
+	vpc.ControllerVpcID = &controllerVpcID
+	_, err := dbSession.DB.NewUpdate().Model(vpc).Column("controller_vpc_id").WherePK().Exec(ctx)
+	require.NoError(t, err)
+	ipBlock := util.TestBuildBuildIPBlock(
+		t,
+		dbSession,
+		"test-vpc-selection-ip-block",
+		site,
+		ip,
+		&tenant.ID,
+		cdbm.IPBlockRoutingTypeDatacenterOnly,
+		"192.0.2.0",
+		24,
+		cdbm.IPBlockProtocolVersionV4,
+		false,
+		cdbm.IPBlockStatusReady,
+		tnu,
+	)
+	require.NotNil(t, ipBlock)
+	buildPrefix := func(name, prefix string) *cdbm.VpcPrefix {
+		vpcPrefix := util.TestBuildVPCPrefix(
+			t,
+			dbSession,
+			name,
+			site,
+			tenant,
+			vpc.ID,
+			&ipBlock.ID,
+			&prefix,
+			cutil.GetPtr(28),
+			cdbm.VpcPrefixStatusReady,
+			tnu,
+		)
+		require.NotNil(t, vpcPrefix)
+		return vpcPrefix
+	}
+	deviceLessPrefix := buildPrefix("test-vpc-selection-prefix-1", "192.0.2.0/28")
+	devicePrefix := buildPrefix("test-vpc-selection-prefix-2", "192.0.2.16/28")
+
+	instanceDAO := cdbm.NewInstanceDAO(dbSession)
+	buildInstance := func(name string) *cdbm.Instance {
+		instance, createErr := instanceDAO.Create(ctx, nil, cdbm.InstanceCreateInput{
+			Name:                     name,
+			TenantID:                 tenant.ID,
+			InfrastructureProviderID: ip.ID,
+			SiteID:                   site.ID,
+			VpcID:                    vpc.ID,
+			ControllerInstanceID:     cutil.GetPtr(uuid.New()),
+			Labels:                   map[string]string{},
+			Status:                   cdbm.InstanceStatusProvisioning,
+			CreatedBy:                tnu.ID,
+		})
+		require.NoError(t, createErr)
+		_, createErr = dbSession.DB.Exec(
+			"UPDATE instance SET updated = ? WHERE id = ?",
+			time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2),
+			instance.ID,
+		)
+		require.NoError(t, createErr)
+		return instance
+	}
+
+	deviceLessInstance := buildInstance("device-less-vpc-selection")
+	deviceInstance := buildInstance("device-vpc-selection")
+	shortStatusInstance := buildInstance("short-vpc-selection-status")
+	interfaceDAO := cdbm.NewInterfaceDAO(dbSession)
+	familyMode := cdbm.InterfaceVpcIPFamilyModeIPv4Only
+	createInterface := func(instanceID uuid.UUID, isPhysical bool, device *string, deviceInstance, virtualFunctionID *int) *cdbm.Interface {
+		ifc, createErr := interfaceDAO.Create(ctx, nil, cdbm.InterfaceCreateInput{
+			InstanceID:        instanceID,
+			VpcID:             &vpc.ID,
+			VpcIPFamilyMode:   &familyMode,
+			IsPhysical:        isPhysical,
+			Device:            device,
+			DeviceInstance:    deviceInstance,
+			VirtualFunctionID: virtualFunctionID,
+			Status:            cdbm.InterfaceStatusPending,
+			CreatedBy:         tnu.ID,
+		})
+		require.NoError(t, createErr)
+		return ifc
+	}
+
+	// Keep device-less and device-selected modes on separate Instances, as API
+	// validation requires.
+	deviceLessIfc := createInterface(deviceLessInstance.ID, true, nil, nil, nil)
+	device := "BlueField"
+	deviceInstanceID := 1
+	virtualFunctionID := 2
+	deviceIfc := createInterface(deviceInstance.ID, false, &device, &deviceInstanceID, &virtualFunctionID)
+	shortStatusIfc := createInterface(shortStatusInstance.ID, true, nil, nil, nil)
+
+	deviceLessMac := "02:00:00:00:00:01"
+	deviceMac := "02:00:00:00:00:02"
+	selection := func() *corev1.InstanceInterfaceConfig_Vpc {
+		return &corev1.InstanceInterfaceConfig_Vpc{Vpc: &corev1.InstanceInterfaceVpcSelection{
+			VpcId:      &corev1.VpcId{Value: controllerVpcID.String()},
+			FamilyMode: corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY,
+		}}
+	}
+	status := func(prefixID uuid.UUID, macAddress, address string, virtualFunctionID *uint32) *corev1.InstanceInterfaceStatus {
+		return &corev1.InstanceInterfaceStatus{
+			VirtualFunctionId: virtualFunctionID,
+			MacAddress:        &macAddress,
+			Addresses:         []string{address},
+			VpcId:             &corev1.VpcId{Value: controllerVpcID.String()},
+			ResolvedVpcPrefixes: &corev1.InstanceInterfaceResolvedVpcPrefixes{
+				Ipv4VpcPrefixId: &corev1.VpcPrefixId{Value: prefixID.String()},
+			},
+		}
+	}
+
+	// Core may report observed device data for an Interface whose request did not
+	// select a device. Repeated inventory must continue matching it by VPC intent.
+	observedDevice := "observed-device"
+	deviceLessStatus := status(deviceLessPrefix.ID, deviceLessMac, "192.0.2.10", nil)
+	deviceLessStatus.Device = &observedDevice
+	deviceStatus := status(devicePrefix.ID, deviceMac, "192.0.2.20", cutil.GetPtr(uint32(virtualFunctionID)))
+	deviceStatus.Device = &device
+	deviceStatus.DeviceInstance = uint32(deviceInstanceID)
+
+	inventory := &corev1.InstanceInventory{Instances: []*corev1.Instance{
+		{
+			Id: &corev1.InstanceId{Value: deviceLessInstance.ControllerInstanceID.String()},
+			Config: &corev1.InstanceConfig{Network: &corev1.InstanceNetworkConfig{Interfaces: []*corev1.InstanceInterfaceConfig{
+				{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkDetails: selection()},
+			}}},
+			Status: &corev1.InstanceStatus{
+				Tenant: &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+				Network: &corev1.InstanceNetworkStatus{
+					ConfigsSynced: corev1.SyncState_SYNCED,
+					Interfaces:    []*corev1.InstanceInterfaceStatus{deviceLessStatus},
+				},
+			},
+		},
+		{
+			Id: &corev1.InstanceId{Value: deviceInstance.ControllerInstanceID.String()},
+			Config: &corev1.InstanceConfig{Network: &corev1.InstanceNetworkConfig{Interfaces: []*corev1.InstanceInterfaceConfig{
+				{
+					FunctionType:      corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
+					NetworkDetails:    selection(),
+					Device:            &device,
+					DeviceInstance:    uint32(deviceInstanceID),
+					VirtualFunctionId: cutil.GetPtr(uint32(virtualFunctionID)),
+				},
+			}}},
+			Status: &corev1.InstanceStatus{
+				Tenant: &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+				Network: &corev1.InstanceNetworkStatus{
+					ConfigsSynced: corev1.SyncState_SYNCED,
+					Interfaces:    []*corev1.InstanceInterfaceStatus{deviceStatus},
+				},
+			},
+		},
+		{
+			Id: &corev1.InstanceId{Value: shortStatusInstance.ControllerInstanceID.String()},
+			Config: &corev1.InstanceConfig{Network: &corev1.InstanceNetworkConfig{Interfaces: []*corev1.InstanceInterfaceConfig{
+				{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkDetails: selection()},
+			}}},
+			Status: &corev1.InstanceStatus{
+				Tenant: &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+				Network: &corev1.InstanceNetworkStatus{
+					ConfigsSynced: corev1.SyncState_SYNCED,
+				},
+			},
+		},
+	}}
+
+	tSiteClientPool := testTemporalSiteClientPool(t)
+	tSiteClientPool.IDClientMap[site.ID.String()] = &tmocks.Client{}
+	manager := NewManageInstance(dbSession, tSiteClientPool, &tmocks.Client{}, config.GetTestConfig())
+	_, err = manager.UpdateInstancesInDB(ctx, site.ID, inventory)
+	require.NoError(t, err)
+
+	// Verify both resolved data and the original VPC selection intent persisted.
+	assertResolvedInterface := func(ifc *cdbm.Interface, expectedPrefixID uuid.UUID, expectedMac, expectedAddress string) *cdbm.Interface {
+		updated, getErr := interfaceDAO.GetByID(ctx, nil, ifc.ID, nil)
+		require.NoError(t, getErr)
+		require.NotNil(t, updated.VpcPrefixID)
+		require.NotNil(t, updated.VpcID)
+		require.NotNil(t, updated.VpcIPFamilyMode)
+		require.NotNil(t, updated.MacAddress)
+		assert.Equal(t, expectedPrefixID, *updated.VpcPrefixID)
+		assert.Equal(t, vpc.ID, *updated.VpcID)
+		assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *updated.VpcIPFamilyMode)
+		assert.Equal(t, expectedMac, *updated.MacAddress)
+		assert.Equal(t, []string{expectedAddress}, updated.IPAddresses)
+		assert.Equal(t, cdbm.InterfaceStatusReady, updated.Status)
+		return updated
+	}
+	updatedDeviceLessIfc := assertResolvedInterface(deviceLessIfc, deviceLessPrefix.ID, deviceLessMac, "192.0.2.10")
+	require.NotNil(t, updatedDeviceLessIfc.Device)
+	assert.Equal(t, observedDevice, *updatedDeviceLessIfc.Device)
+	updatedDeviceIfc := assertResolvedInterface(deviceIfc, devicePrefix.ID, deviceMac, "192.0.2.20")
+	require.NotNil(t, updatedDeviceIfc.Device)
+	assert.Equal(t, device, *updatedDeviceIfc.Device)
+
+	// A config without an aligned status entry must leave its Interface untouched.
+	shortStatusUnchanged, err := interfaceDAO.GetByID(ctx, nil, shortStatusIfc.ID, nil)
+	require.NoError(t, err)
+	assert.Nil(t, shortStatusUnchanged.VpcPrefixID)
+	assert.Equal(t, vpc.ID, *shortStatusUnchanged.VpcID)
+	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *shortStatusUnchanged.VpcIPFamilyMode)
+	assert.Nil(t, shortStatusUnchanged.MacAddress)
+	assert.Equal(t, cdbm.InterfaceStatusPending, shortStatusUnchanged.Status)
+
+	// Pending inventory is not authoritative enough to clear resolution.
+	inventory.Instances[0].Status.Network.Interfaces[0].ResolvedVpcPrefixes = nil
+	inventory.Instances[0].Status.Network.ConfigsSynced = corev1.SyncState_PENDING
+	_, err = dbSession.DB.Exec(
+		"UPDATE instance SET updated = ? WHERE id = ?",
+		time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2),
+		deviceLessInstance.ID,
+	)
+	require.NoError(t, err)
+	_, err = manager.UpdateInstancesInDB(ctx, site.ID, inventory)
+	require.NoError(t, err)
+
+	pendingResolution, err := interfaceDAO.GetByID(ctx, nil, deviceLessIfc.ID, nil)
+	require.NoError(t, err)
+	require.NotNil(t, pendingResolution.VpcPrefixID)
+	assert.Equal(t, deviceLessPrefix.ID, *pendingResolution.VpcPrefixID)
+	assert.Equal(t, cdbm.InterfaceStatusReady, pendingResolution.Status)
+	require.NotNil(t, pendingResolution.VpcID)
+	assert.Equal(t, vpc.ID, *pendingResolution.VpcID)
+	require.NotNil(t, pendingResolution.VpcIPFamilyMode)
+	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *pendingResolution.VpcIPFamilyMode)
+
+	// Synchronized inventory authoritatively clears stale resolution.
+	inventory.Instances[0].Status.Network.ConfigsSynced = corev1.SyncState_SYNCED
+	_, err = dbSession.DB.Exec(
+		"UPDATE instance SET updated = ? WHERE id = ?",
+		time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2),
+		deviceLessInstance.ID,
+	)
+	require.NoError(t, err)
+	_, err = manager.UpdateInstancesInDB(ctx, site.ID, inventory)
+	require.NoError(t, err)
+
+	clearedResolution, err := interfaceDAO.GetByID(ctx, nil, deviceLessIfc.ID, nil)
+	require.NoError(t, err)
+	assert.Nil(t, clearedResolution.VpcPrefixID)
+	require.NotNil(t, clearedResolution.VpcID)
+	assert.Equal(t, vpc.ID, *clearedResolution.VpcID)
+	require.NotNil(t, clearedResolution.VpcIPFamilyMode)
+	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *clearedResolution.VpcIPFamilyMode)
+}
+
 func TestManageInstance_deleteInstanceFromDB(t *testing.T) {
 	ctx := context.Background()
 
@@ -74,10 +382,7 @@ func TestManageInstance_deleteInstanceFromDB(t *testing.T) {
 	tnRoles := []string{"FORGE_TENANT_ADMIN"}
 
 	tnu := util.TestBuildUser(t, dbSession, uuid.New().String(), []string{tnOrg}, tnRoles)
-	tncfg := cdbm.TenantConfig{
-		EnableSSHAccess: true,
-	}
-	tenant := util.TestBuildTenant(t, dbSession, tnOrg, "Test Tenant", &tncfg, tnu)
+	tenant := util.TestBuildTenant(t, dbSession, "Test Tenant", tnOrg, nil, tnu)
 
 	site := util.TestBuildSite(t, dbSession, ip, "testSite", cdbm.SiteStatusPending, nil, ipu)
 	vpc := util.TestBuildVpc(t, dbSession, ip, site, tenant, "testVpc")
@@ -206,10 +511,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	tnRoles := []string{"FORGE_TENANT_ADMIN"}
 
 	tnu := util.TestBuildUser(t, dbSession, uuid.New().String(), []string{tnOrg}, tnRoles)
-	tncfg := cdbm.TenantConfig{
-		EnableSSHAccess: true,
-	}
-	tenant := util.TestBuildTenant(t, dbSession, tnOrg, "Test Tenant", &tncfg, tnu)
+	tenant := util.TestBuildTenant(t, dbSession, "Test Tenant", tnOrg, nil, tnu)
 
 	site := util.TestBuildSite(t, dbSession, ip, "testSite", cdbm.SiteStatusPending, nil, ipu)
 	vpc := util.TestBuildVpc(t, dbSession, ip, site, tenant, "testVpc")
@@ -606,7 +908,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Create status detail for instance 10
-	_, err = sdDAO.CreateFromParams(ctx, nil, instance10.ID.String(), instance10.Status, cutil.GetPtr("Instance is missing on Site"))
+	_, err = sdDAO.Create(ctx, nil, cdbm.StatusDetailCreateInput{EntityID: instance10.ID.String(), Status: instance10.Status, Message: cutil.GetPtr("Instance is missing on Site")})
 	assert.NoError(t, err)
 
 	// Instance 11 receives updates from Site Controller, namely status update and Instance VPC Prefix status, attribute updates
@@ -630,7 +932,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 			Labels:                   map[string]string{},
 			Status:                   cdbm.InstanceStatusProvisioning,
 			NetworkSecurityGroupPropagationDetails: &cdbm.NetworkSecurityGroupPropagationDetails{
-				NetworkSecurityGroupPropagationObjectStatus: &cwsv1.NetworkSecurityGroupPropagationObjectStatus{},
+				NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{},
 			},
 			CreatedBy: tnu.ID,
 		},
@@ -898,84 +1200,84 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	_, err = dbSession.DB.Exec("UPDATE dpu_extension_service_deployment SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), dpuExtServiceDeployment2.ID.String())
 	assert.NoError(t, err)
 
-	instanceInventory := &cwsv1.InstanceInventory{
-		NetworkSecurityGroupPropagations: []*cwsv1.NetworkSecurityGroupPropagationObjectStatus{
-			&cwsv1.NetworkSecurityGroupPropagationObjectStatus{
+	instanceInventory := &corev1.InstanceInventory{
+		NetworkSecurityGroupPropagations: []*corev1.NetworkSecurityGroupPropagationObjectStatus{
+			&corev1.NetworkSecurityGroupPropagationObjectStatus{
 				Id:      instance1.ID.String(),
-				Status:  cwsv1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL,
+				Status:  corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL,
 				Details: cutil.GetPtr("nothing to see here"),
 			},
 		},
-		Instances: []*cwsv1.Instance{
+		Instances: []*corev1.Instance{
 			{
-				Id: &cwsv1.InstanceId{Value: instance1.ID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
+				Id: &corev1.InstanceId{Value: instance1.ID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION,
-								NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet1.ControllerNetworkSegmentID.String()},
+								FunctionType:     corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet1.ControllerNetworkSegmentID.String()},
 							},
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_VIRTUAL_FUNCTION,
-								NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet2.ControllerNetworkSegmentID.String()},
+								FunctionType:     corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
+								NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet2.ControllerNetworkSegmentID.String()},
 							},
 						},
 					},
 					// InfiniBand config/status keys must align with reconcile map: controller IB partition id + device + device instance
-					Infiniband: &cwsv1.InstanceInfinibandConfig{
-						IbInterfaces: []*cwsv1.InstanceIBInterfaceConfig{
+					Infiniband: &corev1.InstanceInfinibandConfig{
+						IbInterfaces: []*corev1.InstanceIBInterfaceConfig{
 							{
 								Device:         "MT2910 Family [ConnectX-7]",
 								Vendor:         cutil.GetPtr("Mellanox Technologies"),
 								DeviceInstance: 0,
-								FunctionType:   cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION,
-								IbPartitionId:  &cwsv1.IBPartitionId{Value: partition1.ControllerIBPartitionID.String()},
+								FunctionType:   corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								IbPartitionId:  &corev1.IBPartitionId{Value: partition1.ControllerIBPartitionID.String()},
 							},
 							{
 								Device:         "MT2910 Family [ConnectX-7]",
 								Vendor:         cutil.GetPtr("Mellanox Technologies"),
 								DeviceInstance: 1,
-								FunctionType:   cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION,
-								IbPartitionId:  &cwsv1.IBPartitionId{Value: partition1.ControllerIBPartitionID.String()},
+								FunctionType:   corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								IbPartitionId:  &corev1.IBPartitionId{Value: partition1.ControllerIBPartitionID.String()},
 							},
 						},
 					},
-					DpuExtensionServices: &cwsv1.InstanceDpuExtensionServicesConfig{
-						ServiceConfigs: []*cwsv1.InstanceDpuExtensionServiceConfig{
+					DpuExtensionServices: &corev1.InstanceDpuExtensionServicesConfig{
+						ServiceConfigs: []*corev1.InstanceDpuExtensionServiceConfig{
 							{
 								ServiceId: dpuExtensionService1.ID.String(),
 								Version:   "1.0.0",
 							},
 						},
 					},
-					Nvlink: &cwsv1.InstanceNVLinkConfig{
-						GpuConfigs: []*cwsv1.InstanceNVLinkGpuConfig{
+					Nvlink: &corev1.InstanceNVLinkConfig{
+						GpuConfigs: []*corev1.InstanceNVLinkGpuConfig{
 							{
 								DeviceInstance:     0,
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 							{
 								DeviceInstance:     1,
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 							{
 								DeviceInstance:     2,
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 							{
 								DeviceInstance:     3,
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 						},
 					},
 				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
-					Network: &cwsv1.InstanceNetworkStatus{
-						Interfaces: []*cwsv1.InstanceInterfaceStatus{
+					Network: &corev1.InstanceNetworkStatus{
+						Interfaces: []*corev1.InstanceInterfaceStatus{
 							{
 								MacAddress: &macAddress,
 								Addresses:  ipAddresses,
@@ -986,10 +1288,10 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 								Addresses:         ipAddresses,
 							},
 						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
-					Infiniband: &cwsv1.InstanceInfinibandStatus{
-						IbInterfaces: []*cwsv1.InstanceIBInterfaceStatus{
+					Infiniband: &corev1.InstanceInfinibandStatus{
+						IbInterfaces: []*corev1.InstanceIBInterfaceStatus{
 							{
 								PfGuid: cutil.GetPtr("1070fd0300bd43ad"),
 								Guid:   cutil.GetPtr("1070fd0300bd43ad"),
@@ -999,130 +1301,130 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 								Guid:   cutil.GetPtr("c470bd0300ebe2b8"),
 							},
 						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
-					DpuExtensionServices: &cwsv1.InstanceDpuExtensionServicesStatus{
-						DpuExtensionServices: []*cwsv1.InstanceDpuExtensionServiceStatus{
+					DpuExtensionServices: &corev1.InstanceDpuExtensionServicesStatus{
+						DpuExtensionServices: []*corev1.InstanceDpuExtensionServiceStatus{
 							{
 								ServiceId:        dpuExtensionService1.ID.String(),
 								Version:          "1.0.0",
-								DeploymentStatus: cwsv1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_RUNNING,
+								DeploymentStatus: corev1.DpuExtensionServiceDeploymentStatus_DPU_EXTENSION_SERVICE_RUNNING,
 							},
 						},
 					},
-					Nvlink: &cwsv1.InstanceNVLinkStatus{
-						GpuStatuses: []*cwsv1.InstanceNVLinkGpuStatus{
+					Nvlink: &corev1.InstanceNVLinkStatus{
+						GpuStatuses: []*corev1.InstanceNVLinkGpuStatus{
 							{
 								GpuGuid:            cutil.GetPtr("a8f4c20500d71e9f"),
-								DomainId:           &cwsv1.NVLinkDomainId{Value: uuid.New().String()},
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								DomainId:           &corev1.NVLinkDomainId{Value: uuid.New().String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 							{
 								GpuGuid:            cutil.GetPtr("b3e8d70400c52f1a"),
-								DomainId:           &cwsv1.NVLinkDomainId{Value: uuid.New().String()},
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								DomainId:           &corev1.NVLinkDomainId{Value: uuid.New().String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 							{
 								GpuGuid:            cutil.GetPtr("c470bd0300ebe2b8"),
-								DomainId:           &cwsv1.NVLinkDomainId{Value: uuid.New().String()},
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								DomainId:           &corev1.NVLinkDomainId{Value: uuid.New().String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 							{
 								GpuGuid:            cutil.GetPtr("d3e7d60400c52f1a"),
-								DomainId:           &cwsv1.NVLinkDomainId{Value: uuid.New().String()},
-								LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
+								DomainId:           &corev1.NVLinkDomainId{Value: uuid.New().String()},
+								LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition1.ID.String()},
 							},
 						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
-					Update: &cwsv1.InstanceUpdateStatus{
+					Update: &corev1.InstanceUpdateStatus{
 						UserApprovalReceived: false,
 					},
 				},
 			},
 			{
-				Id:     &cwsv1.InstanceId{Value: instance5.ControllerInstanceID.String()},
-				Config: &cwsv1.InstanceConfig{},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Id:     &corev1.InstanceId{Value: instance5.ControllerInstanceID.String()},
+				Config: &corev1.InstanceConfig{},
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
 				},
 			},
 			{
-				Id:     &cwsv1.InstanceId{Value: instance6.ControllerInstanceID.String()},
-				Config: &cwsv1.InstanceConfig{},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Id:     &corev1.InstanceId{Value: instance6.ControllerInstanceID.String()},
+				Config: &corev1.InstanceConfig{},
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
 				},
 			},
 			{
-				Id:     &cwsv1.InstanceId{Value: instance7.ID.String()},
-				Config: &cwsv1.InstanceConfig{},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Id:     &corev1.InstanceId{Value: instance7.ID.String()},
+				Config: &corev1.InstanceConfig{},
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
 				},
 			},
 			{
-				Id:     &cwsv1.InstanceId{Value: instance9.ID.String()},
-				Config: &cwsv1.InstanceConfig{},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Id:     &corev1.InstanceId{Value: instance9.ID.String()},
+				Config: &corev1.InstanceConfig{},
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
 				},
 			},
 			{
-				Id: &cwsv1.InstanceId{Value: instance11.ControllerInstanceID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
+				Id: &corev1.InstanceId{Value: instance11.ControllerInstanceID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								FunctionType:     corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
 								NetworkSegmentId: nil,
 								// VPC Prefix info
-								NetworkDetails: &cwsv1.InstanceInterfaceConfig_VpcPrefixId{
-									VpcPrefixId: &cwsv1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
+								NetworkDetails: &corev1.InstanceInterfaceConfig_VpcPrefixId{
+									VpcPrefixId: &corev1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
 								},
 								Device:    cutil.GetPtr("MT43244 BlueField-3 integrated ConnectX-7 network controller"),
 								IpAddress: &requestedIpAddress,
-								RoutingProfile: &cwsv1.InstanceInterfaceRoutingProfile{
-									AllowedAnycastPrefixes: []*cwsv1.PrefixFilterPolicyEntry{
+								RoutingProfile: &corev1.InstanceInterfaceRoutingProfile{
+									AllowedAnycastPrefixes: []*corev1.PrefixFilterPolicyEntry{
 										{Prefix: routingProfilePrefixes[0]},
 										{Prefix: routingProfilePrefixes[1]},
 									},
 								},
 							},
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_VIRTUAL_FUNCTION,
+								FunctionType:     corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
 								NetworkSegmentId: nil,
 								// VPC Prefix info
-								NetworkDetails: &cwsv1.InstanceInterfaceConfig_VpcPrefixId{
-									VpcPrefixId: &cwsv1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
+								NetworkDetails: &corev1.InstanceInterfaceConfig_VpcPrefixId{
+									VpcPrefixId: &corev1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
 								},
 								Device:            cutil.GetPtr("MT43244 BlueField-3 integrated ConnectX-7 network controller"),
 								VirtualFunctionId: &vfID,
 							},
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								FunctionType:     corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
 								NetworkSegmentId: nil,
 								// VPC Prefix info
-								NetworkDetails: &cwsv1.InstanceInterfaceConfig_VpcPrefixId{
-									VpcPrefixId: &cwsv1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
+								NetworkDetails: &corev1.InstanceInterfaceConfig_VpcPrefixId{
+									VpcPrefixId: &corev1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
 								},
 								Device:         cutil.GetPtr("MT43244 BlueField-3 integrated ConnectX-7 network controller"),
 								DeviceInstance: 1,
 							},
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_VIRTUAL_FUNCTION,
+								FunctionType:     corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
 								NetworkSegmentId: nil,
 								// VPC Prefix info
-								NetworkDetails: &cwsv1.InstanceInterfaceConfig_VpcPrefixId{
-									VpcPrefixId: &cwsv1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
+								NetworkDetails: &corev1.InstanceInterfaceConfig_VpcPrefixId{
+									VpcPrefixId: &corev1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
 								},
 								Device:            cutil.GetPtr("MT43244 BlueField-3 integrated ConnectX-7 network controller"),
 								DeviceInstance:    1,
@@ -1131,12 +1433,12 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 						},
 					},
 				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
-					Network: &cwsv1.InstanceNetworkStatus{
-						Interfaces: []*cwsv1.InstanceInterfaceStatus{
+					Network: &corev1.InstanceNetworkStatus{
+						Interfaces: []*corev1.InstanceInterfaceStatus{
 							{
 								MacAddress: &macAddress,
 								Addresses:  ipAddresses,
@@ -1163,109 +1465,109 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 								VirtualFunctionId: &vfID,
 							},
 						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
-					Update: &cwsv1.InstanceUpdateStatus{
+					Update: &corev1.InstanceUpdateStatus{
 						UserApprovalReceived: false,
 					},
 				},
 			},
 			{
-				Id: &cwsv1.InstanceId{Value: instance15.ControllerInstanceID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
+				Id: &corev1.InstanceId{Value: instance15.ControllerInstanceID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								FunctionType:     corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
 								NetworkSegmentId: nil,
 								// VPC Prefix info
-								NetworkDetails: &cwsv1.InstanceInterfaceConfig_VpcPrefixId{
-									VpcPrefixId: &cwsv1.VpcPrefixId{Value: vpcPrefix2.ID.String()},
+								NetworkDetails: &corev1.InstanceInterfaceConfig_VpcPrefixId{
+									VpcPrefixId: &corev1.VpcPrefixId{Value: vpcPrefix2.ID.String()},
 								},
 							},
 						},
 					},
 				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
-					Network: &cwsv1.InstanceNetworkStatus{
-						Interfaces: []*cwsv1.InstanceInterfaceStatus{
+					Network: &corev1.InstanceNetworkStatus{
+						Interfaces: []*corev1.InstanceInterfaceStatus{
 							{
 								VirtualFunctionId: &vfID,
 								MacAddress:        &macAddress,
 								Addresses:         ipAddresses,
 							},
 						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
-					Update: &cwsv1.InstanceUpdateStatus{
+					Update: &corev1.InstanceUpdateStatus{
 						UserApprovalReceived: false,
 					},
 				},
 			},
 			{
-				Id:     &cwsv1.InstanceId{Value: instance13.ID.String()},
-				Config: &cwsv1.InstanceConfig{},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_PROVISIONING,
+				Id:     &corev1.InstanceId{Value: instance13.ID.String()},
+				Config: &corev1.InstanceConfig{},
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_PROVISIONING,
 					},
 				},
 			},
 			{
-				Id:     &cwsv1.InstanceId{Value: instance14.ID.String()},
-				Config: &cwsv1.InstanceConfig{},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Id:     &corev1.InstanceId{Value: instance14.ID.String()},
+				Config: &corev1.InstanceConfig{},
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
 				},
 			},
 			{
-				Id:               &cwsv1.InstanceId{Value: instance16.ControllerInstanceID.String()},
-				Config:           &cwsv1.InstanceConfig{},
+				Id:               &corev1.InstanceId{Value: instance16.ControllerInstanceID.String()},
+				Config:           &corev1.InstanceConfig{},
 				TpmEkCertificate: &tpmEKCertBase64,
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
 				},
 			},
 			{
-				Id:               &cwsv1.InstanceId{Value: instance17.ControllerInstanceID.String()},
-				Config:           &cwsv1.InstanceConfig{},
+				Id:               &corev1.InstanceId{Value: instance17.ControllerInstanceID.String()},
+				Config:           &corev1.InstanceConfig{},
 				TpmEkCertificate: &tpmEKCertBase64,
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
 				},
 			},
 			{
-				Id: &cwsv1.InstanceId{Value: instance18.ID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
+				Id: &corev1.InstanceId{Value: instance18.ID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION,
-								NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet1.ControllerNetworkSegmentID.String()},
+								FunctionType:     corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet1.ControllerNetworkSegmentID.String()},
 							},
 							{
-								FunctionType:     cwsv1.InterfaceFunctionType_VIRTUAL_FUNCTION,
-								NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet2.ControllerNetworkSegmentID.String()},
+								FunctionType:     corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
+								NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet2.ControllerNetworkSegmentID.String()},
 							},
 						},
 					},
 					Infiniband: nil,
 				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant: &cwsv1.InstanceTenantStatus{
-						State: cwsv1.TenantState_READY,
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
 					},
-					Network: &cwsv1.InstanceNetworkStatus{
-						Interfaces: []*cwsv1.InstanceInterfaceStatus{
+					Network: &corev1.InstanceNetworkStatus{
+						Interfaces: []*corev1.InstanceInterfaceStatus{
 							{
 								MacAddress: &macAddress,
 								Addresses:  ipAddresses,
@@ -1276,10 +1578,10 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 								Addresses:         ipAddresses,
 							},
 						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
 					Infiniband: nil,
-					Update: &cwsv1.InstanceUpdateStatus{
+					Update: &corev1.InstanceUpdateStatus{
 						UserApprovalReceived: false,
 					},
 				},
@@ -1351,23 +1653,23 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		pagedInvIds = append(pagedInvIds, ins.ControllerInstanceID.String())
 	}
 
-	pagedCtrlIns := []*cwsv1.Instance{}
+	pagedCtrlIns := []*corev1.Instance{}
 	for i := 0; i < 34; i++ {
-		ctrlIns := &cwsv1.Instance{
-			Id:     &cwsv1.InstanceId{Value: pagedInvIds[i]},
-			Config: &cwsv1.InstanceConfig{},
-			Status: &cwsv1.InstanceStatus{
-				Tenant: &cwsv1.InstanceTenantStatus{
-					State: cwsv1.TenantState_READY,
+		ctrlIns := &corev1.Instance{
+			Id:     &corev1.InstanceId{Value: pagedInvIds[i]},
+			Config: &corev1.InstanceConfig{},
+			Status: &corev1.InstanceStatus{
+				Tenant: &corev1.InstanceTenantStatus{
+					State: corev1.TenantState_READY,
 				},
 			},
 		}
 
 		if i == 1 {
-			ctrlIns.Metadata = &cwsv1.Metadata{
+			ctrlIns.Metadata = &corev1.Metadata{
 				Name:        "Test Instance 1",
 				Description: "Test description",
-				Labels: []*cwsv1.Label{
+				Labels: []*corev1.Label{
 					{
 						Key:   "west1",
 						Value: cutil.GetPtr("gpu1"),
@@ -1522,117 +1824,117 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	nvlifcDelE1.Instance = nvlinkDelInstE
 
 	nvlinkDelMacAddress := "2F-FC-34-AE-9C-2B"
-	nvlinkDelInventory := &cwsv1.InstanceInventory{
-		Instances: []*cwsv1.Instance{
+	nvlinkDelInventory := &corev1.InstanceInventory{
+		Instances: []*corev1.Instance{
 			{
-				Id: &cwsv1.InstanceId{Value: nvlinkDelInstA.ID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
-							{FunctionType: cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
+				Id: &corev1.InstanceId{Value: nvlinkDelInstA.ID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
+							{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
 						},
 					},
-					Nvlink: &cwsv1.InstanceNVLinkConfig{
-						GpuConfigs: []*cwsv1.InstanceNVLinkGpuConfig{
-							{DeviceInstance: 1, LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
+					Nvlink: &corev1.InstanceNVLinkConfig{
+						GpuConfigs: []*corev1.InstanceNVLinkGpuConfig{
+							{DeviceInstance: 1, LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
 						},
 					},
 				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant:  &cwsv1.InstanceTenantStatus{State: cwsv1.TenantState_READY},
-					Network: &cwsv1.InstanceNetworkStatus{Interfaces: []*cwsv1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: cwsv1.SyncState_SYNCED},
-					Nvlink: &cwsv1.InstanceNVLinkStatus{
-						GpuStatuses: []*cwsv1.InstanceNVLinkGpuStatus{
-							{GpuGuid: cutil.GetPtr(gpuGuidDel2), LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
+				Status: &corev1.InstanceStatus{
+					Tenant:  &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+					Network: &corev1.InstanceNetworkStatus{Interfaces: []*corev1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: corev1.SyncState_SYNCED},
+					Nvlink: &corev1.InstanceNVLinkStatus{
+						GpuStatuses: []*corev1.InstanceNVLinkGpuStatus{
+							{GpuGuid: cutil.GetPtr(gpuGuidDel2), LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
 						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
 				},
 			},
 			{
-				Id: &cwsv1.InstanceId{Value: nvlinkDelInstB.ID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
-							{FunctionType: cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
+				Id: &corev1.InstanceId{Value: nvlinkDelInstB.ID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
+							{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
 						},
 					},
-					Nvlink: &cwsv1.InstanceNVLinkConfig{
-						GpuConfigs: []*cwsv1.InstanceNVLinkGpuConfig{
-							{DeviceInstance: 1, LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
-						},
-					},
-				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant:  &cwsv1.InstanceTenantStatus{State: cwsv1.TenantState_READY},
-					Network: &cwsv1.InstanceNetworkStatus{Interfaces: []*cwsv1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: cwsv1.SyncState_SYNCED},
-					Nvlink: &cwsv1.InstanceNVLinkStatus{
-						GpuStatuses: []*cwsv1.InstanceNVLinkGpuStatus{
-							{GpuGuid: cutil.GetPtr(gpuGuidDel3), LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
-						},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
-					},
-				},
-			},
-			{
-				Id: &cwsv1.InstanceId{Value: nvlinkDelInstC.ID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
-							{FunctionType: cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
-						},
-					},
-					Nvlink: &cwsv1.InstanceNVLinkConfig{},
-				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant:  &cwsv1.InstanceTenantStatus{State: cwsv1.TenantState_READY},
-					Network: &cwsv1.InstanceNetworkStatus{Interfaces: []*cwsv1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: cwsv1.SyncState_SYNCED},
-					Nvlink:  &cwsv1.InstanceNVLinkStatus{},
-				},
-			},
-			{
-				Id: &cwsv1.InstanceId{Value: nvlinkDelInstD.ID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
-							{FunctionType: cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
-						},
-					},
-					Nvlink: &cwsv1.InstanceNVLinkConfig{
-						GpuConfigs: []*cwsv1.InstanceNVLinkGpuConfig{
-							{DeviceInstance: 0, LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
+					Nvlink: &corev1.InstanceNVLinkConfig{
+						GpuConfigs: []*corev1.InstanceNVLinkGpuConfig{
+							{DeviceInstance: 1, LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
 						},
 					},
 				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant:  &cwsv1.InstanceTenantStatus{State: cwsv1.TenantState_READY},
-					Network: &cwsv1.InstanceNetworkStatus{Interfaces: []*cwsv1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: cwsv1.SyncState_SYNCED},
-					Nvlink: &cwsv1.InstanceNVLinkStatus{
-						GpuStatuses:   []*cwsv1.InstanceNVLinkGpuStatus{},
-						ConfigsSynced: cwsv1.SyncState_SYNCED,
+				Status: &corev1.InstanceStatus{
+					Tenant:  &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+					Network: &corev1.InstanceNetworkStatus{Interfaces: []*corev1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: corev1.SyncState_SYNCED},
+					Nvlink: &corev1.InstanceNVLinkStatus{
+						GpuStatuses: []*corev1.InstanceNVLinkGpuStatus{
+							{GpuGuid: cutil.GetPtr(gpuGuidDel3), LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
+						},
+						ConfigsSynced: corev1.SyncState_SYNCED,
 					},
 				},
 			},
 			{
-				Id: &cwsv1.InstanceId{Value: nvlinkDelInstE.ID.String()},
-				Config: &cwsv1.InstanceConfig{
-					Network: &cwsv1.InstanceNetworkConfig{
-						Interfaces: []*cwsv1.InstanceInterfaceConfig{
-							{FunctionType: cwsv1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &cwsv1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
+				Id: &corev1.InstanceId{Value: nvlinkDelInstC.ID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
+							{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
 						},
 					},
-					Nvlink: &cwsv1.InstanceNVLinkConfig{
-						GpuConfigs: []*cwsv1.InstanceNVLinkGpuConfig{
-							{DeviceInstance: 0, LogicalPartitionId: &cwsv1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
+					Nvlink: &corev1.InstanceNVLinkConfig{},
+				},
+				Status: &corev1.InstanceStatus{
+					Tenant:  &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+					Network: &corev1.InstanceNetworkStatus{Interfaces: []*corev1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: corev1.SyncState_SYNCED},
+					Nvlink:  &corev1.InstanceNVLinkStatus{},
+				},
+			},
+			{
+				Id: &corev1.InstanceId{Value: nvlinkDelInstD.ID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
+							{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
+						},
+					},
+					Nvlink: &corev1.InstanceNVLinkConfig{
+						GpuConfigs: []*corev1.InstanceNVLinkGpuConfig{
+							{DeviceInstance: 0, LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
 						},
 					},
 				},
-				Status: &cwsv1.InstanceStatus{
-					Tenant:  &cwsv1.InstanceTenantStatus{State: cwsv1.TenantState_READY},
-					Network: &cwsv1.InstanceNetworkStatus{Interfaces: []*cwsv1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: cwsv1.SyncState_SYNCED},
-					Nvlink: &cwsv1.InstanceNVLinkStatus{
-						GpuStatuses:   []*cwsv1.InstanceNVLinkGpuStatus{},
-						ConfigsSynced: cwsv1.SyncState_PENDING,
+				Status: &corev1.InstanceStatus{
+					Tenant:  &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+					Network: &corev1.InstanceNetworkStatus{Interfaces: []*corev1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: corev1.SyncState_SYNCED},
+					Nvlink: &corev1.InstanceNVLinkStatus{
+						GpuStatuses:   []*corev1.InstanceNVLinkGpuStatus{},
+						ConfigsSynced: corev1.SyncState_SYNCED,
+					},
+				},
+			},
+			{
+				Id: &corev1.InstanceId{Value: nvlinkDelInstE.ID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
+							{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkSegmentId: &corev1.NetworkSegmentId{Value: subnet4.ControllerNetworkSegmentID.String()}},
+						},
+					},
+					Nvlink: &corev1.InstanceNVLinkConfig{
+						GpuConfigs: []*corev1.InstanceNVLinkGpuConfig{
+							{DeviceInstance: 0, LogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllPartition4.ID.String()}},
+						},
+					},
+				},
+				Status: &corev1.InstanceStatus{
+					Tenant:  &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
+					Network: &corev1.InstanceNetworkStatus{Interfaces: []*corev1.InstanceInterfaceStatus{{MacAddress: &nvlinkDelMacAddress}}, ConfigsSynced: corev1.SyncState_SYNCED},
+					Nvlink: &corev1.InstanceNVLinkStatus{
+						GpuStatuses:   []*corev1.InstanceNVLinkGpuStatus{},
+						ConfigsSynced: corev1.SyncState_PENDING,
 					},
 				},
 			},
@@ -1684,7 +1986,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		siteID                                uuid.UUID
 		clientPoolSiteID                      string
 		clientPoolClient                      *tmocks.Client
-		instanceInventory                     *cwsv1.InstanceInventory
+		instanceInventory                     *corev1.InstanceInventory
 		updatedInstance                       *cdbm.Instance
 		updatedVpcPrefixInstance              *cdbm.Instance
 		updatedMultiDPUInstance               *cdbm.Instance
@@ -1757,15 +2059,15 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 			siteID:           site.ID,
 			clientPoolSiteID: site.ID.String(),
 			clientPoolClient: mtc1,
-			instanceInventory: &cwsv1.InstanceInventory{
-				Instances: []*cwsv1.Instance{
+			instanceInventory: &corev1.InstanceInventory{
+				Instances: []*corev1.Instance{
 					{
-						Id:               &cwsv1.InstanceId{Value: instance17.ControllerInstanceID.String()},
-						Config:           &cwsv1.InstanceConfig{},
+						Id:               &corev1.InstanceId{Value: instance17.ControllerInstanceID.String()},
+						Config:           &corev1.InstanceConfig{},
 						TpmEkCertificate: &tpmEKCertBase64,
-						Status: &cwsv1.InstanceStatus{
-							Tenant: &cwsv1.InstanceTenantStatus{
-								State: cwsv1.TenantState_READY,
+						Status: &corev1.InstanceStatus{
+							Tenant: &corev1.InstanceTenantStatus{
+								State: corev1.TenantState_READY,
 							},
 						},
 					},
@@ -1779,11 +2081,11 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 			siteID:           site3.ID,
 			clientPoolSiteID: site3.ID.String(),
 			clientPoolClient: mtc3,
-			instanceInventory: &cwsv1.InstanceInventory{
-				Instances:       []*cwsv1.Instance{},
+			instanceInventory: &corev1.InstanceInventory{
+				Instances:       []*corev1.Instance{},
 				Timestamp:       timestamppb.Now(),
-				InventoryStatus: cwsv1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
-				InventoryPage: &cwsv1.InventoryPage{
+				InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+				InventoryPage: &corev1.InventoryPage{
 					CurrentPage: 1,
 					PageSize:    25,
 				},
@@ -1795,10 +2097,10 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 			siteID:           site2.ID,
 			clientPoolSiteID: site2.ID.String(),
 			clientPoolClient: mtc3,
-			instanceInventory: &cwsv1.InstanceInventory{
+			instanceInventory: &corev1.InstanceInventory{
 				Instances: pagedCtrlIns[0:10],
 				Timestamp: timestamppb.Now(),
-				InventoryPage: &cwsv1.InventoryPage{
+				InventoryPage: &corev1.InventoryPage{
 					CurrentPage: 1,
 					TotalPages:  4,
 					PageSize:    10,
@@ -1813,10 +2115,10 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 			siteID:           site2.ID,
 			clientPoolSiteID: site2.ID.String(),
 			clientPoolClient: mtc3,
-			instanceInventory: &cwsv1.InstanceInventory{
+			instanceInventory: &corev1.InstanceInventory{
 				Instances: pagedCtrlIns[30:34],
 				Timestamp: timestamppb.Now(),
-				InventoryPage: &cwsv1.InventoryPage{
+				InventoryPage: &corev1.InventoryPage{
 					CurrentPage: 4,
 					TotalPages:  4,
 					PageSize:    10,
@@ -1832,10 +2134,10 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 			siteID:           site2.ID,
 			clientPoolSiteID: site2.ID.String(),
 			clientPoolClient: mtc3,
-			instanceInventory: &cwsv1.InstanceInventory{
+			instanceInventory: &corev1.InstanceInventory{
 				Instances: pagedCtrlIns[0:10],
 				Timestamp: timestamppb.Now(),
-				InventoryPage: &cwsv1.InventoryPage{
+				InventoryPage: &corev1.InventoryPage{
 					CurrentPage: 1,
 					TotalPages:  4,
 					PageSize:    10,
@@ -2083,7 +2385,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 					assert.True(t, ui.IsMissingOnSite)
 					assert.Equal(t, cdbm.InstanceStatusError, ui.Status)
 
-					sds, _, err := sdDAO.GetAllByEntityID(ctx, nil, instance.ID.String(), nil, nil, nil)
+					sds, _, err := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{instance.ID.String()}}, cdbp.PageInput{})
 					assert.Nil(t, err)
 					assert.Equal(t, 1, len(sds), instance.Name)
 				} else {
@@ -2115,7 +2417,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 
 			for _, instance := range tc.unchangedInstances {
 				// Check that no new status detail has been created for Instance
-				sds, _, err := sdDAO.GetAllByEntityID(ctx, nil, instance.ID.String(), nil, nil, nil)
+				sds, _, err := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{instance.ID.String()}}, cdbp.PageInput{})
 				assert.Nil(t, err)
 				assert.Equal(t, 1, len(sds))
 			}
@@ -2124,7 +2426,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 				assert.True(t, len(tc.clientPoolClient.Calls) > 0)
 				assert.Equal(t, len(tc.clientPoolClient.Calls[0].Arguments), 4)
 
-				scReq := tc.clientPoolClient.Calls[0].Arguments[3].(*cwsv1.InstanceConfigUpdateRequest)
+				scReq := tc.clientPoolClient.Calls[0].Arguments[3].(*corev1.InstanceConfigUpdateRequest)
 				assert.Equal(t, tc.metadataInstanceUpdate.ControllerInstanceID.String(), scReq.InstanceId.Value)
 			}
 

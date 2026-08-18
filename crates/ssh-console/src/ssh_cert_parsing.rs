@@ -19,7 +19,7 @@ use russh::keys::Certificate;
 use crate::config::{CertAuthorization, CertAuthorizationStrategy, KeyIdFormat};
 
 /// Search for the given role in the Key ID field of a certificate, returning if it is declared.
-pub fn certificate_contains_role(
+pub(crate) fn certificate_contains_role(
     certificate: &Certificate,
     role: &str,
     cert_authorization: &CertAuthorization,
@@ -42,7 +42,7 @@ pub fn certificate_contains_role(
 }
 
 /// Try to get the username from the given certificate, or return None if we couldn't find one.
-pub fn get_user_from_certificate<'a>(
+pub(crate) fn get_user_from_certificate<'a>(
     certificate: &'a Certificate,
     cert_authorization: &CertAuthorization,
 ) -> Option<&'a str> {
@@ -80,9 +80,8 @@ fn key_id_contains_role(key_id: &str, role: &str, key_id_format: &KeyIdFormat) -
         })
     else {
         tracing::warn!(
-            "Could not find `{}=` substring in key_id: {:?}",
-            key_id_format.role_field,
-            key_id,
+            role_field = key_id_format.role_field.as_str(),
+            "Could not find role field in key ID"
         );
         return false;
     };
@@ -108,9 +107,8 @@ fn get_user_from_key_id<'a>(key_id: &'a str, key_id_format: &KeyIdFormat) -> Opt
         })
     else {
         tracing::warn!(
-            "Could not find `{}=` substring in key_id: {:?}",
-            key_id_format.user_field,
-            key_id
+            user_field = key_id_format.user_field.as_str(),
+            "Could not find user field in key ID"
         );
         return None;
     };

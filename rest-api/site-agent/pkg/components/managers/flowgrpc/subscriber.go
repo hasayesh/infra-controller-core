@@ -166,6 +166,73 @@ func (flowgrpc *API) RegisterSubscriber() error {
 	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(ruleManager.DeleteTaskRuleOnFlow)
 	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered DeleteTaskRuleOnFlow activity")
 
+	// Register Run workflows
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.CreateTaskRun)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered CreateTaskRun workflow")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.GetTaskRun)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered GetTaskRun workflow")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.GetAllTaskRuns)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered GetAllTaskRuns workflow")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.GetAllTaskRunTargets)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered GetAllTaskRunTargets workflow")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.PauseTaskRun)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered PauseTaskRun workflow")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.ResumeTaskRun)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered ResumeTaskRun workflow")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.AdvanceTaskRunPhase)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered AdvanceTaskRunPhase workflow")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.CancelTaskRun)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered CancelTaskRun workflow")
+
+	// Register Run activities
+	runManager := swa.NewManageTaskRun(ManagerAccess.Data.EB.Managers.FlowGrpc.Client)
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.CreateTaskRunOnFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered CreateTaskRunOnFlow activity")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.GetTaskRunFromFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered GetTaskRunFromFlow activity")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.GetAllTaskRunsFromFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered GetAllTaskRunsFromFlow activity")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.GetAllTaskRunTargetsFromFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered GetAllTaskRunTargetsFromFlow activity")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.PauseTaskRunOnFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered PauseTaskRunOnFlow activity")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.ResumeTaskRunOnFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered ResumeTaskRunOnFlow activity")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.AdvanceTaskRunPhaseOnFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered AdvanceTaskRunPhaseOnFlow activity")
+
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(runManager.CancelTaskRunOnFlow)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered CancelTaskRunOnFlow activity")
+
+	// Register the generic Flow gRPC proxy alongside the per-method workflows
+	// above. Registering it here, before any handler dispatches through it, is
+	// what lets a later release switch handlers over safely: a workflow type is
+	// known only to workers that registered it, the cloud API and each site's
+	// agent ship as separate Helm releases, and a type no worker knows is still
+	// accepted at submission, so the caller learns of it only as a timeout.
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Registering generic Flow gRPC proxy workflow and activity")
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterWorkflow(sww.InvokeFlowGRPC)
+	flowProxyManager := swa.NewManageFlowProxy(
+		ManagerAccess.Data.EB.Managers.FlowGrpc.Client,
+		ManagerAccess.Conf.EB.Temporal.ClusterID,
+	)
+	ManagerAccess.Data.EB.Managers.Workflow.Temporal.Worker.RegisterActivity(flowProxyManager.InvokeFlowGRPCOnSite)
+	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Successfully registered InvokeFlowGRPC workflow and activity")
+
 	// Register the tray subscribers here
 	ManagerAccess.Data.EB.Log.Info().Msg("FlowGrpc: Registering tray workflows")
 

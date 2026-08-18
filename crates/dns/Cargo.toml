@@ -21,12 +21,14 @@ description = "Carbide is bare metal provisioning system with auto-discovery and
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "carbide-dns"
 path = "src/main.rs"
 
 [dependencies]
+carbide-instrument = { path = "../instrument" }
 async-trait = { workspace = true }
 clap = { workspace = true }
 eyre = { workspace = true }
@@ -57,6 +59,7 @@ thiserror = { workspace = true }
 lru.workspace = true
 
 [dev-dependencies]
+carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-test-support = { path = "../test-support" }
 
 [build-dependencies]

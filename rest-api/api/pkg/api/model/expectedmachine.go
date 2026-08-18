@@ -21,6 +21,45 @@ const (
 	ExpectedMachineMaxBatchItems = 100
 )
 
+// APIHostLifecycleProfile captures per-host lifecycle settings that affect how
+// NICo progresses a host through its state machine.
+type APIHostLifecycleProfile struct {
+	// DisableLockdown, when true, skips locking down the server during host
+	// lifecycle management. When omitted, the existing value is preserved.
+	DisableLockdown *bool `json:"disableLockdown"`
+}
+
+// ToDBModel converts the API profile into its DB model form. A nil receiver
+// maps to the zero-value profile (no setting present).
+func (p *APIHostLifecycleProfile) ToDBModel() cdbm.HostLifecycleProfile {
+	if p == nil {
+		return cdbm.HostLifecycleProfile{}
+	}
+	return cdbm.HostLifecycleProfile{DisableLockdown: p.DisableLockdown}
+}
+
+// ToDBModelPtr converts the API profile into a DB model pointer, returning nil
+// when the update request did not set a meaningful field.
+func (p *APIHostLifecycleProfile) ToDBModelPtr() *cdbm.HostLifecycleProfile {
+	if p == nil {
+		return nil
+	}
+	v := p.ToDBModel()
+	if !v.HasSetFields() {
+		return nil
+	}
+	return &v
+}
+
+// NewAPIHostLifecycleProfile builds the API profile from its DB model form,
+// returning nil when no setting is present so the field is omitted in responses.
+func NewAPIHostLifecycleProfile(p cdbm.HostLifecycleProfile) *APIHostLifecycleProfile {
+	if p.DisableLockdown == nil {
+		return nil
+	}
+	return &APIHostLifecycleProfile{DisableLockdown: p.DisableLockdown}
+}
+
 // APIExpectedMachineCreateRequest is the data structure to capture instance request to create a new ExpectedMachine
 type APIExpectedMachineCreateRequest struct {
 	// SiteID is the ID of the Site
@@ -55,8 +94,12 @@ type APIExpectedMachineCreateRequest struct {
 	TrayIdx *int32 `json:"trayIdx"`
 	// HostID is the optional host identifier
 	HostID *int32 `json:"hostId"`
+	// IsDpfEnabled marks whether this host is eligible for DPF-based provisioning
+	IsDpfEnabled *bool `json:"isDpfEnabled"`
 	// Labels is the labels of the expected machine
 	Labels map[string]string `json:"labels"`
+	// HostLifecycleProfile is the optional per-host lifecycle profile
+	HostLifecycleProfile *APIHostLifecycleProfile `json:"hostLifecycleProfile"`
 }
 
 // Validate ensure the values passed in request are acceptable
@@ -108,7 +151,8 @@ func (emcr *APIExpectedMachineCreateRequest) Validate() error {
 type APIExpectedMachineUpdateRequest struct {
 	// ID is required for batch updates (must be empty or match path value for single update)
 	ID *string `json:"id"`
-	// BmcMacAddress is the MAC address of the expected machine's BMC
+	// BmcMacAddress may reassert the ExpectedMachine's current BMC MAC, but
+	// cannot change it after creation.
 	BmcMacAddress *string `json:"bmcMacAddress"`
 	// BmcUsername is the username of the expected machine's BMC
 	DefaultBmcUsername *string `json:"defaultBmcUsername"`
@@ -122,7 +166,8 @@ type APIExpectedMachineUpdateRequest struct {
 	SkuID *string `json:"skuId"`
 	// RackID is the optional rack identifier
 	RackID *string `json:"rackId"`
-	// BmcIpAddress is the optional BMC IP address of the expected machine
+	// BmcIpAddress is the optional BMC IP address of the expected machine.
+	// An empty string is the PATCH clear sentinel; nil preserves the stored value.
 	BmcIpAddress *string `json:"bmcIpAddress"`
 	// Name is the optional name of the expected machine
 	Name *string `json:"name"`
@@ -138,8 +183,12 @@ type APIExpectedMachineUpdateRequest struct {
 	TrayIdx *int32 `json:"trayIdx"`
 	// HostID is the optional host identifier
 	HostID *int32 `json:"hostId"`
+	// IsDpfEnabled marks whether this host is eligible for DPF-based provisioning
+	IsDpfEnabled *bool `json:"isDpfEnabled"`
 	// Labels is the labels of the expected machine
 	Labels map[string]string `json:"labels"`
+	// HostLifecycleProfile is the optional per-host lifecycle profile
+	HostLifecycleProfile *APIHostLifecycleProfile `json:"hostLifecycleProfile"`
 }
 
 // Validate ensure the values passed in request are acceptable
@@ -182,7 +231,6 @@ func (emur *APIExpectedMachineUpdateRequest) Validate() error {
 		validation.Field(&emur.RackID,
 			validation.NilOrNotEmpty.Error("RackID cannot be empty")),
 		validation.Field(&emur.BmcIpAddress,
-			validation.NilOrNotEmpty.Error("BmcIpAddress cannot be empty"),
 			validation.When(emur.BmcIpAddress != nil && *emur.BmcIpAddress != "",
 				validationis.IP.Error("BmcIpAddress must be a valid IPv4 or IPv6 address"))),
 		validation.Field(&emur.Name,
@@ -246,8 +294,12 @@ type APIExpectedMachine struct {
 	TrayIdx *int32 `json:"trayIdx"`
 	// HostID is the optional host identifier
 	HostID *int32 `json:"hostId"`
+	// IsDpfEnabled indicates whether this host is eligible for DPF-based provisioning
+	IsDpfEnabled *bool `json:"isDpfEnabled"`
 	// Labels is the labels of the expected machine
 	Labels map[string]string `json:"labels"`
+	// HostLifecycleProfile is the optional per-host lifecycle profile
+	HostLifecycleProfile *APIHostLifecycleProfile `json:"hostLifecycleProfile,omitempty"`
 	// Created indicates the ISO datetime string for when the ExpectedMachine was created
 	Created time.Time `json:"created"`
 	// Updated indicates the ISO datetime string for when the ExpectedMachine was last updated
@@ -273,7 +325,9 @@ func NewAPIExpectedMachine(dibp *cdbm.ExpectedMachine) *APIExpectedMachine {
 		SlotID:                   dibp.SlotID,
 		TrayIdx:                  dibp.TrayIdx,
 		HostID:                   dibp.HostID,
+		IsDpfEnabled:             dibp.IsDpfEnabled,
 		Labels:                   dibp.Labels,
+		HostLifecycleProfile:     NewAPIHostLifecycleProfile(dibp.HostLifecycleProfile),
 		Created:                  dibp.Created,
 		Updated:                  dibp.Updated,
 	}

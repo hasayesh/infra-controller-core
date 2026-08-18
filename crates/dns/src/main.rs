@@ -14,6 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
+
 use std::net::AddrParseError;
 use std::path::PathBuf;
 
@@ -63,11 +65,6 @@ async fn main() -> Result<(), eyre::Report> {
         Command::Run(run_command) => {
             let config: Config = run_command.try_into()?;
 
-            tracing::info!(
-                "OpenTelemetry tracing enabled, exporting to endpoint: {}",
-                &config.otlp_endpoint.to_string()
-            );
-
             let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(config.otlp_endpoint.to_string())
@@ -88,15 +85,22 @@ async fn main() -> Result<(), eyre::Report> {
             let otel_layer =
                 tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("carbide-dns"));
 
+            let log_events = carbide_instrument::LogEventsMetric::new("nico-dns");
             tracing_subscriber::registry()
+                .with(log_events.layer())
                 .with(fmt::layer().json())
                 .with(env_filter)
                 .with(otel_layer)
                 .try_init()?;
 
+            tracing::info!(
+                endpoint = %config.otlp_endpoint,
+                "OpenTelemetry tracing enabled",
+            );
+
             DnsServer::run(config)
                 .await
-                .wrap_err("Failed to start DNS service")?;
+                .wrap_err("failed to start DNS service")?;
         }
     }
 
@@ -162,13 +166,13 @@ pub struct RunCommand {
 
 #[derive(thiserror::Error, Debug)]
 pub enum CommandError {
-    #[error("Invalid listening address {addr}: {error}")]
+    #[error("invalid listening address {addr}: {error}")]
     InvalidListeningAddress { addr: String, error: AddrParseError },
-    #[error("Invalid metrics address {addr}: {error}")]
+    #[error("invalid metrics address {addr}: {error}")]
     InvalidMetricsAddress { addr: String, error: AddrParseError },
-    #[error("Invalid URI: {uri}: {error}")]
+    #[error("invalid URI: {uri}: {error}")]
     InvalidUri { uri: String, error: InvalidUri },
-    #[error("Configuration error: {0}")]
+    #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
 }
 

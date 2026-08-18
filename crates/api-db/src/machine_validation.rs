@@ -150,9 +150,18 @@ pub async fn mark_stale_if_active(
         WHERE id=$1
         AND end_time IS NULL
         AND state IN ('Started', 'InProgress')
-        AND start_time
-            + (GREATEST(duration_to_complete, 0) * INTERVAL '1 second')
-            + ($3::bigint * INTERVAL '1 second') < $4
+        AND (
+            (
+                last_heartbeat_at IS NOT NULL
+                AND last_heartbeat_at + ($3::bigint * INTERVAL '1 second') < $4
+            )
+            OR (
+                last_heartbeat_at IS NULL
+                AND start_time
+                    + (GREATEST(duration_to_complete, 0) * INTERVAL '1 second')
+                    + ($3::bigint * INTERVAL '1 second') < $4
+            )
+        )
         RETURNING *";
     sqlx::query_as::<_, MachineValidation>(query)
         .bind(id)
@@ -192,7 +201,7 @@ pub async fn create_new_run(
     machine_id: &MachineId,
     context: MachineValidationContext,
     filter: MachineValidationFilter,
-) -> Result<MachineValidationId, DatabaseError> {
+) -> Result<MachineValidation, DatabaseError> {
     let id = MachineValidationId::from(uuid::Uuid::new_v4());
     let query = "
         INSERT INTO machine_validation (
@@ -206,13 +215,14 @@ pub async fn create_new_run(
             state
         )
         VALUES ($1, $2, $3, $4, $5, NULL, $6, $7)
-        ON CONFLICT DO NOTHING";
+        ON CONFLICT DO NOTHING
+        RETURNING *";
     // TODO fetch total number of test and repopulate the status
     let status = MachineValidationStatus {
         state: MachineValidationState::Started,
         ..MachineValidationStatus::default()
     };
-    let _ = sqlx::query(query)
+    let validation = sqlx::query_as::<_, MachineValidation>(query)
         .bind(id)
         .bind(format!("Test_{machine_id}"))
         .bind(machine_id)
@@ -220,7 +230,7 @@ pub async fn create_new_run(
         .bind(context.as_ref())
         .bind(format!("Running validation on {machine_id}"))
         .bind(status.state.to_string())
-        .execute(&mut *txn)
+        .fetch_one(&mut *txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
@@ -233,7 +243,7 @@ pub async fn create_new_run(
     crate::machine::update_machine_validation_health_report(txn, machine_id, &health_report)
         .await?;
 
-    Ok(id)
+    Ok(validation)
 }
 
 pub async fn find<DB>(
@@ -338,6 +348,18 @@ pub async fn find_by_id(
     )))
 }
 
+pub async fn lock_by_id_no_key_update(
+    txn: &mut PgConnection,
+    id: &MachineValidationId,
+) -> DatabaseResult<Option<MachineValidation>> {
+    let query = "SELECT * FROM machine_validation WHERE id=$1 FOR NO KEY UPDATE";
+    sqlx::query_as::<_, MachineValidation>(query)
+        .bind(id)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
 pub async fn find_all(txn: impl DbReader<'_>) -> DatabaseResult<Vec<MachineValidation>> {
     find_by(txn, ObjectColumnFilter::<IdColumn>::All).await
 }
@@ -358,4 +380,123 @@ pub async fn mark_machine_validation_complete(
     crate::machine::update_machine_validation_time(machine_id, txn).await?;
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    fn test_machine_id() -> MachineId {
+        MachineId::from_str("fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30").unwrap()
+    }
+
+    async fn insert_active_validation(
+        txn: &mut PgConnection,
+        start_time: chrono::DateTime<chrono::Utc>,
+        duration_to_complete: i64,
+        last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> DatabaseResult<MachineValidationId> {
+        let id = MachineValidationId::new();
+        const QUERY: &str = "
+            INSERT INTO machine_validation (
+                id,
+                machine_id,
+                start_time,
+                name,
+                end_time,
+                context,
+                total,
+                completed,
+                state,
+                duration_to_complete,
+                last_heartbeat_at
+            )
+            VALUES ($1, $2, $3, $4, NULL, $5, 1, 0, $6, $7, $8)";
+
+        sqlx::query(QUERY)
+            .bind(id)
+            .bind(test_machine_id())
+            .bind(start_time)
+            .bind(format!("Test_{id}"))
+            .bind("OnDemand")
+            .bind(MachineValidationState::InProgress.to_string())
+            .bind(duration_to_complete)
+            .bind(last_heartbeat_at)
+            .execute(txn)
+            .await
+            .map_err(|e| DatabaseError::query(QUERY, e))?;
+
+        Ok(id)
+    }
+
+    #[crate::sqlx_test]
+    async fn mark_stale_if_active_uses_heartbeat_when_present(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+        let now = chrono::Utc::now();
+        let stale_run_timeout = std::time::Duration::from_secs(60);
+        let status = MachineValidationStatus {
+            state: MachineValidationState::Failed,
+            ..MachineValidationStatus::default()
+        };
+
+        let fresh_heartbeat = insert_active_validation(
+            txn.as_mut(),
+            now - chrono::Duration::minutes(10),
+            1,
+            Some(now - chrono::Duration::seconds(30)),
+        )
+        .await?;
+        let stale_heartbeat = insert_active_validation(
+            txn.as_mut(),
+            now - chrono::Duration::seconds(30),
+            1,
+            Some(now - chrono::Duration::seconds(61)),
+        )
+        .await?;
+        let stale_without_heartbeat =
+            insert_active_validation(txn.as_mut(), now - chrono::Duration::seconds(120), 1, None)
+                .await?;
+
+        assert!(
+            mark_stale_if_active(
+                txn.as_mut(),
+                &fresh_heartbeat,
+                stale_run_timeout,
+                now,
+                &status,
+            )
+            .await?
+            .is_none()
+        );
+        assert_eq!(
+            mark_stale_if_active(
+                txn.as_mut(),
+                &stale_heartbeat,
+                stale_run_timeout,
+                now,
+                &status,
+            )
+            .await?
+            .map(|validation| validation.id),
+            Some(stale_heartbeat)
+        );
+        assert_eq!(
+            mark_stale_if_active(
+                txn.as_mut(),
+                &stale_without_heartbeat,
+                stale_run_timeout,
+                now,
+                &status,
+            )
+            .await?
+            .map(|validation| validation.id),
+            Some(stale_without_heartbeat)
+        );
+
+        Ok(())
+    }
 }

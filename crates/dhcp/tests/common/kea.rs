@@ -93,7 +93,7 @@ impl Drop for KeaRunPermit {
     }
 }
 
-pub struct Kea {
+pub(crate) struct Kea {
     temp_conf_file: PathBuf,
 
     dhcp_in_port: u16,
@@ -111,7 +111,7 @@ impl Kea {
     /// Reserve dynamic DHCP ports, start Kea, and return it with a connected
     /// relay socket. The Kea process is stopped when the harness drops. Tests
     /// that inspect Kea's memfile can pass an externally-owned lease path.
-    pub fn start(
+    pub(crate) fn start(
         api_server_url: &str,
         lease_file: Option<&Path>,
     ) -> Result<(Kea, UdpSocket), eyre::Report> {
@@ -210,7 +210,7 @@ impl Kea {
 
         let (port, status) = last_exit.expect("at least one Kea start attempt should have run");
         Err(eyre::eyre!(
-            "Kea exited before binding DHCP port {port} after {KEA_START_ATTEMPTS} attempts: {status}"
+            "kea exited before binding DHCP port {port} after {KEA_START_ATTEMPTS} attempts: {status}"
         ))
     }
 
@@ -265,12 +265,12 @@ impl Kea {
                     break;
                 }
                 Ok(_) => {}
-                Err(e) => return Err(eyre::eyre!("Unexpected error probing Kea readiness: {e}")),
+                Err(e) => return Err(eyre::eyre!("unexpected error probing kea readiness: {e}")),
             }
             if Instant::now() >= deadline {
                 self.stop_process();
                 return Err(eyre::eyre!(
-                    "Kea did not bind DHCP port {} within {KEA_READY_TIMEOUT:?}",
+                    "kea did not bind DHCP port {} within {KEA_READY_TIMEOUT:?}",
                     self.dhcp_in_port
                 ));
             }
@@ -283,6 +283,8 @@ impl Kea {
         if let Some(process) = &mut self.process {
             // Rust stdlib can only send a KILL (9) to sub-process. Thankfully dhcp already depends on
             // libc so we can use that.
+            // SAFETY: The unreaped Child retains its valid, unreused PID and
+            // SIGTERM is a valid signal; no borrowed memory crosses the syscall.
             unsafe {
                 libc::kill(process.id() as i32, libc::SIGTERM);
             }
@@ -361,6 +363,7 @@ impl Kea {
             "renew-timer": 900,
             "rebind-timer": 1800,
             "valid-lifetime": 3600,
+            "decline-probation-period": 900,
             "hooks-libraries": [
                 {
                         "library": hook_lib,

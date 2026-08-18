@@ -29,6 +29,10 @@ use sqlx::PgConnection;
 
 use super::dpu_nic_firmware_metrics::DpuNicFirmwareUpdateMetrics;
 use super::machine_update_module::MachineUpdateModule;
+use super::metrics::{
+    FirmwareUpdateFailed, FirmwareUpdateFailureCause, FirmwareUpdatePhase, FirmwareUpdateProgress,
+    FirmwareUpdateTarget,
+};
 use crate::cfg::file::CarbideConfig;
 use crate::machine_update_manager::MachineUpdateManager;
 use crate::{CarbideResult, DatabaseError};
@@ -37,15 +41,23 @@ use crate::{CarbideResult, DatabaseError};
 /// to ensure that DPU NIC firmware matches the expected version of the carbide release.
 ///
 /// Config used from [CarbideConfig](crate::cfg::CarbideConfig)
-/// * `dpu_nic_firmware_update_version` the version of the DPU NIC firmware that is expected to be running on the DPU.
+/// * `dpu_config.dpu_nic_firmware_update_versions` lists the accepted DPU NIC firmware versions.
 ///
 /// Note that if the version does not match in either direction, the DPU will be updated.
-pub struct DpuNicFirmwareUpdate {
-    pub metrics: Option<DpuNicFirmwareUpdateMetrics>,
-    pub config: Arc<CarbideConfig>,
+pub(crate) struct DpuNicFirmwareUpdate {
+    pub(crate) metrics: Option<DpuNicFirmwareUpdateMetrics>,
+    pub(crate) config: Arc<CarbideConfig>,
     /// DPF handle for discovering outdated DPF-managed DPUs. `None` when DPF
     /// is disabled in config; in that case `find_outdated_dpus_dpf` is not called.
-    pub dpf: Option<Arc<dyn DpfOperations>>,
+    pub(crate) dpf: Option<Arc<dyn DpfOperations>>,
+    /// Wrong-version outcomes already counted, keyed by DPU and the version it
+    /// landed on: the condition persists across manager passes (the update
+    /// marker stays until an operator intervenes or a new update runs), and a
+    /// counter must record the outcome once, not once per poll. An entry
+    /// clears when the DPU's markers clear, so a later attempt that lands
+    /// wrong again is a new outcome. In-memory: a restart re-reports at most
+    /// once per stuck DPU.
+    pub(crate) reported_wrong_versions: std::sync::Mutex<HashSet<(MachineId, String)>>,
 }
 
 #[async_trait]
@@ -58,7 +70,10 @@ impl MachineUpdateModule for DpuNicFirmwareUpdate {
             match dpu_machine_update::get_reprovisioning_machines(txn).await {
                 Ok(current_updating_machines) => current_updating_machines,
                 Err(e) => {
-                    tracing::warn!("Error getting outstanding reprovisioning count: {}", e);
+                    tracing::warn!(
+                        error = %e,
+                        "Error getting outstanding reprovisioning count",
+                    );
                     vec![]
                 }
             };
@@ -105,11 +120,6 @@ impl MachineUpdateModule for DpuNicFirmwareUpdate {
                 output + format!("{} ({}) ", dpu.dpu_machine_id, dpu.firmware_version).as_str()
             });
 
-            tracing::info!(
-                "Starting DPU updates for host {}: {}",
-                host_machine_id,
-                dpu_update_string
-            );
             // If the reprovisioning failed to update the database for a
             // given {dpu,host}_machine_id, log it as a warning and don't
             // add it to updates_started.
@@ -124,11 +134,13 @@ impl MachineUpdateModule for DpuNicFirmwareUpdate {
             {
                 match reprovisioning_err {
                     DatabaseError::NotFoundError { id, .. } => {
-                        tracing::warn!(
-                            "failed to trigger reprovisioning for managed host : {} - no update match for id: {}",
-                            host_machine_id,
-                            id
-                        );
+                        carbide_instrument::emit(FirmwareUpdateFailed {
+                            target: FirmwareUpdateTarget::DpuNic,
+                            cause: FirmwareUpdateFailureCause::NoUpdateMatch,
+                            machine_id: host_machine_id,
+                            unmatched_dpu_machine_id: id,
+                            firmware_version: String::new(),
+                        });
                         continue;
                     }
                     _ => {
@@ -139,6 +151,15 @@ impl MachineUpdateModule for DpuNicFirmwareUpdate {
 
             txn.commit().await?;
 
+            // Counted only once the trigger is committed: a DPU that left
+            // ready between snapshot and trigger is a NoUpdateMatch failure,
+            // not a started update.
+            carbide_instrument::emit(FirmwareUpdateProgress {
+                target: FirmwareUpdateTarget::DpuNic,
+                phase: FirmwareUpdatePhase::Started,
+                machine_id: host_machine_id,
+                detail: dpu_update_string,
+            });
             updates_started.insert(host_machine_id);
         }
 
@@ -148,28 +169,53 @@ impl MachineUpdateModule for DpuNicFirmwareUpdate {
     async fn clear_completed_updates(&self, txn: &mut PgConnection) -> CarbideResult<()> {
         let updated_machines =
             dpu_machine_update::get_updated_machines(txn, self.config.host_health).await?;
-        tracing::debug!("found {} updated machines", updated_machines.len());
+        tracing::debug!(
+            updated_machine_count = updated_machines.len(),
+            "found updated machines",
+        );
         for updated_machine in updated_machines {
-            if self
-                .config
-                .dpu_config
-                .dpu_nic_firmware_update_versions
-                .contains(&updated_machine.firmware_version)
+            // DPF picks update targets by the DPUDeployment's expected BFB, not
+            // by `dpu_nic_firmware_update_versions` — `find_outdated_dpus` skips
+            // DPF hosts outright. Holding a DPF host's reported NIC firmware
+            // against that list therefore never matches, which used to leave the
+            // HostUpdateInProgress marker (and its prevent_allocations alert)
+            // pinned forever after a successful reprovision. The reprovision
+            // completing is the completion signal for DPF hosts.
+            if updated_machine.dpf_managed
+                || self
+                    .config
+                    .dpu_config
+                    .dpu_nic_firmware_update_versions
+                    .contains(&updated_machine.firmware_version)
             {
                 if let Err(e) =
                     MachineUpdateManager::remove_machine_update_markers(txn, &updated_machine).await
                 {
                     tracing::warn!(
                         machine_id = %updated_machine.dpu_machine_id,
-                        "Failed to remove machine update markers: {}", e
+                        error = %e,
+                        "Failed to remove machine update markers",
                     );
+                } else if let Ok(mut reported) = self.reported_wrong_versions.lock() {
+                    reported.retain(|(dpu, _)| *dpu != updated_machine.dpu_machine_id);
                 }
-            } else {
-                tracing::warn!(
-                    machine_id = %updated_machine.dpu_machine_id,
-                    firmware_version = %updated_machine.firmware_version,
-                    "Incorrect firmware version after attempted update"
-                );
+            } else if self
+                .reported_wrong_versions
+                .lock()
+                .is_ok_and(|mut reported| {
+                    reported.insert((
+                        updated_machine.dpu_machine_id,
+                        updated_machine.firmware_version.clone(),
+                    ))
+                })
+            {
+                carbide_instrument::emit(FirmwareUpdateFailed {
+                    target: FirmwareUpdateTarget::DpuNic,
+                    cause: FirmwareUpdateFailureCause::WrongVersionAfterUpdate,
+                    machine_id: updated_machine.dpu_machine_id,
+                    unmatched_dpu_machine_id: String::new(),
+                    firmware_version: updated_machine.firmware_version,
+                });
             }
         }
         Ok(())
@@ -228,7 +274,7 @@ impl MachineUpdateModule for DpuNicFirmwareUpdate {
 }
 
 impl DpuNicFirmwareUpdate {
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<CarbideConfig>,
         meter: opentelemetry::metrics::Meter,
         dpf: Option<Arc<dyn DpfOperations>>,
@@ -243,13 +289,14 @@ impl DpuNicFirmwareUpdate {
         let mut metrics = DpuNicFirmwareUpdateMetrics::new();
         metrics.register_callbacks(&meter);
         Some(DpuNicFirmwareUpdate {
+            reported_wrong_versions: std::sync::Mutex::new(HashSet::new()),
             metrics: Some(metrics),
             config,
             dpf,
         })
     }
 
-    pub async fn check_for_updates(
+    pub(crate) async fn check_for_updates(
         &self,
         snapshots: &HashMap<MachineId, ManagedHostStateSnapshot>,
         available_updates: i32,
@@ -263,7 +310,10 @@ impl DpuNicFirmwareUpdate {
         ) {
             Ok(machine_updates) => machine_updates,
             Err(e) => {
-                tracing::warn!("Failed to find machines needing updates: {}", e);
+                tracing::warn!(
+                    error = %e,
+                    "Failed to find machines needing updates",
+                );
                 vec![]
             }
         }

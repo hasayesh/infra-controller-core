@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-pub mod metrics;
+pub(crate) mod metrics;
 
 use std::panic::Location;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-pub use ::rpc::forge as rpc;
+pub(crate) use ::rpc::forge as rpc;
 use ::rpc::forge::{RemoveSkuRequest, SkuIdList};
 use ::rpc::protos::dns::{
     CreateDomainRequest, DnsResourceRecordLookupRequest, DnsResourceRecordLookupResponse, Domain,
@@ -39,7 +39,7 @@ use carbide_secrets::certificates::CertificateProvider;
 use carbide_secrets::credentials::{
     BmcCredentialType, CredentialKey, CredentialManager, CredentialType, Credentials,
 };
-use carbide_site_explorer::EndpointExplorer;
+use carbide_site_explorer::{EndpointExplorationService, EndpointExplorer};
 use carbide_uuid::machine::{MachineId, MachineInterfaceId};
 use db::db_read::PgPoolReader;
 use db::work_lock_manager::WorkLockManagerHandle;
@@ -78,6 +78,7 @@ pub struct Api {
     pub(crate) dpu_health_log_limiter: LogLimiter<MachineId>,
     pub dynamic_settings: DynamicSettings,
     pub(crate) endpoint_explorer: Arc<dyn EndpointExplorer>,
+    pub(crate) endpoint_exploration_service: Arc<EndpointExplorationService>,
     pub(crate) scout_stream_registry: ConnectionRegistry,
     #[allow(unused)]
     pub(crate) rms_client: Option<Arc<dyn RmsApi>>,
@@ -88,6 +89,11 @@ pub struct Api {
     pub(crate) metric_emitter: ApiMetricsEmitter,
     pub(crate) component_manager: Option<component_manager::component_manager::ComponentManager>,
     pub(crate) bms_client: OnceLock<Arc<BmsDsxExchangeHandle>>,
+    pub(crate) secrets_context: Option<crate::secrets::SecretsContext>,
+    /// Validator for node-auth bearer JWTs (issue #355). `Some` only when
+    /// `[node_auth] enabled`; installed into the authn middleware by the
+    /// listener.
+    pub(crate) node_jwt_validator: Option<Arc<crate::node_auth::NodeJwtValidator>>,
 }
 
 pub(crate) type ScoutStreamType =
@@ -202,6 +208,48 @@ impl Forge for Api {
         request: Request<rpc::VpcsByIdsRequest>,
     ) -> Result<Response<rpc::VpcList>, Status> {
         crate::handlers::vpc::find_by_ids(self, request).await
+    }
+
+    async fn find_site_prefix_ids(
+        &self,
+        request: Request<rpc::SitePrefixSearchFilter>,
+    ) -> Result<Response<rpc::SitePrefixIdList>, Status> {
+        crate::handlers::site_prefix::find_ids(self, request).await
+    }
+
+    async fn find_site_prefixes_by_ids(
+        &self,
+        request: Request<rpc::SitePrefixesByIdsRequest>,
+    ) -> Result<Response<rpc::SitePrefixList>, Status> {
+        crate::handlers::site_prefix::find_by_ids(self, request).await
+    }
+
+    async fn create_site_prefix(
+        &self,
+        request: Request<rpc::SitePrefixCreationRequest>,
+    ) -> Result<Response<rpc::SitePrefix>, Status> {
+        crate::handlers::site_prefix::create(self, request).await
+    }
+
+    async fn update_site_prefix(
+        &self,
+        request: Request<rpc::SitePrefixUpdateRequest>,
+    ) -> Result<Response<rpc::SitePrefix>, Status> {
+        crate::handlers::site_prefix::update(self, request).await
+    }
+
+    async fn delete_site_prefix(
+        &self,
+        request: Request<rpc::SitePrefixDeletionRequest>,
+    ) -> Result<Response<rpc::SitePrefixDeletionResult>, Status> {
+        crate::handlers::site_prefix::delete(self, request).await
+    }
+
+    async fn find_site_prefix_state_histories(
+        &self,
+        request: Request<rpc::SitePrefixStateHistoriesRequest>,
+    ) -> Result<Response<rpc::StateHistories>, Status> {
+        crate::handlers::site_prefix::find_state_histories(self, request).await
     }
 
     async fn create_vpc_prefix(
@@ -966,6 +1014,20 @@ impl Forge for Api {
         crate::handlers::credential::get_switch_nvos_credentials(self, request).await
     }
 
+    async fn get_container_registry_credential(
+        &self,
+        request: Request<rpc::GetContainerRegistryCredentialRequest>,
+    ) -> Result<Response<rpc::GetContainerRegistryCredentialResponse>, Status> {
+        crate::handlers::credential::get_container_registry_credential(self, request).await
+    }
+
+    async fn set_container_registry_credential(
+        &self,
+        request: Request<rpc::SetContainerRegistryCredentialRequest>,
+    ) -> Result<Response<()>, Status> {
+        crate::handlers::credential::set_container_registry_credential(self, request).await
+    }
+
     /// Network status of each managed host, as reported by forge-dpu-agent.
     /// For use by forge-admin-cli
     ///
@@ -1063,6 +1125,13 @@ impl Forge for Api {
         crate::handlers::site_explorer::get_site_exploration_report(self, request).await
     }
 
+    async fn get_site_explorer_last_run(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<::rpc::site_explorer::SiteExplorerLastRunResponse>, Status> {
+        crate::handlers::site_explorer::get_site_explorer_last_run(self, request).await
+    }
+
     async fn find_explored_endpoint_ids(
         &self,
         request: Request<::rpc::site_explorer::ExploredEndpointSearchFilter>,
@@ -1089,6 +1158,20 @@ impl Forge for Api {
         request: Request<::rpc::site_explorer::ExploredManagedHostsByIdsRequest>,
     ) -> Result<Response<::rpc::site_explorer::ExploredManagedHostList>, Status> {
         crate::handlers::site_explorer::find_explored_managed_hosts_by_ids(self, request).await
+    }
+
+    async fn find_explored_mlx_device_host_ids(
+        &self,
+        request: Request<::rpc::site_explorer::ExploredMlxDeviceHostSearchFilter>,
+    ) -> Result<Response<::rpc::site_explorer::ExploredMlxDeviceHostIdList>, Status> {
+        crate::handlers::site_explorer::find_explored_mlx_device_host_ids(self, request).await
+    }
+
+    async fn find_explored_mlx_devices_by_ids(
+        &self,
+        request: Request<::rpc::site_explorer::ExploredMlxDevicesByIdsRequest>,
+    ) -> Result<Response<::rpc::site_explorer::ExploredMlxDeviceList>, Status> {
+        crate::handlers::site_explorer::find_explored_mlx_devices_by_ids(self, request).await
     }
 
     async fn update_machine_hardware_info(
@@ -1274,6 +1357,13 @@ impl Forge for Api {
         crate::handlers::rack::get_rack_profile(self, request).await
     }
 
+    async fn list_rack_profiles(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<rpc::ListRackProfilesResponse>, Status> {
+        crate::handlers::rack::list_rack_profiles(self, request)
+    }
+
     /// Trigger DPU reprovisioning
     async fn trigger_dpu_reprovisioning(
         &self,
@@ -1294,6 +1384,22 @@ impl Forge for Api {
         request: Request<rpc::HostReprovisioningRequest>,
     ) -> Result<Response<()>, Status> {
         crate::handlers::host_reprovisioning::trigger_host_reprovisioning(self, request).await
+    }
+
+    async fn trigger_bmc_credential_rotation(
+        &self,
+        request: Request<rpc::BmcCredentialRotationRequest>,
+    ) -> Result<Response<()>, Status> {
+        crate::handlers::bmc_credential_rotation::trigger_bmc_credential_rotation(self, request)
+            .await
+    }
+
+    async fn trigger_uefi_credential_rotation(
+        &self,
+        request: Request<rpc::UefiCredentialRotationRequest>,
+    ) -> Result<Response<()>, Status> {
+        crate::handlers::uefi_credential_rotation::trigger_uefi_credential_rotation(self, request)
+            .await
     }
 
     async fn mark_manual_firmware_upgrade_complete(
@@ -1347,6 +1453,13 @@ impl Forge for Api {
         request: Request<MachineInterfaceId>,
     ) -> Result<Response<()>, Status> {
         crate::handlers::boot_override::clear(self, request).await
+    }
+
+    async fn get_machine_boot_interfaces(
+        &self,
+        request: Request<rpc::GetMachineBootInterfacesRequest>,
+    ) -> Result<Response<rpc::GetMachineBootInterfacesResponse>, Status> {
+        crate::handlers::machine_boot_interfaces::get_machine_boot_interfaces(self, request).await
     }
 
     async fn get_network_topology(
@@ -1444,6 +1557,27 @@ impl Forge for Api {
         crate::handlers::credential::delete_credential(self, request).await
     }
 
+    async fn rotate_credential(
+        &self,
+        request: Request<rpc::RotateCredentialRequest>,
+    ) -> Result<Response<rpc::RotateCredentialResult>, Status> {
+        crate::handlers::credential_rotation::rotate_credential(self, request).await
+    }
+
+    async fn get_credential_rotation_status(
+        &self,
+        request: Request<rpc::CredentialRotationStatusRequest>,
+    ) -> Result<Response<rpc::CredentialRotationStatusResult>, Status> {
+        crate::handlers::credential_rotation::get_credential_rotation_status(self, request).await
+    }
+
+    async fn re_wrap_secrets(
+        &self,
+        request: Request<rpc::ReWrapSecretsRequest>,
+    ) -> Result<Response<rpc::ReWrapSecretsResponse>, Status> {
+        crate::handlers::secrets::re_wrap_secrets(self, request).await
+    }
+
     /// get_route_servers returns a list of all configured route server
     /// entries for all source types.
     async fn get_route_servers(
@@ -1505,6 +1639,13 @@ impl Forge for Api {
         request: Request<rpc::SetHostUefiPasswordRequest>,
     ) -> Result<Response<rpc::SetHostUefiPasswordResponse>, Status> {
         crate::handlers::uefi::set_host_uefi_password(self, request).await
+    }
+
+    async fn set_dpu_uefi_password(
+        &self,
+        request: Request<rpc::SetDpuUefiPasswordRequest>,
+    ) -> Result<Response<rpc::SetDpuUefiPasswordResponse>, Status> {
+        crate::handlers::uefi::set_dpu_uefi_password(self, request).await
     }
 
     async fn get_expected_machine(
@@ -2277,6 +2418,13 @@ impl Forge for Api {
         crate::handlers::machine_validation::get_machine_validation_attempt(self, request).await
     }
 
+    async fn heartbeat_machine_validation_run(
+        &self,
+        request: Request<rpc::MachineValidationHeartbeatRequest>,
+    ) -> Result<Response<rpc::MachineValidationHeartbeatResponse>, Status> {
+        crate::handlers::machine_validation::heartbeat_machine_validation_run(self, request).await
+    }
+
     async fn admin_power_control(
         &self,
         request: Request<rpc::AdminPowerControlRequest>,
@@ -2566,7 +2714,21 @@ impl Forge for Api {
         &self,
         request: Request<rpc::GetDesiredFirmwareVersionsRequest>,
     ) -> Result<Response<rpc::GetDesiredFirmwareVersionsResponse>, Status> {
-        crate::handlers::firmware::get_desired_firmware_versions(self, request)
+        crate::handlers::firmware::get_desired_firmware_versions(self, request).await
+    }
+
+    async fn upsert_host_firmware_config(
+        &self,
+        request: Request<rpc::UpsertHostFirmwareConfigRequest>,
+    ) -> Result<Response<rpc::HostFirmwareConfigResponse>, Status> {
+        crate::handlers::firmware::upsert_host_firmware_config(self, request).await
+    }
+
+    async fn delete_host_firmware_config(
+        &self,
+        request: Request<rpc::DeleteHostFirmwareConfigRequest>,
+    ) -> Result<Response<()>, Status> {
+        crate::handlers::firmware::delete_host_firmware_config(self, request).await
     }
 
     async fn create_sku(
@@ -2788,6 +2950,20 @@ impl Forge for Api {
         crate::handlers::bmc_endpoint_explorer::create_bmc_user(self, request).await
     }
 
+    async fn set_bmc_root_password(
+        &self,
+        request: Request<rpc::SetBmcRootPasswordRequest>,
+    ) -> Result<Response<rpc::SetBmcRootPasswordResponse>, Status> {
+        crate::handlers::bmc_endpoint_explorer::set_bmc_root_password(self, request).await
+    }
+
+    async fn probe_bmc_vendor(
+        &self,
+        request: Request<rpc::ProbeBmcVendorRequest>,
+    ) -> Result<Response<rpc::ProbeBmcVendorResponse>, Status> {
+        crate::handlers::bmc_endpoint_explorer::probe_bmc_vendor(self, request).await
+    }
+
     async fn delete_bmc_user(
         &self,
         request: Request<rpc::DeleteBmcUserRequest>,
@@ -2806,7 +2982,7 @@ impl Forge for Api {
         &self,
         request: Request<rpc::ListHostFirmwareRequest>,
     ) -> Result<Response<rpc::ListHostFirmwareResponse>, Status> {
-        crate::handlers::firmware::list_host_firmware(self, request)
+        crate::handlers::firmware::list_host_firmware(self, request).await
     }
 
     // Scout is telling Carbide the mlx device configuration in its machine
@@ -2814,7 +2990,7 @@ impl Forge for Api {
         &self,
         request: Request<mlx_device_pb::PublishMlxDeviceReportRequest>,
     ) -> Result<Response<mlx_device_pb::PublishMlxDeviceReportResponse>, Status> {
-        crate::handlers::dpa::publish_mlx_device_report(self, request).await
+        crate::handlers::svpc::publish_mlx_device_report(self, request).await
     }
 
     // Scout is telling carbide the observed status (locking status, card mode) of the
@@ -2823,7 +2999,7 @@ impl Forge for Api {
         &self,
         request: Request<mlx_device_pb::PublishMlxObservationReportRequest>,
     ) -> Result<Response<mlx_device_pb::PublishMlxObservationReportResponse>, Status> {
-        crate::handlers::dpa::publish_mlx_observation_report(self, request).await
+        crate::handlers::svpc::publish_mlx_observation_report(self, request).await
     }
 
     async fn trim_table(
@@ -3128,6 +3304,35 @@ impl Forge for Api {
         crate::handlers::dpf::get_dpf_service_versions(self, request).await
     }
 
+    async fn find_pending_dpu_service_sync_ids(
+        &self,
+        request: Request<rpc::FindPendingDpuServiceSyncIdsRequest>,
+    ) -> Result<Response<::rpc::common::MachineIdList>, Status> {
+        crate::handlers::dpu_service_sync::find_pending_dpu_service_sync_ids(self, request).await
+    }
+
+    async fn find_pending_dpu_service_syncs_by_ids(
+        &self,
+        request: Request<rpc::FindPendingDpuServiceSyncsByIdsRequest>,
+    ) -> Result<Response<rpc::ListPendingDpuServiceSyncsResponse>, Status> {
+        crate::handlers::dpu_service_sync::find_pending_dpu_service_syncs_by_ids(self, request)
+            .await
+    }
+
+    async fn list_dpu_service_sync_history(
+        &self,
+        request: Request<rpc::ListDpuServiceSyncHistoryRequest>,
+    ) -> Result<Response<rpc::ListPendingDpuServiceSyncsResponse>, Status> {
+        crate::handlers::dpu_service_sync::list_dpu_service_sync_history(self, request).await
+    }
+
+    async fn release_dpu_service_sync_hold(
+        &self,
+        request: Request<rpc::ReleaseDpuServiceSyncHoldRequest>,
+    ) -> Result<Response<rpc::ReleaseDpuServiceSyncHoldResponse>, Status> {
+        crate::handlers::dpu_service_sync::release_dpu_service_sync_hold(self, request).await
+    }
+
     // scout_stream handles the bidirectional streaming connection from scout agents.
     // scout agents call scout_stream and send an Init message, and then carbide-api
     // will send down "request" messages to connected agent(s) to either instruct them
@@ -3310,6 +3515,14 @@ impl Forge for Api {
         crate::handlers::component_manager::component_power_control(self, request).await
     }
 
+    async fn component_configure_switch_certificate(
+        &self,
+        request: Request<rpc::ComponentConfigureSwitchCertificateRequest>,
+    ) -> Result<Response<rpc::ComponentConfigureSwitchCertificateResponse>, Status> {
+        crate::handlers::component_manager::component_configure_switch_certificate(self, request)
+            .await
+    }
+
     async fn get_component_inventory(
         &self,
         request: Request<rpc::GetComponentInventoryRequest>,
@@ -3359,7 +3572,7 @@ impl Forge for Api {
                 description: template.description.clone(),
                 reserved_params: template.reserved_params.clone(),
                 required_artifacts: template.required_artifacts.clone(),
-                scope: ipxe_template_scope_to_proto(template.scope).into(),
+                visibility: ipxe_template_visibility_to_proto(template.visibility).into(),
             })),
             None => Err(Status::not_found(format!(
                 "iPXE template '{}' not found",
@@ -3395,7 +3608,7 @@ impl Forge for Api {
                     description: t.description.clone(),
                     reserved_params: t.reserved_params.clone(),
                     required_artifacts: t.required_artifacts.clone(),
-                    scope: ipxe_template_scope_to_proto(t.scope).into(),
+                    visibility: ipxe_template_visibility_to_proto(t.visibility).into(),
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
@@ -3413,14 +3626,14 @@ impl Forge for Api {
     }
 }
 
-fn ipxe_template_scope_to_proto(
-    scope: carbide_ipxe_renderer::IpxeTemplateScope,
-) -> ::rpc::forge::IpxeTemplateScope {
-    use ::rpc::forge::IpxeTemplateScope as ProtoScope;
-    use carbide_ipxe_renderer::IpxeTemplateScope as RendererScope;
-    match scope {
-        RendererScope::Internal => ProtoScope::Internal,
-        RendererScope::Public => ProtoScope::Public,
+fn ipxe_template_visibility_to_proto(
+    visibility: carbide_ipxe_renderer::IpxeTemplateVisibility,
+) -> ::rpc::forge::IpxeTemplateVisibility {
+    use ::rpc::forge::IpxeTemplateVisibility as ProtoVisibility;
+    use carbide_ipxe_renderer::IpxeTemplateVisibility as RendererVisibility;
+    match visibility {
+        RendererVisibility::Internal => ProtoVisibility::Internal,
+        RendererVisibility::Public => ProtoVisibility::Public,
     }
 }
 
@@ -3470,9 +3683,16 @@ pub(crate) fn truncate(mut s: String, len: usize) -> String {
 pub struct DefaultCredential {
     /// Human-friendly name for display in the admin UI
     /// (e.g. `"Host UEFI password"`).
-    pub display_name: &'static str,
+    _display_name: &'static str,
     /// The credential's key path, shown to operators for reference.
-    pub key: String,
+    _key: String,
+}
+
+#[cfg(test)]
+impl DefaultCredential {
+    pub(crate) fn key(&self) -> &str {
+        &self._key
+    }
 }
 
 /// Human-friendly label for a site-wide default credential key, for the admin UI.
@@ -3515,15 +3735,15 @@ impl Api {
                 Ok(Some(Credentials::UsernamePassword { password, .. }))
                     if !password.is_empty() => {}
                 Ok(_) => missing.push(DefaultCredential {
-                    display_name: default_credential_display_name(&key),
-                    key: key.to_key_str().into_owned(),
+                    _display_name: default_credential_display_name(&key),
+                    _key: key.to_key_str().into_owned(),
                 }),
                 Err(err) => {
                     // A backend error is distinct from a genuinely-unset credential;
                     // don't raise the "not set" warning on a transient secrets failure.
                     tracing::warn!(
                         key = %key.to_key_str(),
-                        %err,
+                        error = %err,
                         "could not verify default credential presence",
                     );
                 }
@@ -3536,7 +3756,9 @@ impl Api {
     // https://github.com/rust-lang/rust/issues/110011 will be
     // implemented
     #[track_caller]
-    pub fn txn_begin(&self) -> impl Future<Output = Result<db::Transaction<'_>, DatabaseError>> {
+    pub(crate) fn txn_begin(
+        &self,
+    ) -> impl Future<Output = Result<db::Transaction<'_>, DatabaseError>> {
         let loc = Location::caller();
         db::Transaction::begin_with_location(&self.database_connection, loc)
     }
@@ -3545,7 +3767,7 @@ impl Api {
         self.database_connection.clone().into()
     }
 
-    pub fn pg_pool(&self) -> &sqlx::PgPool {
+    pub(crate) fn pg_pool(&self) -> &sqlx::PgPool {
         &self.database_connection
     }
 

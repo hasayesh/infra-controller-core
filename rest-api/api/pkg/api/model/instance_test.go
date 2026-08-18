@@ -14,7 +14,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/api/pkg/api/model/util"
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -76,19 +76,17 @@ func TestNewAPIInstance(t *testing.T) {
 
 	secondaryVpcID1 := uuid.New()
 	secondaryVpcID2 := uuid.New()
+	ipv4FamilyMode := cdbm.InterfaceVpcIPFamilyModeIPv4Only
 
 	dbis1Secondary1 := cdbm.Interface{
-		ID:          uuid.New(),
-		InstanceID:  dbi1.ID,
-		VpcPrefixID: cutil.GetPtr(uuid.New()),
-		VpcPrefix: &cdbm.VpcPrefix{
-			ID:    uuid.New(),
-			VpcID: secondaryVpcID1,
-		},
-		IsPhysical: false,
-		Status:     cdbm.InterfaceStatusPending,
-		Created:    time.Now(),
-		Updated:    time.Now(),
+		ID:              uuid.New(),
+		InstanceID:      dbi1.ID,
+		VpcID:           &secondaryVpcID1,
+		VpcIPFamilyMode: &ipv4FamilyMode,
+		IsPhysical:      false,
+		Status:          cdbm.InterfaceStatusPending,
+		Created:         time.Now(),
+		Updated:         time.Now(),
 	}
 
 	dbis1Secondary2 := cdbm.Interface{
@@ -885,7 +883,7 @@ func TestAPIInstanceCreateRequest_Validate(t *testing.T) {
 				},
 			},
 			wantErr:          true,
-			wantErrorMessage: "`secondaryVpcIds` can only be specified when `vpcPrefixId` is specified within `interfaces`",
+			wantErrorMessage: "`secondaryVpcIds` can only be specified when `vpcPrefixId` or `vpcId` is specified within `interfaces`",
 		},
 		{
 			name: "test valid Instance create request, NVLink Interfaces specified",
@@ -1027,6 +1025,68 @@ func TestAPIBatchInstanceCreateRequest_Validate(t *testing.T) {
 			if tt.wantErrorMessage != "" && err != nil {
 				assert.Contains(t, err.Error(), tt.wantErrorMessage)
 			}
+		})
+	}
+}
+
+func TestInstanceRequestsAcceptVpcSelectedSecondaryInterfaces(t *testing.T) {
+	tests := []struct {
+		name     string
+		validate func() error
+	}{
+		{
+			name: "instance create",
+			validate: func() error {
+				request := APIInstanceCreateRequest{
+					Name:              "test-instance",
+					TenantID:          uuid.NewString(),
+					InstanceTypeID:    cutil.GetPtr(uuid.NewString()),
+					VpcID:             uuid.NewString(),
+					SecondaryVpcIDs:   []string{uuid.NewString()},
+					OperatingSystemID: cutil.GetPtr(uuid.NewString()),
+					Interfaces: []APIInterfaceCreateOrUpdateRequest{
+						{VpcPrefixID: cutil.GetPtr(uuid.NewString())},
+						{VpcID: cutil.GetPtr(uuid.NewString()), IPFamilies: []IPFamily{IPFamilyIPv4}},
+					},
+				}
+				return request.Validate()
+			},
+		},
+		{
+			name: "batch instance create",
+			validate: func() error {
+				request := APIBatchInstanceCreateRequest{
+					NamePrefix:      "test-batch",
+					Count:           2,
+					TenantID:        uuid.NewString(),
+					InstanceTypeID:  uuid.NewString(),
+					VpcID:           uuid.NewString(),
+					SecondaryVpcIDs: []string{uuid.NewString()},
+					IpxeScript:      cutil.GetPtr("test ipxe"),
+					Interfaces: []APIInterfaceCreateOrUpdateRequest{
+						{VpcID: cutil.GetPtr(uuid.NewString()), IPFamilies: []IPFamily{IPFamilyIPv4}},
+					},
+				}
+				return request.Validate()
+			},
+		},
+		{
+			name: "instance update",
+			validate: func() error {
+				request := APIInstanceUpdateRequest{
+					SecondaryVpcIDs: []string{uuid.NewString()},
+					Interfaces: []APIInterfaceCreateOrUpdateRequest{
+						{VpcID: cutil.GetPtr(uuid.NewString()), IPFamilies: []IPFamily{IPFamilyIPv4}},
+					},
+				}
+				return request.Validate()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.NoError(t, tt.validate())
 		})
 	}
 }
@@ -2532,16 +2592,40 @@ func TestAPIInstanceUpdateRequest_Validate_Auto(t *testing.T) {
 func TestAPIInstanceDeleteRequest_ToProto(t *testing.T) {
 	id := uuid.New()
 	ctrlID := uuid.New()
-	instance := &cdbm.Instance{ID: id, ControllerInstanceID: &ctrlID}
+	userID := uuid.New()
+	tenantID := uuid.New()
+	org := "test-tenant-org"
+	orgDisplayName := "Test Tenant Org"
+	dbUser := &cdbm.User{ID: userID}
+	instance := &cdbm.Instance{
+		ID:                   id,
+		ControllerInstanceID: &ctrlID,
+		Tenant: &cdbm.Tenant{
+			ID:             tenantID,
+			Org:            org,
+			OrgDisplayName: &orgDisplayName,
+		},
+	}
+
+	assertDeleteAttribution := func(t *testing.T, got *corev1.InstanceReleaseRequest) {
+		t.Helper()
+		require.NotNil(t, got.DeleteAttribution)
+		require.NotNil(t, got.DeleteAttribution.InitiatedBy)
+		assert.Equal(t, org, got.DeleteAttribution.InitiatedBy.Org)
+		assert.Equal(t, orgDisplayName, got.DeleteAttribution.InitiatedBy.OrgDisplayName)
+		assert.Equal(t, userID.String(), got.DeleteAttribution.InitiatedBy.UserId)
+		assert.Equal(t, tenantID.String(), got.DeleteAttribution.InitiatedBy.TenantId)
+	}
 
 	t.Run("empty request sources only the canonical ID", func(t *testing.T) {
 		req := APIInstanceDeleteRequest{}
-		got := req.ToProto(instance)
+		got := req.ToProto(instance, dbUser)
 		require.NotNil(t, got)
 		require.NotNil(t, got.Id)
 		assert.Equal(t, ctrlID.String(), got.Id.Value)
 		assert.Nil(t, got.Issue)
 		assert.Nil(t, got.IsRepairTenant)
+		assertDeleteAttribution(t, got)
 	})
 
 	t.Run("overlays MachineHealthIssue with summary and details", func(t *testing.T) {
@@ -2552,12 +2636,13 @@ func TestAPIInstanceDeleteRequest_ToProto(t *testing.T) {
 				Details:  cutil.GetPtr("port 0 returned link-down for 30 minutes"),
 			},
 		}
-		got := req.ToProto(instance)
+		got := req.ToProto(instance, dbUser)
 		require.NotNil(t, got)
 		require.NotNil(t, got.Issue)
-		assert.Equal(t, cwssaws.IssueCategory_HARDWARE, got.Issue.Category)
+		assert.Equal(t, corev1.IssueCategory_HARDWARE, got.Issue.Category)
 		assert.Equal(t, "burnt out NIC", got.Issue.Summary)
 		assert.Equal(t, "port 0 returned link-down for 30 minutes", got.Issue.Details)
+		assertDeleteAttribution(t, got)
 	})
 
 	t.Run("MachineHealthIssue without optional pointers leaves Summary and Details empty", func(t *testing.T) {
@@ -2566,25 +2651,77 @@ func TestAPIInstanceDeleteRequest_ToProto(t *testing.T) {
 				Category: MachineIssueCategoryOther,
 			},
 		}
-		got := req.ToProto(instance)
+		got := req.ToProto(instance, dbUser)
 		require.NotNil(t, got.Issue)
-		assert.Equal(t, cwssaws.IssueCategory_OTHER, got.Issue.Category)
+		assert.Equal(t, corev1.IssueCategory_OTHER, got.Issue.Category)
 		assert.Equal(t, "", got.Issue.Summary)
 		assert.Equal(t, "", got.Issue.Details)
+		assertDeleteAttribution(t, got)
 	})
 
 	t.Run("overlays IsRepairTenant when set", func(t *testing.T) {
 		req := APIInstanceDeleteRequest{IsRepairTenant: cutil.GetPtr(true)}
-		got := req.ToProto(instance)
+		got := req.ToProto(instance, dbUser)
 		require.NotNil(t, got.IsRepairTenant)
 		assert.True(t, *got.IsRepairTenant)
+		assertDeleteAttribution(t, got)
 	})
 
 	t.Run("uses Instance ID when ControllerInstanceID is nil", func(t *testing.T) {
-		bare := &cdbm.Instance{ID: id}
+		bare := &cdbm.Instance{
+			ID: id,
+			Tenant: &cdbm.Tenant{
+				ID:  tenantID,
+				Org: org,
+			},
+		}
 		req := APIInstanceDeleteRequest{}
-		got := req.ToProto(bare)
+		got := req.ToProto(bare, dbUser)
 		require.NotNil(t, got.Id)
 		assert.Equal(t, id.String(), got.Id.Value)
+		require.NotNil(t, got.DeleteAttribution)
+		require.NotNil(t, got.DeleteAttribution.InitiatedBy)
+		assert.Equal(t, org, got.DeleteAttribution.InitiatedBy.Org)
+		assert.Equal(t, "", got.DeleteAttribution.InitiatedBy.OrgDisplayName)
+		assert.Equal(t, userID.String(), got.DeleteAttribution.InitiatedBy.UserId)
+		assert.Equal(t, tenantID.String(), got.DeleteAttribution.InitiatedBy.TenantId)
+	})
+}
+
+func TestValidateInfiniBandRequestForMachineCapability(t *testing.T) {
+	deviceType := cdbm.MachineCapabilityDeviceType("")
+	machineIbCaps := []cdbm.MachineCapability{
+		{
+			Type:            cdbm.MachineCapabilityTypeInfiniBand,
+			Name:            "MT28908 Family [ConnectX-6]",
+			Vendor:          cutil.GetPtr("Mellanox Technologies"),
+			Count:           cutil.GetPtr(3),
+			DeviceType:      &deviceType,
+			InactiveDevices: []int{1, 3},
+		},
+	}
+
+	t.Run("satisfied when requested device instance is active on machine", func(t *testing.T) {
+		req := APIInstanceCreateRequest{
+			InfiniBandInterfaces: []APIInfiniBandInterfaceCreateOrUpdateRequest{
+				{Device: "MT28908 Family [ConnectX-6]", DeviceInstance: 0, IsPhysical: true},
+			},
+		}
+		match := req.ValidateInfiniBandRequestForMachineCapability(machineIbCaps)
+		assert.True(t, match.Satisfied)
+		assert.True(t, match.CountSatisfiable)
+		assert.Equal(t, []int{0, 2}, match.SuggestedByDevice["MT28908 Family [ConnectX-6]"])
+	})
+
+	t.Run("not satisfied but count satisfiable when requested device instance is inactive on machine", func(t *testing.T) {
+		req := APIInstanceCreateRequest{
+			InfiniBandInterfaces: []APIInfiniBandInterfaceCreateOrUpdateRequest{
+				{Device: "MT28908 Family [ConnectX-6]", DeviceInstance: 1, IsPhysical: true},
+			},
+		}
+		match := req.ValidateInfiniBandRequestForMachineCapability(machineIbCaps)
+		assert.False(t, match.Satisfied)
+		assert.True(t, match.CountSatisfiable)
+		assert.Equal(t, []int{0}, match.UnsatisfiedRequestIndices)
 	})
 }

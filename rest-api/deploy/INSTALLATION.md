@@ -17,7 +17,7 @@ This guide covers the cloud-hosted topology — deploying the REST control plane
 
 All manifests live under `deploy/kustomize/` with the following structure:
 
-```
+```text
 deploy/kustomize/
 ├── base/                 # Reusable base manifests (not applied directly)
 │   ├── api/              # nico-rest-api
@@ -64,7 +64,7 @@ deploy/kustomize/
 
 ## Order of Operations
 
-```
+```text
 1.  Create namespaces
 2.  Create CA signing secret            ← prerequisite for nico-rest-cert-manager
 3.  Deploy PostgreSQL
@@ -91,6 +91,7 @@ kubectl apply -f deploy/kustomize/base/temporal-helm/namespace.yaml
 ```
 
 **Files:**
+
 - `deploy/kustomize/base/postgres/namespace.yaml` — creates `postgres` namespace
 - `deploy/kustomize/base/temporal-helm/namespace.yaml` — creates `temporal` namespace
 
@@ -108,7 +109,7 @@ The CA certificate is the trust anchor for the entire deployment. Every TLS cert
 
 ### Required secret shape
 
-```
+```text
 Secret name: ca-signing-secret  (type: kubernetes.io/tls)
 Namespaces:  `nico-rest`  and  `cert-manager`
 Keys:
@@ -169,7 +170,7 @@ A single-replica PostgreSQL 14 StatefulSet that hosts all databases for the NICo
 | `base/postgres/namespace.yaml` | `postgres` namespace |
 | `base/postgres/admin-creds.yaml` | Secret `admin-creds` — postgres superuser password |
 | `base/postgres/init-configmap.yaml` | ConfigMap `postgres-init` — SQL init script |
-| `base/postgres/statefulset.yaml` | StatefulSet `postgres` — `postgres:14.4-alpine`, 1Gi PVC |
+| `base/postgres/statefulset.yaml` | StatefulSet `postgres` — `postgres:14.4-alpine`, 10Gi PVC |
 | `base/postgres/service.yaml` | ClusterIP Service on port 5432 — DNS: `postgres.postgres` |
 | `base/postgres/adminer.yaml` | Optional Adminer web UI |
 
@@ -202,7 +203,7 @@ kubectl rollout status statefulset/postgres -n postgres
 
 Keycloak is the **reference OIDC identity provider** for the NICo REST API. It handles authentication and issues JWTs that the API validates on every request. It is pre-loaded with the `nico-dev` realm via an imported realm ConfigMap, which includes the `nico-api` client, realm roles, and a set of pre-seeded dev users.
 
-Users of NICo can also bring their own OpenID/OAuth JWT Provider, see [Auth docs](https://github.com/NVIDIA/infra-controller/rest-api/tree/main/auth) for more details.
+Users of NICo can also bring their own OpenID/OAuth JWT Provider, see [Auth docs](https://github.com/NVIDIA/infra-controller/tree/main/rest-api/auth) for more details.
 
 ### Manifests
 
@@ -329,7 +330,7 @@ The `common/` base provides all shared secrets and cert-manager `Certificate` re
 
 This cert-manager `Certificate` is issued by `nico-rest-ca-issuer` and stored in the secret `temporal-client-cloud-certs`. It covers the following DNS names, allowing the API and both workers to authenticate to Temporal as the same logical client identity:
 
-```
+```text
 temporal-client, nico-rest-api, cloud-worker, site-worker
 ```
 
@@ -702,7 +703,8 @@ The site agent bootstrap flow is:
 
 | Variable | Default | Description |
 |---|---|---|
-| `NICO_ADDRESS` | `nico-rest-mock-core:11079` | NICo/NICo gRPC endpoint — **set this to your Core gRPC server address in production** |
+| `CORE_GRPC_ADDRESS` | `""` (empty) | NICo Core gRPC endpoint — **set this to your Core gRPC server address in production**. Empty falls back to the binary's in-cluster default; the local kind flow injects the mock-core address via the Makefile. |
+| `CORE_GRPC_SEC_OPT` | `0` | Core gRPC security mode (`0` insecure, `1` server TLS, `2` mutual TLS) |
 | `CLUSTER_ID` | `00000000-0000-4000-8000-000000000001` | Site UUID — **must match a registered site** |
 | `TEMPORAL_HOST` | `temporal-frontend.temporal` | Temporal frontend host |
 | `TEMPORAL_PORT` | `7233` | Temporal frontend port |
@@ -724,9 +726,11 @@ The site agent bootstrap flow is:
 ### SPIFFE gRPC certificate
 
 The `certificate.yaml` resource issues a cert-manager `Certificate` with SPIFFE URI:
-```
+
+```text
 spiffe://nico.local/nico-rest/sa/nico-rest-site-agent
 ```
+
 This is the client identity the site agent presents when connecting to the NICo core gRPC API.
 
 ### Configuring a site for bootstrap
@@ -794,22 +798,26 @@ make docker-build IMAGE_REGISTRY=my-registry.example.com/nico IMAGE_TAG=v1.0.0
 ### Authenticate and push
 
 **AWS ECR:**
+
 ```bash
 aws ecr get-login-password --region us-east-1 \
   | docker login --username AWS --password-stdin 123456789.dkr.ecr.us-east-1.amazonaws.com
 ```
 
 **Google Artifact Registry:**
+
 ```bash
 gcloud auth configure-docker
 ```
 
 **Azure Container Registry:**
+
 ```bash
 az acr login --name myregistry
 ```
 
 **Push after building:**
+
 ```bash
 REGISTRY=my-registry.example.com/nico
 TAG=v1.0.0
@@ -892,7 +900,7 @@ Or run commands directly for scripting:
 nicocli --config ~/.nico/config.yaml site list
 ```
 
-See [cli/README.md](cli/README.md) for the full configuration reference and command list.
+See [cli/README.md](../cli/README.md) for the full configuration reference and command list.
 
 ### Getting an access token
 

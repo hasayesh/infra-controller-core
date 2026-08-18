@@ -15,7 +15,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/certs"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/common/grpclog"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/common/utils"
-	pb "github.com/NVIDIA/infra-controller/rest-api/flow/internal/nicoapi/gen"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -50,7 +50,7 @@ const (
 )
 
 type grpcClient struct {
-	gclient     pb.ForgeClient
+	gclient     corev1.ForgeClient
 	grpcTimeout time.Duration
 }
 
@@ -88,7 +88,7 @@ func NewClient(grpcTimeout time.Duration) (Client, error) {
 		return nil, fmt.Errorf("Unable to connect to nico-core-api: %w", err)
 	}
 
-	return &grpcClient{gclient: pb.NewForgeClient(conn), grpcTimeout: grpcTimeout}, nil
+	return &grpcClient{gclient: corev1.NewForgeClient(conn), grpcTimeout: grpcTimeout}, nil
 }
 
 // GetMachines retrieves all machines known by nico-core-api
@@ -97,12 +97,12 @@ func (c *grpcClient) GetMachines(ctx context.Context) ([]MachineDetail, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	machineIDs, err := c.gclient.FindMachineIds(ctx, &pb.MachineSearchConfig{})
+	machineIDs, err := c.gclient.FindMachineIds(ctx, &corev1.MachineSearchConfig{})
 	if err != nil {
 		return nil, err
 	}
 
-	req := &pb.MachinesByIdsRequest{}
+	req := &corev1.MachinesByIdsRequest{}
 	for _, machineID := range machineIDs.MachineIds {
 		req.MachineIds = append(req.MachineIds, machineID)
 	}
@@ -131,7 +131,7 @@ func (c *grpcClient) GetLeakingMachineIds(ctx context.Context) ([]string, error)
 
 	alert := "hardware-health.tray-leak-detection"
 	powerState := "on"
-	searchConfig := pb.MachineSearchConfig{
+	searchConfig := corev1.MachineSearchConfig{
 		OnlyWithHealthAlert: &alert,
 		OnlyWithPowerState:  &powerState,
 	}
@@ -157,7 +157,7 @@ func (c *grpcClient) GetLeakingSwitchIds(ctx context.Context) ([]string, error) 
 	defer cancel()
 
 	alert := "hardware-health.tray-leak-detection"
-	searchConfig := pb.SwitchSearchFilter{
+	searchConfig := corev1.SwitchSearchFilter{
 		OnlyWithHealthAlert: &alert,
 	}
 
@@ -178,7 +178,7 @@ func (c *grpcClient) Version(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	res, err := c.gclient.Version(ctx, &pb.VersionRequest{})
+	res, err := c.gclient.Version(ctx, &corev1.VersionRequest{})
 	if err != nil {
 		return "", err
 	}
@@ -190,7 +190,7 @@ func (c *grpcClient) GetPowerStates(ctx context.Context, machineIds []string) (r
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.PowerOptionRequest{MachineId: stringsToMachineIds(machineIds)}
+	req := &corev1.PowerOptionRequest{MachineId: stringsToMachineIds(machineIds)}
 	res, err := c.gclient.GetPowerOptions(ctx, req)
 	if err != nil {
 		return nil, err
@@ -207,7 +207,7 @@ func (c *grpcClient) SetFirmwareUpdateTimeWindow(ctx context.Context, machineIds
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.SetFirmwareUpdateTimeWindowRequest{
+	req := &corev1.SetFirmwareUpdateTimeWindowRequest{
 		MachineIds:     stringsToMachineIds(machineIds),
 		StartTimestamp: timestamppb.New(startTime),
 		EndTimestamp:   timestamppb.New(endTime),
@@ -226,7 +226,7 @@ func (c *grpcClient) AdminPowerControl(ctx context.Context, machineID string, ac
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.AdminPowerControlRequest{
+	req := &corev1.AdminPowerControlRequest{
 		MachineId: &machineID,
 		Action:    action.toPb(),
 	}
@@ -244,8 +244,8 @@ func (c *grpcClient) UpdatePowerOption(ctx context.Context, machineID string, de
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.PowerOptionUpdateRequest{
-		MachineId:  &pb.MachineId{Id: machineID},
+	req := &corev1.PowerOptionUpdateRequest{
+		MachineId:  &corev1.MachineId{Id: machineID},
 		PowerState: powerStateToPb(desiredState),
 	}
 
@@ -263,7 +263,7 @@ func (c *grpcClient) FindInterfaces(ctx context.Context) (map[string]MachineInte
 	defer cancel()
 
 	// Empty query returns all interfaces
-	req := &pb.InterfaceSearchQuery{}
+	req := &corev1.InterfaceSearchQuery{}
 	res, err := c.gclient.FindInterfaces(ctx, req)
 	if err != nil {
 		return nil, err
@@ -286,7 +286,7 @@ func (c *grpcClient) FindMachinesByIds(ctx context.Context, machineIds []string)
 		return nil, nil
 	}
 
-	req := &pb.MachinesByIdsRequest{
+	req := &corev1.MachinesByIdsRequest{
 		MachineIds: stringsToMachineIds(machineIds),
 	}
 
@@ -312,8 +312,8 @@ func (c *grpcClient) FindHostMachineIdsByRack(ctx context.Context, rackID string
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	cfg := &pb.MachineSearchConfig{
-		RackId: &pb.RackId{Id: rackID},
+	cfg := &corev1.MachineSearchConfig{
+		RackId: &corev1.RackId{Id: rackID},
 		// include_dpus defaults to false; exclude_hosts defaults to false.
 		// We want hosts only because Assigned is a host-only state.
 	}
@@ -341,11 +341,11 @@ func (c *grpcClient) FindSwitchRackIDs(ctx context.Context, switchIds []string) 
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.SwitchesByIdsRequest{
-		SwitchIds: make([]*pb.SwitchId, 0, len(switchIds)),
+	req := &corev1.SwitchesByIdsRequest{
+		SwitchIds: make([]*corev1.SwitchId, 0, len(switchIds)),
 	}
 	for _, id := range switchIds {
-		req.SwitchIds = append(req.SwitchIds, &pb.SwitchId{Id: id})
+		req.SwitchIds = append(req.SwitchIds, &corev1.SwitchId{Id: id})
 	}
 
 	resp, err := c.gclient.FindSwitchesByIds(ctx, req)
@@ -377,11 +377,11 @@ func (c *grpcClient) FindSwitchControllerStates(ctx context.Context, switchIds [
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.SwitchesByIdsRequest{
-		SwitchIds: make([]*pb.SwitchId, 0, len(switchIds)),
+	req := &corev1.SwitchesByIdsRequest{
+		SwitchIds: make([]*corev1.SwitchId, 0, len(switchIds)),
 	}
 	for _, id := range switchIds {
-		req.SwitchIds = append(req.SwitchIds, &pb.SwitchId{Id: id})
+		req.SwitchIds = append(req.SwitchIds, &corev1.SwitchId{Id: id})
 	}
 
 	resp, err := c.gclient.FindSwitchesByIds(ctx, req)
@@ -414,11 +414,11 @@ func (c *grpcClient) FindSwitchNvosIPs(ctx context.Context, switchIds []string) 
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.SwitchesByIdsRequest{
-		SwitchIds: make([]*pb.SwitchId, 0, len(switchIds)),
+	req := &corev1.SwitchesByIdsRequest{
+		SwitchIds: make([]*corev1.SwitchId, 0, len(switchIds)),
 	}
 	for _, id := range switchIds {
-		req.SwitchIds = append(req.SwitchIds, &pb.SwitchId{Id: id})
+		req.SwitchIds = append(req.SwitchIds, &corev1.SwitchId{Id: id})
 	}
 
 	resp, err := c.gclient.FindSwitchesByIds(ctx, req)
@@ -439,6 +439,77 @@ func (c *grpcClient) FindSwitchNvosIPs(ctx context.Context, switchIds []string) 
 	return result, nil
 }
 
+// GetObservedNVLinkDomainMemberships returns valid rack/domain observations
+// from a complete snapshot of Core's active switches. FindSwitchIds excludes
+// deleted switches by default; the details response must include every
+// requested switch so callers can safely reconcile omitted memberships.
+func (c *grpcClient) GetObservedNVLinkDomainMemberships(ctx context.Context) ([]NVLinkDomainMembership, error) {
+	idsCtx, idsCancel := context.WithTimeout(ctx, c.grpcTimeout)
+	idsResponse, err := c.gclient.FindSwitchIds(idsCtx, &corev1.SwitchSearchFilter{})
+	idsCancel()
+	if err != nil {
+		return nil, fmt.Errorf("FindSwitchIds for NVLink domain topology: %w", err)
+	}
+
+	switchIDs := idsResponse.GetIds()
+	if len(switchIDs) == 0 {
+		return []NVLinkDomainMembership{}, nil
+	}
+
+	detailsCtx, detailsCancel := context.WithTimeout(ctx, c.grpcTimeout)
+	defer detailsCancel()
+	detailsResponse, err := c.gclient.FindSwitchesByIds(detailsCtx, &corev1.SwitchesByIdsRequest{
+		SwitchIds: switchIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("FindSwitchesByIds for NVLink domain topology: %w", err)
+	}
+
+	return nvLinkDomainMembershipsFromSwitches(switchIDs, detailsResponse.GetSwitches())
+}
+
+func nvLinkDomainMembershipsFromSwitches(
+	switchIDs []*corev1.SwitchId,
+	switches []*corev1.Switch,
+) ([]NVLinkDomainMembership, error) {
+	requested := make(map[string]struct{}, len(switchIDs))
+	for _, id := range switchIDs {
+		value := id.GetId()
+		if value != "" {
+			requested[value] = struct{}{}
+		}
+	}
+
+	seen := make(map[string]struct{}, len(switches))
+	memberships := make([]NVLinkDomainMembership, 0, len(switches))
+	for _, sw := range switches {
+		switchID := sw.GetId().GetId()
+		if switchID == "" {
+			continue
+		}
+		seen[switchID] = struct{}{}
+
+		domainID := sw.GetNvlinkDomainUuid().GetValue()
+		rackID := sw.GetRackId().GetId()
+		if domainID == "" || rackID == "" {
+			continue
+		}
+		memberships = append(memberships, NVLinkDomainMembership{
+			DomainID: domainID,
+			RackID:   rackID,
+		})
+	}
+
+	for switchID := range requested {
+		_, ok := seen[switchID]
+		if !ok {
+			return nil, fmt.Errorf("FindSwitchesByIds omitted active switch %s", switchID)
+		}
+	}
+
+	return memberships, nil
+}
+
 // FindPowerShelfRackIDs returns the rack assignment of each given power shelf.
 func (c *grpcClient) FindPowerShelfRackIDs(ctx context.Context, shelfIds []string) (map[string]string, error) {
 	if len(shelfIds) == 0 {
@@ -448,11 +519,11 @@ func (c *grpcClient) FindPowerShelfRackIDs(ctx context.Context, shelfIds []strin
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.PowerShelvesByIdsRequest{
-		PowerShelfIds: make([]*pb.PowerShelfId, 0, len(shelfIds)),
+	req := &corev1.PowerShelvesByIdsRequest{
+		PowerShelfIds: make([]*corev1.PowerShelfId, 0, len(shelfIds)),
 	}
 	for _, id := range shelfIds {
-		req.PowerShelfIds = append(req.PowerShelfIds, &pb.PowerShelfId{Id: id})
+		req.PowerShelfIds = append(req.PowerShelfIds, &corev1.PowerShelfId{Id: id})
 	}
 
 	resp, err := c.gclient.FindPowerShelvesByIds(ctx, req)
@@ -484,11 +555,11 @@ func (c *grpcClient) FindPowerShelfControllerStates(ctx context.Context, shelfId
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.PowerShelvesByIdsRequest{
-		PowerShelfIds: make([]*pb.PowerShelfId, 0, len(shelfIds)),
+	req := &corev1.PowerShelvesByIdsRequest{
+		PowerShelfIds: make([]*corev1.PowerShelfId, 0, len(shelfIds)),
 	}
 	for _, id := range shelfIds {
-		req.PowerShelfIds = append(req.PowerShelfIds, &pb.PowerShelfId{Id: id})
+		req.PowerShelfIds = append(req.PowerShelfIds, &corev1.PowerShelfId{Id: id})
 	}
 
 	resp, err := c.gclient.FindPowerShelvesByIds(ctx, req)
@@ -518,7 +589,7 @@ func (c *grpcClient) GetMachinePositionInfo(ctx context.Context, machineIds []st
 		return nil, nil
 	}
 
-	req := &pb.MachinePositionQuery{
+	req := &corev1.MachinePositionQuery{
 		MachineIds: stringsToMachineIds(machineIds),
 	}
 
@@ -534,6 +605,46 @@ func (c *grpcClient) GetMachinePositionInfo(ctx context.Context, machineIds []st
 	return result, nil
 }
 
+// FindMachineControllerStates returns the raw state string Core reports for
+// each machine. Machines for which Core returns no state are omitted from
+// the result map.
+func (c *grpcClient) FindMachineControllerStates(ctx context.Context, machineIds []string) (map[string]string, error) {
+	if len(machineIds) == 0 {
+		return nil, nil
+	}
+
+	machines, err := c.FindMachinesByIds(ctx, machineIds)
+	if err != nil {
+		return nil, fmt.Errorf("FindMachinesByIds: %w", err)
+	}
+
+	result := make(map[string]string, len(machines))
+	for _, m := range machines {
+		if m.State != "" {
+			result[m.MachineID] = m.State
+		}
+	}
+	return result, nil
+}
+
+// DecommissionMachine initiates decommissioning of the given machine via Core.
+// TODO: Core Decommission Machine RPC pending — stub returns not-implemented.
+func (c *grpcClient) DecommissionMachine(_ context.Context, machineID string) error {
+	return fmt.Errorf("not yet implemented: Core DecommissionMachine RPC pending (machine %s)", machineID)
+}
+
+// DecommissionSwitch initiates decommissioning of the given switch via Core.
+// TODO: Core Decommission Switch RPC pending — stub returns not-implemented.
+func (c *grpcClient) DecommissionSwitch(_ context.Context, switchID string) error {
+	return fmt.Errorf("not yet implemented: Core DecommissionSwitch RPC pending (switch %s)", switchID)
+}
+
+// DecommissionPowerShelf initiates decommissioning of the given power shelf via Core.
+// TODO: Core Decommission PowerShelf RPC pending — stub returns not-implemented.
+func (c *grpcClient) DecommissionPowerShelf(_ context.Context, shelfID string) error {
+	return fmt.Errorf("not yet implemented: Core DecommissionPowerShelf RPC pending (shelf %s)", shelfID)
+}
+
 // AllowIngestionAndPowerOn opens NICo's power-on gate for a
 // BMC endpoint.
 func (c *grpcClient) AllowIngestionAndPowerOn(
@@ -544,7 +655,7 @@ func (c *grpcClient) AllowIngestionAndPowerOn(
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.BmcEndpointRequest{IpAddress: bmcIP}
+	req := &corev1.BmcEndpointRequest{IpAddress: bmcIP}
 	if bmcMAC != "" {
 		req.MacAddress = &bmcMAC
 	}
@@ -570,7 +681,7 @@ func (c *grpcClient) DetermineMachineIngestionState(
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.BmcEndpointRequest{IpAddress: bmcIP}
+	req := &corev1.BmcEndpointRequest{IpAddress: bmcIP}
 	if bmcMAC != "" {
 		req.MacAddress = &bmcMAC
 	}
@@ -595,7 +706,7 @@ func (c *grpcClient) AddExpectedMachine(ctx context.Context, req AddExpectedMach
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	pbReq := &pb.ExpectedMachine{
+	pbReq := &corev1.ExpectedMachine{
 		BmcMacAddress:       req.BMCMACAddress,
 		BmcUsername:         req.BMCUsername,
 		BmcPassword:         req.BMCPassword,
@@ -607,7 +718,7 @@ func (c *grpcClient) AddExpectedMachine(ctx context.Context, req AddExpectedMach
 	}
 
 	if req.RackID != "" {
-		pbReq.RackId = &pb.RackId{Id: req.RackID}
+		pbReq.RackId = &corev1.RackId{Id: req.RackID}
 	}
 
 	if req.PauseIngestionAndPowerOn != nil {
@@ -647,7 +758,7 @@ func (c *grpcClient) AddExpectedSwitch(ctx context.Context, req AddExpectedSwitc
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	pbReq := &pb.ExpectedSwitch{
+	pbReq := &corev1.ExpectedSwitch{
 		BmcMacAddress:      req.BMCMACAddress,
 		BmcUsername:        req.BMCUsername,
 		BmcPassword:        req.BMCPassword,
@@ -655,7 +766,7 @@ func (c *grpcClient) AddExpectedSwitch(ctx context.Context, req AddExpectedSwitc
 	}
 
 	if req.RackID != "" {
-		pbReq.RackId = &pb.RackId{Id: req.RackID}
+		pbReq.RackId = &corev1.RackId{Id: req.RackID}
 	}
 
 	if req.NVOSUsername != "" {
@@ -679,7 +790,7 @@ func (c *grpcClient) AddExpectedPowerShelf(ctx context.Context, req AddExpectedP
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	pbReq := &pb.ExpectedPowerShelf{
+	pbReq := &corev1.ExpectedPowerShelf{
 		BmcMacAddress:     req.BMCMACAddress,
 		BmcUsername:       req.BMCUsername,
 		BmcPassword:       req.BMCPassword,
@@ -688,7 +799,7 @@ func (c *grpcClient) AddExpectedPowerShelf(ctx context.Context, req AddExpectedP
 	}
 
 	if req.RackID != "" {
-		pbReq.RackId = &pb.RackId{Id: req.RackID}
+		pbReq.RackId = &corev1.RackId{Id: req.RackID}
 	}
 
 	_, err := c.gclient.AddExpectedPowerShelf(ctx, pbReq)
@@ -703,18 +814,18 @@ func (c *grpcClient) InsertHealthReportOverride(ctx context.Context, machineID s
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.InsertMachineHealthReportRequest{
-		MachineId: &pb.MachineId{Id: machineID},
-		HealthReportEntry: &pb.HealthReportEntry{
-			Report: &pb.HealthReport{
+	req := &corev1.InsertMachineHealthReportRequest{
+		MachineId: &corev1.MachineId{Id: machineID},
+		HealthReportEntry: &corev1.HealthReportEntry{
+			Report: &corev1.HealthReport{
 				Source: source,
-				Alerts: []*pb.HealthProbeAlert{{
+				Alerts: []*corev1.HealthProbeAlert{{
 					Id:              healthProbeIDMaintenance,
 					Message:         "Machine under Flow-managed maintenance",
 					Classifications: []string{classificationSuppressExternalAlerting},
 				}},
 			},
-			Mode: pb.HealthReportApplyMode_Replace,
+			Mode: corev1.HealthReportApplyMode_Replace,
 		},
 	}
 
@@ -729,8 +840,8 @@ func (c *grpcClient) RemoveHealthReportOverride(ctx context.Context, machineID s
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.RemoveMachineHealthReportRequest{
-		MachineId: &pb.MachineId{Id: machineID},
+	req := &corev1.RemoveMachineHealthReportRequest{
+		MachineId: &corev1.MachineId{Id: machineID},
 		Source:    source,
 	}
 
@@ -754,12 +865,12 @@ func (c *grpcClient) InsertHostUpdateInProgressHealthOverride(
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.InsertMachineHealthReportRequest{
-		MachineId: &pb.MachineId{Id: machineID},
-		HealthReportEntry: &pb.HealthReportEntry{
-			Report: &pb.HealthReport{
+	req := &corev1.InsertMachineHealthReportRequest{
+		MachineId: &corev1.MachineId{Id: machineID},
+		HealthReportEntry: &corev1.HealthReportEntry{
+			Report: &corev1.HealthReport{
 				Source: healthReportSourceHostUpdate,
-				Alerts: []*pb.HealthProbeAlert{{
+				Alerts: []*corev1.HealthProbeAlert{{
 					Id:      healthProbeIDHostUpdateInProgress,
 					Message: message,
 					Classifications: []string{
@@ -768,7 +879,7 @@ func (c *grpcClient) InsertHostUpdateInProgressHealthOverride(
 					},
 				}},
 			},
-			Mode: pb.HealthReportApplyMode_Replace,
+			Mode: corev1.HealthReportApplyMode_Replace,
 		},
 	}
 
@@ -792,8 +903,8 @@ func (c *grpcClient) RemoveHostUpdateInProgressHealthOverride(
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.RemoveMachineHealthReportRequest{
-		MachineId: &pb.MachineId{Id: machineID},
+	req := &corev1.RemoveMachineHealthReportRequest{
+		MachineId: &corev1.MachineId{Id: machineID},
 		Source:    healthReportSourceHostUpdate,
 	}
 
@@ -819,10 +930,10 @@ func (c *grpcClient) TriggerDpuReprovisioning(
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.DpuReprovisioningRequest{
-		MachineId:      &pb.MachineId{Id: machineID},
-		Mode:           pb.DpuReprovisioningRequest_Set,
-		Initiator:      pb.UpdateInitiator_AdminCli,
+	req := &corev1.DpuReprovisioningRequest{
+		MachineId:      &corev1.MachineId{Id: machineID},
+		Mode:           corev1.DpuReprovisioningRequest_Set,
+		Initiator:      corev1.UpdateInitiator_AdminCli,
 		UpdateFirmware: updateFirmware,
 	}
 
@@ -864,7 +975,7 @@ func (c *grpcClient) IsDpuReprovisioningPendingForHost(
 		dpuSet[id] = struct{}{}
 	}
 
-	resp, err := c.gclient.ListDpuWaitingForReprovisioning(ctx, &pb.DpuReprovisioningListRequest{})
+	resp, err := c.gclient.ListDpuWaitingForReprovisioning(ctx, &corev1.DpuReprovisioningListRequest{})
 	if err != nil {
 		return false, fmt.Errorf("failed to list DPUs waiting for reprovisioning: %w", err)
 	}
@@ -898,8 +1009,8 @@ func (c *grpcClient) findAssociatedDpuMachineIdsLocked(
 		return nil, fmt.Errorf("host machine id is required")
 	}
 
-	resp, err := c.gclient.FindMachinesByIds(ctx, &pb.MachinesByIdsRequest{
-		MachineIds: []*pb.MachineId{{Id: hostMachineID}},
+	resp, err := c.gclient.FindMachinesByIds(ctx, &corev1.MachinesByIdsRequest{
+		MachineIds: []*corev1.MachineId{{Id: hostMachineID}},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to find machine %s: %w", hostMachineID, err)
@@ -908,7 +1019,7 @@ func (c *grpcClient) findAssociatedDpuMachineIdsLocked(
 		return nil, fmt.Errorf("machine %s not found", hostMachineID)
 	}
 
-	dpus := resp.GetMachines()[0].GetAssociatedDpuMachineIds()
+	dpus := resp.GetMachines()[0].GetStatus().GetAssociatedDpuMachineIds()
 	out := make([]string, 0, len(dpus))
 	for _, id := range dpus {
 		if v := id.GetId(); v != "" {
@@ -932,7 +1043,7 @@ func (c *grpcClient) FindInstanceIdByMachineId(
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	resp, err := c.gclient.FindInstanceByMachineID(ctx, &pb.MachineId{Id: machineID})
+	resp, err := c.gclient.FindInstanceByMachineID(ctx, &corev1.MachineId{Id: machineID})
 	if err != nil {
 		return "", fmt.Errorf("failed to find instance for machine %s: %w", machineID, err)
 	}
@@ -959,9 +1070,9 @@ func (c *grpcClient) InvokeInstancePower(
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	req := &pb.InstancePowerRequest{
-		InstanceId:           &pb.InstanceId{Value: instanceID},
-		Operation:            pb.InstancePowerRequest_POWER_RESET,
+	req := &corev1.InstancePowerRequest{
+		InstanceId:           &corev1.InstanceId{Value: instanceID},
+		Operation:            corev1.InstancePowerRequest_POWER_RESET,
 		ApplyUpdatesOnReboot: applyUpdates,
 	}
 
@@ -974,31 +1085,31 @@ func (c *grpcClient) InvokeInstancePower(
 	return nil
 }
 
-func (c *grpcClient) ComponentPowerControl(ctx context.Context, req *pb.ComponentPowerControlRequest) (*pb.ComponentPowerControlResponse, error) {
+func (c *grpcClient) ComponentPowerControl(ctx context.Context, req *corev1.ComponentPowerControlRequest) (*corev1.ComponentPowerControlResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 	return c.gclient.ComponentPowerControl(ctx, req)
 }
 
-func (c *grpcClient) UpdateComponentFirmware(ctx context.Context, req *pb.UpdateComponentFirmwareRequest) (*pb.UpdateComponentFirmwareResponse, error) {
+func (c *grpcClient) UpdateComponentFirmware(ctx context.Context, req *corev1.UpdateComponentFirmwareRequest) (*corev1.UpdateComponentFirmwareResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 	return c.gclient.UpdateComponentFirmware(ctx, req)
 }
 
-func (c *grpcClient) GetComponentFirmwareStatus(ctx context.Context, req *pb.GetComponentFirmwareStatusRequest) (*pb.GetComponentFirmwareStatusResponse, error) {
+func (c *grpcClient) GetComponentFirmwareStatus(ctx context.Context, req *corev1.GetComponentFirmwareStatusRequest) (*corev1.GetComponentFirmwareStatusResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 	return c.gclient.GetComponentFirmwareStatus(ctx, req)
 }
 
-func (c *grpcClient) ListComponentFirmwareVersions(ctx context.Context, req *pb.ListComponentFirmwareVersionsRequest) (*pb.ListComponentFirmwareVersionsResponse, error) {
+func (c *grpcClient) ListComponentFirmwareVersions(ctx context.Context, req *corev1.ListComponentFirmwareVersionsRequest) (*corev1.ListComponentFirmwareVersionsResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 	return c.gclient.ListComponentFirmwareVersions(ctx, req)
 }
 
-func (c *grpcClient) GetComponentInventory(ctx context.Context, req *pb.GetComponentInventoryRequest) (*pb.GetComponentInventoryResponse, error) {
+func (c *grpcClient) GetComponentInventory(ctx context.Context, req *corev1.GetComponentInventoryRequest) (*corev1.GetComponentInventoryResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 	return c.gclient.GetComponentInventory(ctx, req)
@@ -1112,18 +1223,18 @@ func (c *grpcClient) GetAllExpectedPowerShelfDetails(ctx context.Context) ([]Exp
 	return results, nil
 }
 
-func (c *grpcClient) GetDesiredFirmwareVersions(ctx context.Context) ([]*pb.DesiredFirmwareVersionEntry, error) {
+func (c *grpcClient) GetDesiredFirmwareVersions(ctx context.Context) ([]*corev1.DesiredFirmwareVersionEntry, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	resp, err := c.gclient.GetDesiredFirmwareVersions(ctx, &pb.GetDesiredFirmwareVersionsRequest{})
+	resp, err := c.gclient.GetDesiredFirmwareVersions(ctx, &corev1.GetDesiredFirmwareVersionsRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get desired firmware versions: %w", err)
 	}
 	return resp.GetEntries(), nil
 }
 
-func (c *grpcClient) FindExploredEndpointsByIds(ctx context.Context, bmcIPs []string) ([]*pb.ExploredEndpoint, error) {
+func (c *grpcClient) FindExploredEndpointsByIds(ctx context.Context, bmcIPs []string) ([]*corev1.ExploredEndpoint, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
@@ -1131,7 +1242,7 @@ func (c *grpcClient) FindExploredEndpointsByIds(ctx context.Context, bmcIPs []st
 		return nil, nil
 	}
 
-	resp, err := c.gclient.FindExploredEndpointsByIds(ctx, &pb.ExploredEndpointsByIdsRequest{
+	resp, err := c.gclient.FindExploredEndpointsByIds(ctx, &corev1.ExploredEndpointsByIdsRequest{
 		EndpointIds: bmcIPs,
 	})
 	if err != nil {
@@ -1144,13 +1255,13 @@ func (c *grpcClient) SetMachineAutoUpdate(ctx context.Context, machineID string,
 	ctx, cancel := context.WithTimeout(ctx, c.grpcTimeout)
 	defer cancel()
 
-	action := pb.MachineSetAutoUpdateRequest_Enable
+	action := corev1.MachineSetAutoUpdateRequest_Enable
 	if !enable {
-		action = pb.MachineSetAutoUpdateRequest_Disable
+		action = corev1.MachineSetAutoUpdateRequest_Disable
 	}
 
-	_, err := c.gclient.MachineSetAutoUpdate(ctx, &pb.MachineSetAutoUpdateRequest{
-		MachineId: &pb.MachineId{Id: machineID},
+	_, err := c.gclient.MachineSetAutoUpdate(ctx, &corev1.MachineSetAutoUpdateRequest{
+		MachineId: &corev1.MachineId{Id: machineID},
 		Action:    action,
 	})
 	if err != nil {
@@ -1215,6 +1326,10 @@ func (c *grpcClient) SetRackHostMachineIDs(rackID string, machineIDs []string) {
 	panic("Not a unit test")
 }
 
+func (c *grpcClient) SetObservedNVLinkDomainMemberships(memberships []NVLinkDomainMembership) {
+	panic("Not a unit test")
+}
+
 func (c *grpcClient) AddExpectedRackDetail(detail ExpectedRackDetail) {
 	panic("Not a unit test")
 }
@@ -1264,5 +1379,21 @@ func (c *grpcClient) InstancePowerCalls() []InstancePowerCall {
 }
 
 func (c *grpcClient) HostUpdateOverridesActive() map[string]string {
+	panic("Not a unit test")
+}
+
+func (c *grpcClient) SetMachineControllerState(machineID, state string) {
+	panic("Not a unit test")
+}
+
+func (c *grpcClient) SetDecommissionMachineError(err error) {
+	panic("Not a unit test")
+}
+
+func (c *grpcClient) SetDecommissionSwitchError(err error) {
+	panic("Not a unit test")
+}
+
+func (c *grpcClient) SetDecommissionPowerShelfError(err error) {
 	panic("Not a unit test")
 }

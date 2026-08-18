@@ -26,7 +26,7 @@ use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 use crate::{async_write, async_write_table_as_csv};
 
-pub async fn status(
+pub(super) async fn status(
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     output_format: OutputFormat,
     api_client: &ApiClient,
@@ -45,6 +45,7 @@ struct DpuStatus {
 }
 
 impl From<Machine> for DpuStatus {
+    #[allow(deprecated)]
     fn from(machine: Machine) -> Self {
         let state = match machine.state.split_once(' ') {
             Some((state, _)) => state.to_owned(),
@@ -105,7 +106,8 @@ impl From<DpuStatus> for Row {
     }
 }
 
-pub fn get_dpu_version_status(build_info: &BuildInfo, machine: &Machine) -> String {
+#[allow(deprecated)]
+fn get_dpu_version_status(build_info: &BuildInfo, machine: &Machine) -> String {
     let mut version_statuses = Vec::default();
 
     let Some(runtime_config) = build_info.runtime_config.as_ref() else {
@@ -162,7 +164,7 @@ pub fn get_dpu_version_status(build_info: &BuildInfo, machine: &Machine) -> Stri
     }
 }
 
-pub async fn handle_dpu_status(
+async fn handle_dpu_status(
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     output_format: OutputFormat,
     api_client: &ApiClient,
@@ -183,7 +185,7 @@ pub async fn handle_dpu_status(
     match output_format {
         OutputFormat::Json => {
             let machines: Vec<DpuStatus> = generate_dpu_status_data(api_client, dpus).await?;
-            async_write!(output_file, "{}", serde_json::to_string(&machines).unwrap())?;
+            async_write!(output_file, "{}", serde_json::to_string(&machines)?)?;
         }
         OutputFormat::Csv => {
             let result = generate_dpu_status_table(api_client, dpus).await?;
@@ -213,7 +215,7 @@ async fn generate_dpu_status_data(
     Ok(dpu_status)
 }
 
-pub async fn generate_dpu_status_table(
+async fn generate_dpu_status_table(
     api_client: &ApiClient,
     machines: Vec<Machine>,
 ) -> CarbideCliResult<Box<Table>> {

@@ -108,8 +108,8 @@ Because there is no Redfish task to poll, NICo monitors the network install indi
 During normal ingestion no manual action is required. Operators can monitor the state with:
 
 ```bash
-nico-admin-cli -c <api-url> managed-host show --all
-nico-admin-cli -c <api-url> managed-host show <machine-id>
+nico-admin-cli -a <api-url> managed-host show --all
+nico-admin-cli -a <api-url> managed-host show <machine-id>
 ```
 
 For Redfish BFB installs, the handler outcome reports install percentage. For UEFI HTTP Boot installs, the handler outcome reports DPU discovery and reboot status.
@@ -164,8 +164,24 @@ A DPU update is treated as a host-level maintenance event because the host and i
 Operators can inspect DPU firmware status with:
 
 ```bash
-nico-admin-cli -c <api-url> dpu versions
+nico-admin-cli -a <api-url> dpu versions
 ```
+
+### Auditing NIC Firmware Across the Site
+
+A BlueField operating in NIC mode runs with its Arm OS down, so it cannot report its own NIC firmware and never appears in the `dpu versions` inventory. Site exploration already captures each host BMC's Redfish PCIe inventory, and `site-explorer mlx-devices` reports every BlueField and SuperNIC from that view - part number, serial, NIC firmware, and the mode the device's own BMC reports - so cards in NIC mode stay visible to firmware audits:
+
+```bash
+nico-admin-cli -a <api-url> site-explorer mlx-devices
+```
+
+You can filter to devices operating as NICs whose firmware is below a desired version:
+
+```bash
+nico-admin-cli -a <api-url> site-explorer mlx-devices --nic-mode-only --expected-version 32.42.1000
+```
+
+`--host <bmc-ip>` restricts the report to one host BMC. The report's `DPU BMC IP` column gives the address to target for an upgrade; a device whose DPU BMC has not been explored yet still appears, without the mode and DPU BMC fields. Refer to the [mlx-devices CLI reference](../manuals/nico-admin-cli/commands/site-explorer/site-explorer-mlx-devices.md) for the full flag and output list.
 
 ## Containerized Cumulus and NVUE
 
@@ -216,8 +232,8 @@ NICo uses DPU health to gate state transitions and allocation:
 When a DPU becomes unhealthy, inspect the managed host state and DPU health report:
 
 ```bash
-nico-admin-cli -c <api-url> managed-host show <machine-id>
-nico-admin-cli -c <api-url> machine network status
+nico-admin-cli -a <api-url> managed-host show <machine-id>
+nico-admin-cli -a <api-url> machine network status
 ```
 
 Key fields to check in the output:
@@ -252,18 +268,42 @@ Automatic DPU reprovisioning is triggered when Machine Update Manager selects an
 The API requires a `HostUpdateInProgress` health alert on the host before it accepts a reprovisioning request. Use `--update-message` to apply this alert:
 
 ```bash
-nico-admin-cli -c <api-url> dpu reprovision set \
+nico-admin-cli -a <api-url> dpu reprovision set \
   --id <host-or-dpu-machine-id> \
   --update-message "<maintenance-reference>"
 ```
 
 Firmware is always verified and updated during reprovisioning regardless of whether `--update-firmware` is passed. The `--update-firmware` flag is accepted but deprecated.
 
+REST callers must create the same health precondition before starting reprovisioning:
+
+```bash
+curl -X PUT "${BASE_URL}/v2/org/${ORG}/nico/machine/${MACHINE_ID}/health-report" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source": "maintenance.dpu-reprovision",
+    "mode": "Merge",
+    "alerts": [{
+      "id": "HostUpdateInProgress",
+      "message": "DPU reprovisioning in progress",
+      "classifications": ["PreventAllocations"]
+    }]
+  }'
+
+curl -X PATCH "${BASE_URL}/v2/org/${ORG}/nico/machine/${MACHINE_ID}/dpu/reprovision" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"Set"}'
+```
+
+Use `Set` mode in the PATCH operation to start reprovisioning and `Clear` to remove a pending request. `Restart` mode accepts a host ID only, and restarts DPUs that already have a reprovisioning request. If an Instance is attached to the Machine, also pass `"acknowledgeAttachedInstance": true`. The REST `updateFirmware` field is accepted for compatibility, but firmware is always verified and updated during reprovisioning.
+
 ### Monitoring Reprovisioning Progress
 
 ```bash
-nico-admin-cli -c <api-url> dpu reprovision list
-nico-admin-cli -c <api-url> managed-host show <machine-id>
+nico-admin-cli -a <api-url> dpu reprovision list
+nico-admin-cli -a <api-url> managed-host show <machine-id>
 ```
 
 The `managed-host show` output displays the current reprovisioning substate, percent complete for BFB installation (when available), and any handler errors.
@@ -273,13 +313,13 @@ The `managed-host show` output displays the current reprovisioning substate, per
 To restart a DPU reprovisioning flow for all DPUs on a host:
 
 ```bash
-nico-admin-cli -c <api-url> dpu reprovision restart --id <host-machine-id>
+nico-admin-cli -a <api-url> dpu reprovision restart --id <host-machine-id>
 ```
 
 To clear a pending reprovisioning request that has not started:
 
 ```bash
-nico-admin-cli -c <api-url> dpu reprovision clear --id <host-or-dpu-machine-id>
+nico-admin-cli -a <api-url> dpu reprovision clear --id <host-or-dpu-machine-id>
 ```
 
 For the complete reprovisioning state machine, see [DPU Reprovision State Details](../architecture/state_machines/managedhost.md#dpu-reprovision-state-details-dpureprovisionstate).

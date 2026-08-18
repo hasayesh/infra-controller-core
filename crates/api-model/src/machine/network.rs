@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Duration, Utc};
@@ -146,7 +146,9 @@ impl MachineNetworkStatusObservation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedHostNetworkConfig {
     pub loopback_ip: Option<IpAddr>,
-    pub secondary_overlay_vtep_ip: Option<IpAddr>,
+    /// IPv6 loopback reserved for the FNN underlay. `None` keeps the existing
+    /// IPv4-only behavior for sites without `lo-ip-v6`.
+    pub loopback_ip_v6: Option<Ipv6Addr>,
     /// This is a host-level field of the "consolidated" network
     /// config served to all [DPU] agents within host machine group.
     /// This is set in the config for the host-specific row in the
@@ -154,6 +156,7 @@ pub struct ManagedHostNetworkConfig {
     /// merging in DPU-specific configs.
     pub use_admin_network: Option<bool>,
     pub quarantine_state: Option<ManagedHostQuarantineState>,
+    pub use_admin_network_changed: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,9 +192,10 @@ impl Default for ManagedHostNetworkConfig {
     fn default() -> Self {
         ManagedHostNetworkConfig {
             loopback_ip: None,
-            secondary_overlay_vtep_ip: None,
+            loopback_ip_v6: None,
             use_admin_network: Some(true),
             quarantine_state: None,
+            use_admin_network_changed: None,
         }
     }
 }
@@ -203,10 +207,16 @@ mod tests {
 
     use carbide_test_support::Outcome::*;
     use carbide_test_support::{Check, scenarios, value_scenarios};
+    use carbide_uuid::extension_service::ExtensionServiceId;
     use chrono::TimeZone;
     use config_version::ConfigVersion;
 
     use super::*;
+    use crate::extension_service::ExtensionServiceType;
+    use crate::instance::status::extension_service::{
+        ExtensionServiceDeploymentStatus, ExtensionServiceStatusObservation,
+    };
+    use crate::test_support::machine_snapshot::config_version;
 
     // A stable MachineId for status observations; `any_observed_version_changed`
     // never inspects it, so any valid id does.
@@ -217,12 +227,6 @@ mod tests {
     // A fixed timestamp so observations built in tests compare deterministically.
     fn observed_at() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
-    }
-
-    // ConfigVersion built from its string form so the timestamp is deterministic
-    // (ConfigVersion::new() stamps `now()`, which makes two calls unequal).
-    fn config_version(version_nr: u64) -> ConfigVersion {
-        ConfigVersion::from_str(&format!("V{version_nr}-T1000000")).unwrap()
     }
 
     // A MachineNetworkStatusObservation carrying only the fields
@@ -258,22 +262,31 @@ mod tests {
     }
 
     fn extension_observation(
-        config_version: ConfigVersion,
+        observation_config_version: ConfigVersion,
         instance_config_version: Option<ConfigVersion>,
     ) -> InstanceExtensionServiceStatusObservation {
         InstanceExtensionServiceStatusObservation {
-            config_version,
+            config_version: observation_config_version,
             instance_config_version,
-            extension_service_statuses: Vec::new(),
+            extension_service_statuses: vec![ExtensionServiceStatusObservation {
+                service_id: ExtensionServiceId::from_str("00000000-0000-0000-0000-000000000000")
+                    .unwrap(),
+                service_type: ExtensionServiceType::KubernetesPod,
+                service_name: "test-service".to_string(),
+                version: config_version(1),
+                removed: None,
+                overall_state: ExtensionServiceDeploymentStatus::Running,
+                components: vec![],
+                message: String::new(),
+            }],
             observed_at: observed_at(),
         }
     }
 
     // JSON round-trips: serialize a config to JSON and deserialize it back; the
-    // config must survive intact. Covers the IPv4 case (existing Postgres JSON
-    // still deserializes after Ipv4Addr -> IpAddr) and the IPv6 case (new v6
-    // pools). The error type (serde_json::Error) is not PartialEq, so failing
-    // rows would use `Fails`; all rows here round-trip cleanly.
+    // config must survive intact. The error type (serde_json::Error) is not
+    // PartialEq, so failing rows would use `Fails`; all rows here round-trip
+    // cleanly.
     #[test]
     fn test_managed_host_network_config_json_roundtrip() {
         scenarios!(
@@ -284,50 +297,70 @@ mod tests {
             "ipv4 round-trip" {
                 ManagedHostNetworkConfig {
                     loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                    secondary_overlay_vtep_ip: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5))),
+                    loopback_ip_v6: None,
                     use_admin_network: Some(true),
                     quarantine_state: None,
+                    use_admin_network_changed: None,
                 } => Yields(ManagedHostNetworkConfig {
                     loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                    secondary_overlay_vtep_ip: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5))),
+                    loopback_ip_v6: None,
                     use_admin_network: Some(true),
                     quarantine_state: None,
+                    use_admin_network_changed: None,
                 }),
             }
 
-            "ipv6 round-trip" {
+            "generic IPv6 addresses round-trip" {
                 ManagedHostNetworkConfig {
                     loopback_ip: Some(IpAddr::V6(Ipv6Addr::new(
                         0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
                     ))),
-                    secondary_overlay_vtep_ip: Some(IpAddr::V6(Ipv6Addr::new(
-                        0xfd00, 0, 0, 0, 0, 0, 0, 0x42,
-                    ))),
+                    loopback_ip_v6: None,
                     use_admin_network: Some(false),
                     quarantine_state: None,
+                    use_admin_network_changed: None,
                 } => Yields(ManagedHostNetworkConfig {
                     loopback_ip: Some(IpAddr::V6(Ipv6Addr::new(
                         0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
                     ))),
-                    secondary_overlay_vtep_ip: Some(IpAddr::V6(Ipv6Addr::new(
-                        0xfd00, 0, 0, 0, 0, 0, 0, 0x42,
-                    ))),
+                    loopback_ip_v6: None,
                     use_admin_network: Some(false),
                     quarantine_state: None,
+                    use_admin_network_changed: None,
+                }),
+            }
+
+            "dedicated IPv6 loopback round-trip" {
+                ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: Some(Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                    )),
+                    use_admin_network: Some(false),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                } => Yields(ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: Some(Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                    )),
+                    use_admin_network: Some(false),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
                 }),
             }
         );
     }
 
-    // Deserialize raw JSON (as it would already exist in the database) into the
-    // IpAddr-typed config, projecting to the (loopback_ip, secondary_overlay_vtep_ip)
-    // pair the original tests asserted. Covers legacy IPv4 JSON and IPv6 JSON.
+    // `loopback_ip_v6` is optional in persisted machine JSON, so rows written
+    // before this field existed keep loading it as `None`. Once populated, the
+    // `Ipv6Addr` type rejects an IPv4 value before it can reach FNN rendering.
     #[test]
     fn test_managed_host_network_config_deserialize_json() {
         scenarios!(
             run = |json| {
                 serde_json::from_str::<ManagedHostNetworkConfig>(json)
-                    .map(|c| (c.loopback_ip, c.secondary_overlay_vtep_ip))
+                    .map(|c| (c.loopback_ip, c.loopback_ip_v6))
                     .map_err(drop)
             };
             "legacy ipv4 json" {
@@ -336,22 +369,37 @@ mod tests {
                             "secondary_overlay_vtep_ip": "172.16.0.5",
                             "use_admin_network": true,
                             "quarantine_state": null
-                        }"# => Yields((
+                }"# => Yields((
                     Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                    Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5))),
+                    None,
                 )),
             }
 
-            "ipv6 json" {
+            "generic IPv6 address json" {
                 r#"{
                             "loopback_ip": "2001:db8::1",
-                            "secondary_overlay_vtep_ip": null,
                             "use_admin_network": true,
                             "quarantine_state": null
-                        }"# => Yields((
+                }"# => Yields((
                     Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
                     None,
                 )),
+            }
+
+            "dedicated IPv6 loopback json" {
+                r#"{
+                            "loopback_ip": "10.0.0.1",
+                            "loopback_ip_v6": "2001:db8::1",
+                            "use_admin_network": true,
+                            "quarantine_state": null
+                }"# => Yields((
+                    Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                )),
+            }
+
+            "IPv4 rejected for dedicated IPv6 loopback" {
+                r#"{"loopback_ip_v6": "192.0.2.1"}"# => Fails,
             }
         );
     }
@@ -364,13 +412,15 @@ mod tests {
     fn test_managed_host_network_config_ipv4_json_format_unchanged() {
         let config = ManagedHostNetworkConfig {
             loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-            secondary_overlay_vtep_ip: None,
+            loopback_ip_v6: None,
             use_admin_network: Some(true),
             quarantine_state: None,
+            use_admin_network_changed: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         // Ensure IpAddr serializes IPv4 same as Ipv4Addr.
         assert!(json.contains(r#""loopback_ip":"10.0.0.1""#), "json: {json}");
+        assert!(!json.contains("secondary_overlay_vtep_ip"), "json: {json}");
     }
 
     // Ensure default ManagedHostNetworkConfig is still all-None/Some(true),
@@ -381,20 +431,22 @@ mod tests {
     #[test]
     fn test_managed_host_network_config_default() {
         let default = ManagedHostNetworkConfig::default();
+        assert_eq!(default.loopback_ip_v6, None);
+
         value_scenarios!(
             run = |ip| ip;
             "loopback_ip defaults to None" {
                 default.loopback_ip => None,
-            }
-
-            "secondary_overlay_vtep_ip defaults to None" {
-                default.secondary_overlay_vtep_ip => None,
             }
         );
         value_scenarios!(
             run = |flag| flag;
             "use_admin_network defaults to Some(true)" {
                 default.use_admin_network => Some(true),
+            }
+
+            "use_admin_network_changed defaults to None" {
+                default.use_admin_network_changed => None,
             }
         );
         Check {
@@ -566,6 +618,21 @@ mod tests {
                     network_status(Some(v1), None, Some(extension_observation(v1, Some(v2)))),
                 ) => true,
             }
+
+            "extension observation service version differs -> changed" {
+                (
+                    network_status(Some(v1), None, Some(extension_observation(v1, None))),
+                    network_status(
+                        Some(v1),
+                        None,
+                        Some({
+                            let mut observation = extension_observation(v1, None);
+                            observation.extension_service_statuses[0].version = v2;
+                            observation
+                        }),
+                    ),
+                ) => true,
+            }
         );
     }
 
@@ -580,7 +647,6 @@ mod tests {
             "well-formed with quarantine state" {
                 r#"{
                             "loopback_ip": "10.0.0.1",
-                            "secondary_overlay_vtep_ip": null,
                             "use_admin_network": false,
                             "quarantine_state": {
                                 "reason": "noisy",
@@ -588,21 +654,23 @@ mod tests {
                             }
                         }"# => Yields(ManagedHostNetworkConfig {
                     loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                    secondary_overlay_vtep_ip: None,
+                    loopback_ip_v6: None,
                     use_admin_network: Some(false),
                     quarantine_state: Some(ManagedHostQuarantineState {
                         reason: Some("noisy".to_string()),
                         mode: ManagedHostQuarantineMode::BlockAllTraffic,
                     }),
+                    use_admin_network_changed: None,
                 }),
             }
 
             "empty object defaults all optional fields" {
                 "{}" => Yields(ManagedHostNetworkConfig {
                     loopback_ip: None,
-                    secondary_overlay_vtep_ip: None,
+                    loopback_ip_v6: None,
                     use_admin_network: None,
                     quarantine_state: None,
+                    use_admin_network_changed: None,
                 }),
             }
 
@@ -647,20 +715,22 @@ mod tests {
             "quarantine state round-trips" {
                 ManagedHostNetworkConfig {
                     loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                    secondary_overlay_vtep_ip: None,
+                    loopback_ip_v6: None,
                     use_admin_network: Some(true),
                     quarantine_state: Some(ManagedHostQuarantineState {
                         reason: Some("flooded".to_string()),
                         mode: ManagedHostQuarantineMode::BlockAllTraffic,
                     }),
+                    use_admin_network_changed: None,
                 } => Yields(ManagedHostNetworkConfig {
                     loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                    secondary_overlay_vtep_ip: None,
+                    loopback_ip_v6: None,
                     use_admin_network: Some(true),
                     quarantine_state: Some(ManagedHostQuarantineState {
                         reason: Some("flooded".to_string()),
                         mode: ManagedHostQuarantineMode::BlockAllTraffic,
                     }),
+                    use_admin_network_changed: None,
                 }),
             }
         );

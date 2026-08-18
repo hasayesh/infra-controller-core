@@ -30,7 +30,7 @@ use crate::CarbideResult;
 use crate::tests::common;
 use crate::tests::common::api_fixtures::dpu::create_dpu_machine_in_waiting_for_network_install;
 
-pub async fn update_nic_firmware_version(
+pub(in crate::tests) async fn update_nic_firmware_version(
     txn: &mut PgConnection,
     machine_id: &MachineId,
     version: &str,
@@ -80,7 +80,9 @@ async fn create_machines(
     .expect("Failed to load snapshots")
 }
 
-pub async fn get_all_snapshots(test_env: &TestEnv) -> HashMap<MachineId, ManagedHostStateSnapshot> {
+pub(in crate::tests) async fn get_all_snapshots(
+    test_env: &TestEnv,
+) -> HashMap<MachineId, ManagedHostStateSnapshot> {
     let mut txn = test_env.pool.begin().await.unwrap();
     let machine_ids = db::machine::find_machine_ids(
         txn.as_mut(),
@@ -324,6 +326,7 @@ async fn test_find_available_outdated_dpus_multidpu_one_under_reprov(
             host_machine_id: mh.host().id,
             dpu_machine_id: mh.dpu_n(0).id,
             firmware_version: "test_version".to_string(),
+            dpf_managed: false,
         }],
     )
     .await
@@ -382,11 +385,13 @@ async fn test_find_available_outdated_dpus_multidpu_both_under_reprov(
                 host_machine_id: mh.host().id,
                 dpu_machine_id: all_dpus[1].id,
                 firmware_version: "test_version".to_string(),
+                dpf_managed: false,
             },
             DpuMachineUpdate {
                 host_machine_id: mh.host().id,
                 dpu_machine_id: all_dpus[0].id,
                 firmware_version: "test_version".to_string(),
+                dpf_managed: false,
             },
         ],
     )

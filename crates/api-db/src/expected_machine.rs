@@ -88,15 +88,17 @@ pub async fn find_many_by_bmc_mac_address(
         .collect()
 }
 
-// the expected machines table needs host mac addresses to control dhcp vending of ip's
-// since the carbide dhcp server in some cases is not authoritative on a large network.
-// search in the host_nics field before vending an ip.
-pub async fn find_by_host_mac_address(
+/// Find the ExpectedMachine that declares an interface MAC.
+///
+/// DHCP uses this lookup when NICo is not authoritative for every address on
+/// the surrounding network. The SQL keeps the physical `host_nics` column so
+/// existing databases need no migration for the model rename.
+pub async fn find_by_interface_mac_address(
     txn: &mut PgConnection,
-    host_mac_address: MacAddress,
+    interface_mac_address: MacAddress,
 ) -> DatabaseResult<Option<ExpectedMachine>> {
     let query = "SELECT * FROM expected_machines WHERE host_nics @> $1::jsonb";
-    let mac_address = serde_json::json!([{ "mac_address": host_mac_address.to_string() }]);
+    let mac_address = serde_json::json!([{ "mac_address": interface_mac_address.to_string() }]);
     sqlx::query_as(query)
         .bind(sqlx::types::Json(mac_address))
         .fetch_optional(txn)
@@ -136,6 +138,27 @@ pub async fn find_all(txn: impl DbReader<'_>) -> DatabaseResult<Vec<ExpectedMach
         .fetch_all(txn)
         .await
         .map_err(|err| DatabaseError::query(sql, err))
+}
+
+/// Lock expected-machine writes and return the inventory being replaced.
+///
+/// Older clients omit interface fields they do not know about. Replace-all
+/// reads those values before clearing the table, so the read must exclude
+/// concurrent inserts, updates, and deletes until the replacement transaction
+/// commits. Replace-all is rare, so a table-level writer lock keeps the complete
+/// inventory operation easy to reason about.
+pub async fn find_all_for_replace(txn: &mut PgConnection) -> DatabaseResult<Vec<ExpectedMachine>> {
+    let lock = "LOCK TABLE expected_machines IN SHARE ROW EXCLUSIVE MODE";
+    sqlx::query(lock)
+        .execute(&mut *txn)
+        .await
+        .map_err(|error| DatabaseError::query(lock, error))?;
+
+    let query = "SELECT * FROM expected_machines ORDER BY id";
+    sqlx::query_as(query)
+        .fetch_all(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))
 }
 
 /// find_all_by_rack_id returns all expected machines for a given rack_id.
@@ -263,9 +286,9 @@ pub async fn create(
 ) -> DatabaseResult<ExpectedMachine> {
     let id = machine.id.unwrap_or_else(Uuid::new_v4);
     let query = "INSERT INTO expected_machines
-            (id, bmc_mac_address, bmc_username, bmc_password, serial_number, fallback_dpu_serial_numbers, metadata_name, metadata_description, metadata_labels, sku_id, host_nics, rack_id, default_pause_ingestion_and_poweron, dpf_enabled, bmc_ip_address, bmc_retain_credentials, dpu_mode, host_lifecycle_profile)
+            (id, bmc_mac_address, bmc_username, bmc_password, serial_number, fallback_dpu_serial_numbers, metadata_name, metadata_description, metadata_labels, sku_id, host_nics, rack_id, default_pause_ingestion_and_poweron, dpf_enabled, bmc_ip_address, bmc_retain_credentials, dpu_mode, bmc_ip_allocation, host_lifecycle_profile)
             VALUES
-            ($1::uuid, $2::macaddr, $3::varchar, $4::varchar, $5::varchar, $6::text[], $7, $8, $9::jsonb, $10::varchar, $11::jsonb, $12, $13, $14, $15::inet, $16, $17, $18::jsonb) RETURNING *";
+            ($1::uuid, $2::macaddr, $3::varchar, $4::varchar, $5::varchar, $6::text[], $7, $8, $9::jsonb, $10::varchar, $11::jsonb, $12, $13, $14, $15::inet, $16, $17, $18, $19::jsonb) RETURNING *";
 
     sqlx::query_as(query)
         .bind(id)
@@ -278,7 +301,7 @@ pub async fn create(
         .bind(&machine.data.metadata.description)
         .bind(sqlx::types::Json(&machine.data.metadata.labels))
         .bind(&machine.data.sku_id)
-        .bind(sqlx::types::Json(&machine.data.host_nics))
+        .bind(sqlx::types::Json(&machine.data.interfaces))
         .bind(&machine.data.rack_id)
         .bind(
             machine
@@ -289,7 +312,8 @@ pub async fn create(
         .bind(machine.data.dpf_enabled.unwrap_or(true))
         .bind(machine.data.bmc_ip_address)
         .bind(machine.data.bmc_retain_credentials.unwrap_or(false))
-        .bind(machine.data.dpu_mode)
+        .bind(machine.data.dpu_policy)
+        .bind(machine.data.bmc_ip_allocation)
         .bind(sqlx::types::Json(&machine.data.host_lifecycle_profile))
         .fetch_one(txn)
         .await
@@ -314,6 +338,58 @@ pub async fn find(
         Err(DatabaseError::InvalidArgument(
             "either id or bmc_mac_address must be provided".into(),
         ))
+    }
+}
+
+/// Returns the selected expected machine while locking it for the current
+/// transaction.
+///
+/// Acquire the table lock an eventual update needs before taking the row lock.
+/// Replace-all takes a stronger writer lock, so this order prevents each path
+/// from holding one lock while waiting to upgrade to the other.
+pub async fn find_for_update(
+    txn: &mut PgConnection,
+    req: &ExpectedMachineRequest,
+) -> DatabaseResult<Option<ExpectedMachine>> {
+    // Resolve the selector before taking a table lock so an invalid request
+    // cannot delay a real writer.
+    enum Selector {
+        Id(Uuid),
+        BmcMacAddress(MacAddress),
+    }
+    let selector = if let Some(id) = req.id {
+        Selector::Id(id)
+    } else if let Some(mac_address) = req.bmc_mac_address {
+        Selector::BmcMacAddress(mac_address)
+    } else {
+        return Err(DatabaseError::InvalidArgument(
+            "either id or bmc_mac_address must be provided".into(),
+        ));
+    };
+
+    let lock = "LOCK TABLE expected_machines IN ROW EXCLUSIVE MODE";
+    sqlx::query(lock)
+        .execute(&mut *txn)
+        .await
+        .map_err(|error| DatabaseError::query(lock, error))?;
+
+    match selector {
+        Selector::Id(id) => {
+            let query = "SELECT * FROM expected_machines WHERE id=$1 FOR UPDATE";
+            sqlx::query_as(query)
+                .bind(id)
+                .fetch_optional(txn)
+                .await
+                .map_err(|err| DatabaseError::query(query, err))
+        }
+        Selector::BmcMacAddress(mac_address) => {
+            let query = "SELECT * FROM expected_machines WHERE bmc_mac_address=$1 FOR UPDATE";
+            sqlx::query_as(query)
+                .bind(mac_address)
+                .fetch_optional(txn)
+                .await
+                .map_err(|err| DatabaseError::query(query, err))
+        }
     }
 }
 
@@ -397,7 +473,8 @@ pub async fn update(txn: &mut PgConnection, machine: &ExpectedMachine) -> Databa
                      bmc_ip_address=$13, \
                      bmc_retain_credentials=COALESCE($14, bmc_retain_credentials), \
                      dpu_mode=$15, \
-                     host_lifecycle_profile=COALESCE($16, host_lifecycle_profile) \
+                     bmc_ip_allocation=$16, \
+                     host_lifecycle_profile=COALESCE($17, host_lifecycle_profile) \
                  WHERE ",
                 $where_clause,
             )
@@ -406,11 +483,11 @@ pub async fn update(txn: &mut PgConnection, machine: &ExpectedMachine) -> Databa
 
     let (query, target_id) = match machine.id {
         Some(id) => (
-            update_expected_machine_query!("id=$17::uuid"),
+            update_expected_machine_query!("id=$18::uuid"),
             id.to_string(),
         ),
         None => (
-            update_expected_machine_query!("bmc_mac_address=$17::macaddr"),
+            update_expected_machine_query!("bmc_mac_address=$18::macaddr"),
             machine.bmc_mac_address.to_string(),
         ),
     };
@@ -424,13 +501,14 @@ pub async fn update(txn: &mut PgConnection, machine: &ExpectedMachine) -> Databa
         .bind(&machine.data.metadata.description)
         .bind(sqlx::types::Json(&machine.data.metadata.labels))
         .bind(&machine.data.sku_id)
-        .bind(sqlx::types::Json(&machine.data.host_nics))
+        .bind(sqlx::types::Json(&machine.data.interfaces))
         .bind(&machine.data.rack_id)
         .bind(machine.data.default_pause_ingestion_and_poweron)
         .bind(machine.data.dpf_enabled)
         .bind(machine.data.bmc_ip_address)
         .bind(machine.data.bmc_retain_credentials)
-        .bind(machine.data.dpu_mode)
+        .bind(machine.data.dpu_policy)
+        .bind(machine.data.bmc_ip_allocation)
         .bind(
             (!machine.data.host_lifecycle_profile.is_empty())
                 .then_some(sqlx::types::Json(&machine.data.host_lifecycle_profile)),

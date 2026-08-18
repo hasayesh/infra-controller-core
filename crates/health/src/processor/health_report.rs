@@ -102,7 +102,7 @@ impl HealthReportProcessor {
             return SensorHealth::Fatal;
         }
 
-        if let Some(lower_fatal) = health.range_min
+        if let Some(lower_fatal) = health.lower_fatal
             && reading <= lower_fatal
         {
             return SensorHealth::Fatal;
@@ -261,7 +261,7 @@ mod tests {
     use nv_redfish::resource::Health as BmcHealth;
 
     use super::*;
-    use crate::endpoint::{BmcAddr, EndpointMetadata, MachineData};
+    use crate::endpoint::{BmcAddr, EndpointMetadata, MachineData, SharedSystemUuid};
     use crate::sink::HealthReportTarget;
 
     fn test_context() -> EventContext {
@@ -273,14 +273,19 @@ mod tests {
                 mac: MacAddress::from_str("42:9e:b1:bd:9d:dd").expect("valid mac"),
             },
             collector_type: "sensor_collector",
+            labels: Default::default(),
             metadata: Some(EndpointMetadata::Machine(MachineData {
-                machine_id: "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
-                    .parse()
-                    .expect("valid machine id"),
+                machine_id: Some(
+                    "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
+                        .parse()
+                        .expect("valid machine id"),
+                ),
                 machine_serial: None,
+                system_uuid: SharedSystemUuid::default(),
                 slot_number: None,
                 tray_index: None,
                 nvlink_domain_uuid: None,
+                driver_version: None,
             })),
             rack_id: None,
         }

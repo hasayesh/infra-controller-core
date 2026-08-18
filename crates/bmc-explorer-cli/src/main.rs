@@ -14,12 +14,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use carbide_redfish::boot_interface::BootInterfaceTarget;
 use carbide_redfish::nv_redfish::NvRedfishClientPool;
 use carbide_secrets::credentials::Credentials;
 use carbide_secrets::test_support::credentials::TestCredentialManager;
@@ -62,7 +64,7 @@ struct Cli {
     #[arg(long, default_value_t = 443)]
     bmc_port: u16,
 
-    /// Boot MAC Address (e.g. 02:03:04:05:06:07)
+    /// Boot interface MAC address (e.g. 02:03:04:05:06:07)
     #[arg(long)]
     boot_mac: Option<MacAddress>,
 }
@@ -110,11 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         credential_provider.clone(),
         rotate_switch_nvos_credentials,
         mode,
+        // Standalone debug tool: no database, so rotation bookkeeping is skipped.
+        None,
     );
 
     let ip = args.bmc_ip.parse()?;
     let port = args.bmc_port;
     let bmc_ip_address = SocketAddr::new(ip, port);
+    let boot_interface = args.boot_mac.map(BootInterfaceTarget::MacOnly);
 
     if let Some(iterations) = args.benchmark {
         let start = Instant::now();
@@ -123,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .generate_exploration_report(
                     bmc_ip_address,
                     fallback_credentials.clone(),
-                    args.boot_mac,
+                    boot_interface.as_ref(),
                     None,
                 )
                 .await?;
@@ -138,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .generate_exploration_report(
                         bmc_ip_address,
                         fallback_credentials.clone(),
-                        args.boot_mac,
+                        boot_interface.as_ref(),
                         None,
                     )
                     .await?,

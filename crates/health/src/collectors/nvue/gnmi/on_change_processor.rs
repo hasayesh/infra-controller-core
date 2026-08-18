@@ -119,8 +119,8 @@ impl GnmiOnChangeProcessor {
             Some(proto::subscribe_response::Response::Error(e)) => {
                 stream_metrics.stream_errors_total.inc();
                 tracing::warn!(
-                    code = e.code,
-                    message = %e.message,
+                    grpc_status_code = e.code,
+                    error = %e.message,
                     stream = %self.collector_name,
                     "nvue_gnmi ON_CHANGE: server error in stream"
                 );
@@ -345,11 +345,16 @@ mod tests {
             "capturing_sink"
         }
 
-        fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+        fn try_handle_event(
+            &self,
+            context: &EventContext,
+            event: &CollectorEvent,
+        ) -> Result<(), crate::HealthError> {
             self.events
                 .lock()
                 .expect("lock poisoned")
                 .push((context.clone(), event.clone()));
+            Ok(())
         }
     }
 
@@ -378,6 +383,7 @@ mod tests {
             collector_type,
             metadata: None,
             rack_id: None,
+            labels: Default::default(),
         }
     }
 
@@ -774,13 +780,16 @@ mod tests {
                     mac: MacAddress::from_str("AA:BB:CC:DD:EE:FF").unwrap(),
                 },
                 collector_type: ON_CHANGE_STREAM_ID_SYSTEM_EVENTS,
+                labels: Default::default(),
                 metadata: Some(EndpointMetadata::Switch(SwitchData {
                     id: Some(switch_id),
                     serial: "SN-SWITCH-001".to_string(),
                     slot_number: Some(7),
                     tray_index: Some(3),
+                    nvlink_domain_uuid: None,
                     endpoint_role: SwitchEndpointRole::Host,
                     is_primary: false,
+                    nmxc_enabled: false,
                     nmxt_enabled: false,
                 })),
                 rack_id: Some(RackId::new("RACK_2")),

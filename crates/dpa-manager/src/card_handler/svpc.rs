@@ -19,22 +19,24 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use carbide_dpa::DpaInfo;
+use carbide_uuid::dpa_interface::DpaInterfaceId;
 use carbide_uuid::spx::{NULL_SPX_PARTITION_ID, SpxPartitionId};
 use chrono::TimeDelta;
 use db::{self, ObjectColumnFilter};
+use mac_address::MacAddress;
 use model::dpa_interface::DpaLockMode::{Locked, Unlocked};
 use model::dpa_interface::{DpaInterface, DpaInterfaceControllerState};
 use model::instance::snapshot::InstanceSnapshot;
 use model::machine::{Machine, ManagedHostStateSnapshot};
 use mqttea::client::MqtteaClient;
-use sqlx::PgTransaction;
+use sqlx::{PgConnection, PgTransaction};
 
 use super::DpaInterfaceStateHandler;
 use crate::errors::{DpaManagerError, DpaManagerResult};
 use crate::metrics::DpaMonitorMetrics;
 use crate::{DpaMonitor, HandlerResult};
 
-pub struct SvpcInterfaceHandler;
+pub(super) struct SvpcInterfaceHandler;
 
 enum ReconcileAction {
     Noop,
@@ -44,10 +46,14 @@ enum ReconcileAction {
 }
 
 impl SvpcInterfaceHandler {
+    // Given an iterator, return the first item if there is only one, otherwise return an error.
     fn at_most_one<I: Iterator>(mut iter: I, ctx: &str) -> DpaManagerResult<Option<I::Item>> {
         let first = iter.next();
         if first.is_some() && iter.next().is_some() {
-            tracing::error!("{ctx}: more than one match");
+            tracing::error!(
+                context = %ctx,
+                "Multiple matches found",
+            );
             return Err(DpaManagerError::InvalidArgument(format!(
                 "{ctx}: more than one match"
             )));
@@ -55,6 +61,7 @@ impl SvpcInterfaceHandler {
         Ok(first)
     }
 
+    // Given an SPX Partitioin ID, find the DPA VNI associated with it.
     async fn get_partition_vni(
         monitor: &mut DpaMonitor,
         partition_id: SpxPartitionId,
@@ -93,6 +100,8 @@ impl SvpcInterfaceHandler {
         let instance_version = instance.spx_config_version;
         let nic_version = dpa_interface.network_config.version.to_string();
 
+        // We expect to find only one configured attachment for the MAC address of this DPA interface
+        // TODO: This has to be changed when we support multiple VFs per NIC
         let configured = Self::at_most_one(
             instance
                 .config
@@ -103,8 +112,11 @@ impl SvpcInterfaceHandler {
             "reconcile_assigned_state configured attachments",
         )?;
 
+        // We expect to find only one observation for the MAC address of this DPA interface
+        // TODO: This has to be changed when we support multiple VFs per NIC
         let observed = Self::at_most_one(
             machine
+                .status
                 .spx_status_observation
                 .iter()
                 .flat_map(|o| &o.spx_attachments)
@@ -195,6 +207,7 @@ impl SvpcInterfaceHandler {
         let this_mac = dpa_interface.mac_address;
 
         let this_nic_observed_attachments = machine
+            .status
             .spx_status_observation
             .clone()
             .map(|observed| {
@@ -224,9 +237,10 @@ impl SvpcInterfaceHandler {
             || (observed_attachment.config_version != Some(nic_version));
 
         tracing::debug!(
-            "[{}] reconcile_ready_state: need_deletion {need_deletion}, need_heartbeat {}",
-            chrono::Utc::now(),
-            !need_deletion
+            timestamp = %chrono::Utc::now(),
+            need_deletion = need_deletion,
+            heartbeat_needed = !need_deletion,
+            "Reconciled ready-state action",
         );
 
         if need_deletion {
@@ -263,8 +277,9 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
     ) -> DpaManagerResult<HandlerResult> {
         let Some(dpa_interface) = mh.dpa_interface_snapshots.get(idx) else {
             tracing::error!(
-                "handle_provisioning idx out of bounds: {idx}, len: {}",
-                mh.dpa_interface_snapshots.len()
+                index = idx,
+                dpa_interface_snapshot_count = mh.dpa_interface_snapshots.len(),
+                "handle_provisioning index out of bounds",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -281,7 +296,7 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
         }
 
         let new_state = DpaInterfaceControllerState::Ready;
-        tracing::info!(state = ?new_state, "Dpa Interface state transition");
+        tracing::info!(next_state = ?new_state, "Dpa Interface state transition");
         Ok(HandlerResult {
             new_state: Some(new_state),
             txn: None,
@@ -297,8 +312,9 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
     ) -> DpaManagerResult<HandlerResult> {
         let Some(dpa_interface) = mh.dpa_interface_snapshots.get(idx) else {
             tracing::error!(
-                "handle_ready idx out of bounds: {idx}, len: {}",
-                mh.dpa_interface_snapshots.len()
+                index = idx,
+                dpa_interface_snapshot_count = mh.dpa_interface_snapshots.len(),
+                "handle_ready index out of bounds",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -309,7 +325,7 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
         let host_use_admin_network = dpa_interface.use_admin_network();
         if !host_use_admin_network {
             let new_state = DpaInterfaceControllerState::Unlocking;
-            tracing::info!(state = ?new_state, "Dpa Interface state transition");
+            tracing::info!(next_state = ?new_state, "Dpa Interface state transition");
 
             return Ok(HandlerResult {
                 new_state: Some(new_state),
@@ -322,7 +338,7 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
         let client = dpa_info
             .mqtt_client
             .clone()
-            .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
+            .ok_or_else(|| eyre::eyre!("missing mqtt_client"))?;
 
         let txn = Self::reconcile_ready_state(
             monitor,
@@ -351,8 +367,9 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
     ) -> DpaManagerResult<HandlerResult> {
         let Some(dpa_interface) = mh.dpa_interface_snapshots.get(idx) else {
             tracing::error!(
-                "handle_unlocking idx out of bounds: {idx}, len: {}",
-                mh.dpa_interface_snapshots.len()
+                index = idx,
+                dpa_interface_snapshot_count = mh.dpa_interface_snapshots.len(),
+                "handle_unlocking index out of bounds",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -362,8 +379,8 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
 
         let Some(ref cs) = dpa_interface.card_state else {
             tracing::error!(
-                "Unexpected - card_state none for dpa: {:#?}",
-                dpa_interface.id
+                dpa_interface_id = %dpa_interface.id,
+                "DPA interface has no card state",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -373,7 +390,7 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
 
         if cs.lockmode == Some(Unlocked) {
             let new_state = DpaInterfaceControllerState::ApplyFirmware;
-            tracing::info!(state = ?new_state, "Interface unlocked. Transitioning to next state");
+            tracing::info!(next_state = ?new_state, "Interface unlocked. Transitioning to next state");
             return Ok(HandlerResult {
                 new_state: Some(new_state),
                 txn: None,
@@ -396,8 +413,9 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
     ) -> DpaManagerResult<HandlerResult> {
         let Some(dpa_interface) = mh.dpa_interface_snapshots.get(idx) else {
             tracing::error!(
-                "handle_apply_firmware idx out of bounds: {idx}, len: {}",
-                mh.dpa_interface_snapshots.len()
+                index = idx,
+                dpa_interface_snapshot_count = mh.dpa_interface_snapshots.len(),
+                "handle_apply_firmware index out of bounds",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -407,8 +425,8 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
 
         let Some(ref card_state) = dpa_interface.card_state else {
             tracing::info!(
-                "no firmware report, because card_state none for dpa: {:#?}, waiting for retry",
-                dpa_interface.id
+                dpa_interface_id = %dpa_interface.id,
+                "DPA interface has no card state; waiting to retry firmware report",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -421,7 +439,7 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
             if firmware_report.flashed && reset_ok {
                 let new_state = DpaInterfaceControllerState::ApplyProfile;
                 tracing::info!(
-                    state = ?new_state,
+                    next_state = ?new_state,
                     observed_version = firmware_report.observed_version.as_deref().unwrap_or("none"),
                     "firmware report received and successfully applied, transitioning"
                 );
@@ -454,8 +472,9 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
     ) -> DpaManagerResult<HandlerResult> {
         let Some(dpa_interface) = mh.dpa_interface_snapshots.get(idx) else {
             tracing::error!(
-                "handle_apply_profile idx out of bounds: {idx}, len: {}",
-                mh.dpa_interface_snapshots.len()
+                index = idx,
+                dpa_interface_snapshot_count = mh.dpa_interface_snapshots.len(),
+                "handle_apply_profile index out of bounds",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -466,18 +485,18 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
         apply_profile(dpa_interface)
     }
 
-    #[allow(clippy::unused_async)]
     async fn handle_locking(
         &self,
-        _monitor: &mut DpaMonitor,
+        monitor: &mut DpaMonitor,
         mh: &ManagedHostStateSnapshot,
         idx: usize,
         _metrics: &mut DpaMonitorMetrics,
     ) -> DpaManagerResult<HandlerResult> {
         let Some(dpa_interface) = mh.dpa_interface_snapshots.get(idx) else {
             tracing::error!(
-                "handle_locking idx out of bounds: {idx}, len: {}",
-                mh.dpa_interface_snapshots.len()
+                index = idx,
+                dpa_interface_snapshot_count = mh.dpa_interface_snapshots.len(),
+                "handle_locking index out of bounds",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -487,8 +506,8 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
 
         let Some(ref cs) = dpa_interface.card_state else {
             tracing::error!(
-                "Unexpected - card_state none for dpa: {:#?}",
-                dpa_interface.id
+                dpa_interface_id = %dpa_interface.id,
+                "DPA interface has no card state",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -497,11 +516,35 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
         };
 
         if cs.lockmode == Some(Locked) {
+            // The card is now locked on the device. Complete its lockdown_ikm
+            // convergence, keyed by the card (NIC) MAC, so the rotation engine
+            // tracks this card from the moment it is actually locked. The record
+            // is committed atomically with the state transition below (the
+            // monitor reuses this txn to persist the new controller state).
+            //
+            // api-core staged the *exact* IKM version the lock key was derived
+            // from as the in-flight `rotating_to_version` when it issued the lock
+            // command; we promote that value to `current_version` here. We must
+            // not re-read the site-wide target instead: it can advance between
+            // issuing the lock and observing it, which would record the card as
+            // converged to a newer version than the IKM it is actually locked
+            // under. A card with nothing staged (locked before this flow shipped,
+            // already covered by the backfill at v0) falls back to the site-wide
+            // target; that path is idempotent and warns.
+            let mut txn = monitor
+                .db_services
+                .db_pool
+                .begin()
+                .await
+                .map_err(|e| db::AnnotatedSqlxError::new("handle_locking begin txn", e))?;
+            record_lock_convergence(txn.as_mut(), dpa_interface.id, dpa_interface.mac_address)
+                .await?;
+
             let new_state = DpaInterfaceControllerState::Assigned;
-            tracing::info!(state = ?new_state, "Dpa Interface state transition");
+            tracing::info!(next_state = ?new_state, "Dpa Interface state transition");
             return Ok(HandlerResult {
                 new_state: Some(new_state),
-                txn: None,
+                txn: Some(txn),
             });
         }
 
@@ -520,8 +563,9 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
     ) -> DpaManagerResult<HandlerResult> {
         let Some(dpa_interface) = mh.dpa_interface_snapshots.get(idx) else {
             tracing::error!(
-                "handle_assigned idx out of bounds: {idx}, len: {}",
-                mh.dpa_interface_snapshots.len()
+                index = idx,
+                dpa_interface_snapshot_count = mh.dpa_interface_snapshots.len(),
+                "handle_assigned index out of bounds",
             );
             return Ok(HandlerResult {
                 new_state: None,
@@ -533,7 +577,7 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
 
         if host_use_admin_network {
             let new_state = DpaInterfaceControllerState::Ready;
-            tracing::info!(state = ?new_state, "Dpa Interface state transition");
+            tracing::info!(next_state = ?new_state, "Dpa Interface state transition");
             return Ok(HandlerResult {
                 new_state: Some(new_state),
                 txn: None,
@@ -544,7 +588,7 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
         let client = dpa_info
             .mqtt_client
             .clone()
-            .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
+            .ok_or_else(|| eyre::eyre!("missing mqtt_client"))?;
 
         let instance = mh.instance.as_ref().ok_or_else(|| {
             tracing::error!("reconcile_assigned_state instance is missing");
@@ -571,8 +615,8 @@ impl DpaInterfaceStateHandler for SvpcInterfaceHandler {
 fn apply_profile(state: &DpaInterface) -> DpaManagerResult<HandlerResult> {
     let Some(ref cs) = state.card_state else {
         tracing::info!(
-            "no profile report, because card_state none for dpa: {:#?}, waiting for retry",
-            state.id
+            dpa_interface_id = %state.id,
+            "DPA interface has no card state; waiting to retry profile report",
         );
         return Ok(HandlerResult {
             new_state: None,
@@ -582,7 +626,7 @@ fn apply_profile(state: &DpaInterface) -> DpaManagerResult<HandlerResult> {
     if cs.profile_synced == Some(true) {
         let new_state = DpaInterfaceControllerState::Locking;
         tracing::info!(
-            state = ?new_state,
+            next_state = ?new_state,
             profile = cs.profile.as_deref().unwrap_or("none"),
             "profile applied successfully, transitioning"
         );
@@ -595,4 +639,141 @@ fn apply_profile(state: &DpaInterface) -> DpaManagerResult<HandlerResult> {
         new_state: None,
         txn: None,
     })
+}
+
+/// Completes `lockdown_ikm` convergence for a card observed locked, on the
+/// caller's `conn` (`handle_locking` passes its open transaction so the record
+/// commits atomically with the state transition).
+///
+/// api-core staged the exact IKM version the lock key was derived from as the
+/// in-flight `rotating_to_version` when it issued the lock command, so:
+///
+///   * if a rotation is staged, promote it to `current_version` verbatim. We
+///     must NOT re-read the site-wide target: it can advance between issuing the
+///     lock and observing it, which would record the card as converged to a
+///     newer version than the IKM it is actually locked under.
+///   * if nothing is staged (a card locked before this flow shipped, already
+///     covered by the backfill at v0), fall back to the site-wide target and
+///     warn; that path is idempotent.
+async fn record_lock_convergence(
+    conn: &mut PgConnection,
+    dpa_interface_id: DpaInterfaceId,
+    mac_address: MacAddress,
+) -> DpaManagerResult<()> {
+    let promoted = db::credential_rotation::promote_rotating_to_current(
+        conn,
+        mac_address,
+        db::credential_rotation::CredentialRotationType::LockdownIkm,
+    )
+    .await?;
+
+    if !promoted {
+        tracing::warn!(
+            %dpa_interface_id,
+            %mac_address,
+            "card locked without a staged lockdown IKM rotation; \
+             recording convergence at the site-wide target"
+        );
+        db::credential_rotation::record_device_converged(
+            conn,
+            mac_address,
+            db::credential_rotation::CredentialRotationType::LockdownIkm,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use mac_address::MacAddress;
+    use sqlx::PgPool;
+
+    use super::record_lock_convergence;
+
+    // current_version for the lockdown_ikm row of `mac`, or None if no row exists.
+    async fn lockdown_version_of(pool: &PgPool, mac: &str) -> Option<i32> {
+        let row: Option<Option<i32>> = sqlx::query_scalar(
+            "SELECT current_version FROM device_credential_rotation \
+             WHERE device_mac = $1::macaddr AND credential_type = 'lockdown_ikm'",
+        )
+        .bind(mac)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        row.flatten()
+    }
+
+    // rotating_to_version for the lockdown_ikm row of `mac`, or None.
+    async fn lockdown_rotating_version_of(pool: &PgPool, mac: &str) -> Option<i32> {
+        let row: Option<Option<i32>> = sqlx::query_scalar(
+            "SELECT rotating_to_version FROM device_credential_rotation \
+             WHERE device_mac = $1::macaddr AND credential_type = 'lockdown_ikm'",
+        )
+        .bind(mac)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        row.flatten()
+    }
+
+    // Promote-path: a staged in-flight version is promoted verbatim, never
+    // re-derived from the (mutable) site-wide target -- this is the TOCTOU the
+    // two-phase lock flow guards against.
+    #[crate::sqlx_test]
+    async fn promotes_staged_version_not_sitewide_target(pool: PgPool) {
+        let id = carbide_uuid::dpa_interface::DpaInterfaceId::new();
+        let mac: MacAddress = "02:00:00:00:00:11".parse().unwrap();
+
+        // api-core staged the lock at version 2; advance the site-wide target so
+        // it differs: the promote-path must ignore it.
+        sqlx::query(
+            "UPDATE sitewide_credential_rotation SET target_version = 7 \
+             WHERE credential_type = 'lockdown_ikm'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        db::credential_rotation::mark_device_rotating_to_version(
+            &mut conn,
+            mac,
+            db::credential_rotation::CredentialRotationType::LockdownIkm,
+            2,
+        )
+        .await
+        .unwrap();
+
+        record_lock_convergence(&mut conn, id, mac).await.unwrap();
+        drop(conn);
+
+        assert_eq!(
+            lockdown_version_of(&pool, "02:00:00:00:00:11").await,
+            Some(2),
+            "must promote the staged version, not the site-wide target (7)"
+        );
+        assert_eq!(
+            lockdown_rotating_version_of(&pool, "02:00:00:00:00:11").await,
+            None,
+            "the in-flight marker must be cleared on promotion"
+        );
+    }
+
+    // Fallback (warn) path: nothing staged falls back to the site-wide target
+    // (seeded at 0 by the backfill migration).
+    #[crate::sqlx_test]
+    async fn falls_back_to_sitewide_target_when_nothing_staged(pool: PgPool) {
+        let id = carbide_uuid::dpa_interface::DpaInterfaceId::new();
+        let mac: MacAddress = "02:00:00:00:00:12".parse().unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        record_lock_convergence(&mut conn, id, mac).await.unwrap();
+        drop(conn);
+
+        assert_eq!(
+            lockdown_version_of(&pool, "02:00:00:00:00:12").await,
+            Some(0),
+            "nothing staged must fall back to the site-wide target (0)"
+        );
+    }
 }

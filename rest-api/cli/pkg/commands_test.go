@@ -4,7 +4,12 @@
 package cli
 
 import (
+	"bytes"
 	"flag"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,6 +95,25 @@ func TestClientFromContextExplicitTokenCommandOverridesCachedConfigToken(t *test
 	assert.Equal(t, "explicit-token", client.Token)
 }
 
+func TestClientFromContextReturnsMalformedConfigError(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("auth:\n  token:missing-space\n  token_command: echo token\n"), 0600))
+	SetConfigPath(configPath)
+	defer SetConfigPath("")
+
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	flags.String("token", "", "")
+	flags.String("token-command", "", "")
+	flags.String("base-url", "", "")
+	flags.String("org", "", "")
+	flags.Bool("debug", false, "")
+
+	ctx := cli.NewContext(cli.NewApp(), flags, nil)
+	_, err := clientFromContext(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "loading config: parsing config "+configPath)
+}
+
 func TestOperationAction(t *testing.T) {
 	tests := []struct {
 		opID string
@@ -131,6 +155,7 @@ func TestOperationAction(t *testing.T) {
 		{"get-jwks", "get"},
 		{"get-spiffe-jwks", "get"},
 		{"get-openid-configuration", "get"},
+		{"start-machine-validation", "start"},
 	}
 
 	for _, tt := range tests {
@@ -168,6 +193,7 @@ func TestExtractResourceSuffix(t *testing.T) {
 		{"get-jwks", "jwks"},
 		{"get-spiffe-jwks", "spiffe-jwks"},
 		{"get-openid-configuration", "openid-configuration"},
+		{"start-machine-validation", "machine-validation"},
 	}
 
 	for _, tt := range tests {
@@ -384,6 +410,41 @@ func TestBuildCommands_NoDuplicateFlags(t *testing.T) {
 	visit("nicocli", cmds)
 }
 
+func TestGeneratedCommandInfos_ContainsConciseAliases(t *testing.T) {
+	spec, err := ParseSpec(openapi.Spec)
+	require.NoError(t, err)
+
+	operations := make(map[string]string)
+	for _, info := range GeneratedCommandInfos(spec) {
+		operations[info.Name] = info.OperationID
+	}
+
+	assert.Equal(t, "machine-power-control-machine", operations["machine power"])
+	assert.Equal(t,
+		"machine-power-control-machine",
+		operations["machine power-control-machine machine-power-control-machine"],
+	)
+
+	for operationID, path := range commandPathAliases {
+		assert.Equalf(t,
+			operationID,
+			operations[strings.Join(path, " ")],
+			"concise command path for %q does not identify the same operation",
+			operationID,
+		)
+	}
+	for operationID, paths := range additionalCommandPathAliases {
+		for _, path := range paths {
+			assert.Equalf(t,
+				operationID,
+				operations[strings.Join(path, " ")],
+				"additional command path for %q does not identify the same operation",
+				operationID,
+			)
+		}
+	}
+}
+
 // TestBuildActionCommand_ReservedBodyPropertyPrefixed verifies that when a
 // request body schema has a property whose kebab-cased name collides with a
 // reserved CLI-wrapper flag (data, data-file, output, all), the generated
@@ -493,9 +554,21 @@ func TestBuildActionCommand_UsageTextUsesBinaryName(t *testing.T) {
 	}
 
 	cmd := buildActionCommand(spec, ro, "")
-	assert.Equal(t, "nicocli site get <siteId>", cmd.UsageText)
+	assert.Equal(t, "nicocli site get [command options] <siteId>", cmd.UsageText)
 	assert.False(t, strings.HasPrefix(cmd.UsageText, "cli "),
 		"UsageText must not start with the literal word 'cli '; got %q", cmd.UsageText)
+}
+
+func TestNewApp_RackGetUsageShowsOptionsBeforeID(t *testing.T) {
+	app, err := NewApp(openapi.Spec)
+	require.NoError(t, err)
+
+	var output bytes.Buffer
+	app.Writer = &output
+	require.NoError(t, app.Run([]string{"nicocli", "rack", "get", "--help"}))
+
+	assert.Contains(t, output.String(), "USAGE:\n   nicocli rack get [command options] <id>")
+	assert.NotContains(t, output.String(), "nicocli rack get <id>")
 }
 
 // TestBuildCommands_AllUsageTextStartsWithBinaryName walks every dynamically
@@ -527,7 +600,7 @@ func TestBuildCommands_AllUsageTextStartsWithBinaryName(t *testing.T) {
 }
 
 func TestDetectMisorderedFlags(t *testing.T) {
-	usage := "nicocli machine update <machineId>"
+	usage := "nicocli machine update [command options] <machineId>"
 	tests := []struct {
 		name         string
 		args         []string
@@ -552,7 +625,7 @@ func TestDetectMisorderedFlags(t *testing.T) {
 			args:         []string{"fm100htq", "--data", "{}"},
 			argParams:    []string{"machineId"},
 			wantErr:      true,
-			wantContains: []string{"--data", "placed after a positional", "Move all flags before positionals", "[flags...] <machineId>"},
+			wantContains: []string{"--data", "placed after a positional", "Move all flags before positionals", "[command options] <machineId>"},
 		},
 		{
 			name:         "flag=value form after positional",
@@ -822,6 +895,29 @@ func TestNewApp_CurrentSingletonCommandSurface(t *testing.T) {
 	}
 }
 
+func TestNewApp_UEFICredentialCreateCommand(t *testing.T) {
+	app, err := NewApp(openapi.Spec)
+	require.NoError(t, err, "NewApp failed")
+
+	var credential *cli.Command
+	for _, command := range app.Commands {
+		if command.Name == "uefi-credential" {
+			credential = command
+			break
+		}
+	}
+	require.NotNil(t, credential, "UEFI credential must be exposed by the embedded OpenAPI spec")
+
+	var create *cli.Command
+	for _, command := range credential.Subcommands {
+		if command.Name == "create" {
+			create = command
+			break
+		}
+	}
+	require.NotNil(t, create, "UEFI credential must expose a create command")
+}
+
 // TestBuildCommands_CurrentSingletonsAreRunnable asserts that every
 // get-current-<resource> singleton in the embedded spec is reachable from the
 // non-interactive CLI under the `current` action that the interactive TUI
@@ -848,6 +944,45 @@ func TestBuildCommands_CurrentSingletonsAreRunnable(t *testing.T) {
 			assert.NotNilf(t, cmdByName(parent.Subcommands, "current"),
 				"tag %q must expose a `current` command runnable from the CLI", tag)
 		})
+	}
+}
+
+func TestBuildCommands_SiteExplorerActionIsRunnable(t *testing.T) {
+	spec, err := ParseSpec(openapi.Spec)
+	require.NoError(t, err)
+
+	var siteExplorer *cli.Command
+	for _, command := range BuildCommands(spec) {
+		if command.HasName("site-explorer") {
+			siteExplorer = command
+			break
+		}
+	}
+	require.NotNil(t, siteExplorer)
+
+	var sawCreate, sawEndpointAction, sawList bool
+	for _, command := range siteExplorer.Subcommands {
+		if command.HasName("create") {
+			sawCreate = true
+		}
+		if command.HasName("endpoint") && len(command.Subcommands) > 0 {
+			for _, subcommand := range command.Subcommands {
+				if subcommand.HasName("action") && subcommand.Action != nil {
+					sawEndpointAction = true
+				}
+			}
+		}
+		if command.HasName("list") {
+			sawList = true
+		}
+	}
+	if !sawCreate {
+		t.Fatal("site-explorer create must be generated from the OpenAPI operation")
+	}
+	require.True(t, sawEndpointAction,
+		"site-explorer endpoint action must be generated from the OpenAPI operation")
+	if !sawList {
+		t.Fatal("site-explorer list must be generated from the OpenAPI operation")
 	}
 }
 
@@ -887,6 +1022,137 @@ func TestBuildCommands_AllocationConstraintIsUpdateOnly(t *testing.T) {
 	assert.Equal(t, []string{"update"}, actions,
 		"allocation constraint must expose only `update`; create/get/list/delete were "+
 			"removed from the OpenAPI spec because the server never registered those routes (NVBug 6232163)")
+}
+
+func TestNewApp_MachineValidationStartCommandSurface(t *testing.T) {
+	app, err := NewApp(openapi.Spec)
+	require.NoError(t, err)
+
+	var machineValidation *cli.Command
+	for _, command := range app.Commands {
+		if command.Name == "machine-validation" {
+			machineValidation = command
+			break
+		}
+	}
+	require.NotNil(t, machineValidation, "Machine validation must be exposed by the embedded OpenAPI spec")
+
+	var start *cli.Command
+	for _, command := range machineValidation.Subcommands {
+		if command.Name == "start" {
+			start = command
+			break
+		}
+	}
+	require.NotNil(t, start, "Machine validation must expose a start command")
+	assert.Equal(t, "nicocli machine-validation start [command options] <machineId>", start.UsageText)
+
+	for _, resourceName := range []string{"results", "runs"} {
+		var resource *cli.Command
+		for _, command := range machineValidation.Subcommands {
+			if command.Name == resourceName {
+				resource = command
+				break
+			}
+		}
+		require.NotNil(t, resource, "Machine validation must expose a %s sub-resource", resourceName)
+
+		var list *cli.Command
+		for _, command := range resource.Subcommands {
+			if command.Name == "list" {
+				list = command
+				break
+			}
+		}
+		require.NotNil(t, list, "Machine validation %s must expose a list command", resourceName)
+	}
+}
+
+func TestNewApp_MachineValidationStartExecutesRESTRequest(t *testing.T) {
+	var method, path, authorization, body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		method = request.Method
+		path = request.URL.Path
+		authorization = request.Header.Get("Authorization")
+		requestBody, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		body = string(requestBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, err = w.Write([]byte(`{"validationID":"validation-1","machineID":"machine-1","startTime":"2026-08-05T16:00:00Z","endTime":null,"name":"Test_machine-1","context":"OnDemand","status":{"state":"Started","total":0,"completed":0},"durationToCompleteSecs":0}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	app, err := NewApp(openapi.Spec)
+	require.NoError(t, err)
+
+	err = app.Run([]string{
+		"nicocli",
+		"--base-url", server.URL,
+		"--org", "test-org",
+		"--api-name", "nico",
+		"--token", "test-token",
+		"machine-validation", "start",
+		"--data", `{"allowedTests":["gpu_bandwidth"],"runUnverifiedTests":true}`,
+		"machine-1",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, http.MethodPost, method)
+	assert.Equal(t, "/v2/org/test-org/nico/machine/machine-1/validation/run", path)
+	assert.Equal(t, "Bearer test-token", authorization)
+	assert.JSONEq(t, `{"allowedTests":["gpu_bandwidth"],"runUnverifiedTests":true}`, body)
+}
+
+func TestNewApp_MachineValidationReadCommandsExecuteRESTRequests(t *testing.T) {
+	tests := []struct {
+		name         string
+		resource     string
+		expectedPath string
+	}{
+		{
+			name:         "runs",
+			resource:     "runs",
+			expectedPath: "/v2/org/test-org/nico/machine/machine-1/validation/run",
+		},
+		{
+			name:         "results",
+			resource:     "results",
+			expectedPath: "/v2/org/test-org/nico/machine/machine-1/validation/result",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var method, path, authorization string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				method = request.Method
+				path = request.URL.Path
+				authorization = request.Header.Get("Authorization")
+				w.Header().Set("Content-Type", "application/json")
+				_, err := w.Write([]byte(`[]`))
+				require.NoError(t, err)
+			}))
+			t.Cleanup(server.Close)
+
+			app, err := NewApp(openapi.Spec)
+			require.NoError(t, err)
+
+			err = app.Run([]string{
+				"nicocli",
+				"--base-url", server.URL,
+				"--org", "test-org",
+				"--api-name", "nico",
+				"--token", "test-token",
+				"machine-validation", tt.resource, "list",
+				"machine-1",
+			})
+			require.NoError(t, err)
+			assert.Equal(t, http.MethodGet, method)
+			assert.Equal(t, tt.expectedPath, path)
+			assert.Equal(t, "Bearer test-token", authorization)
+		})
+	}
 }
 
 // sortStrings is a tiny stable sort used by the order-independence test so it

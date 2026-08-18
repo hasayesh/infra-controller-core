@@ -16,11 +16,11 @@
  */
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-pub use ::rpc::forge as rpc;
+use ::rpc::forge as rpc;
+use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::machine::MachineIdSource;
 use carbide_uuid::nvlink::NvLinkDomainId;
 use db::WithTransaction;
@@ -32,6 +32,9 @@ use model::machine::{DpuInitState, DpuInitStates, ManagedHostState};
 use tonic::{Request, Response, Status};
 
 use crate::api::{Api, log_machine_id, log_request_data};
+use crate::handlers::client_resolution::{
+    OverlayAddressOwnerLookup, find_overlay_address_owner, is_same_host_inband_interface,
+};
 use crate::handlers::utils::convert_and_log_machine_id;
 use crate::{CarbideError, attestation as attest};
 
@@ -40,28 +43,16 @@ pub(crate) async fn discover_machine(
     request: Request<rpc::MachineDiscoveryInfo>,
 ) -> Result<Response<rpc::MachineDiscoveryResult>, Status> {
     // We don't log_request_data(&request); here because the hardware info is huge
-    let remote_ip: Option<IpAddr> = match request.metadata().get("X-Forwarded-For") {
-        None => {
-            // Normal production case.
-            // This is set in api/src/listener.rs::listen_and_serve when we `accept` the connection
-            // The IP is usually an IPv4-mapped IPv6 addresses (e.g. `::ffff:10.217.133.10`) so
-            // we use to_canonical() to convert it to IPv4.
-            request
-                .extensions()
-                .get::<Arc<carbide_authn::middleware::ConnectionAttributes>>()
-                .map(|conn_attrs| conn_attrs.peer_address.ip().to_canonical())
-        }
-        Some(ip_str) => {
-            // Development case, we override the remote IP with HTTP header
-            ip_str
-                .to_str()
-                .ok()
-                .and_then(|s| s.parse().map(|ip: IpAddr| ip.to_canonical()).ok())
-        }
-    };
+
+    // This is set in api/src/listener.rs::listen_and_serve when we `accept` the connection
+    // The IP is usually an IPv4-mapped IPv6 addresses (e.g. `::ffff:10.217.133.10`) so
+    // we use to_canonical() to convert it to IPv4.
+    let remote_ip = request
+        .extensions()
+        .get::<Arc<carbide_authn::middleware::ConnectionAttributes>>()
+        .map(|conn_attrs| conn_attrs.peer_address.ip().to_canonical());
 
     let machine_discovery_info = request.into_inner();
-    let interface_id = machine_discovery_info.machine_interface_id;
     let discovery_reporter = machine_discovery_info.discovery_reporter();
 
     let discovery_data = machine_discovery_info
@@ -70,7 +61,7 @@ pub(crate) async fn discover_machine(
             rpc::machine_discovery_info::DiscoveryData::Info(info) => info,
         })
         .ok_or_else(|| {
-            CarbideError::InvalidArgument("Discovery data is not populated".to_string())
+            CarbideError::InvalidArgument("discovery data is not populated".to_string())
         })?;
     let attest_key_info_opt = discovery_data.attest_key_info.clone();
     let hardware_info = HardwareInfo::try_from(discovery_data).map_err(CarbideError::from)?;
@@ -89,7 +80,7 @@ pub(crate) async fn discover_machine(
     // Generate a stable Machine ID based on the hardware information
     let stable_machine_id = from_hardware_info(&hardware_info).map_err(|e| {
             CarbideError::InvalidArgument(
-                format!("Insufficient HardwareInfo to derive a Stable Machine ID for Machine on InterfaceId {interface_id:?}: {e}"),
+                format!("insufficient HardwareInfo to derive a stable machine ID from DiscoverMachine call by {remote_ip:?}: {e}"),
             )
         })?;
     log_machine_id(&stable_machine_id);
@@ -102,7 +93,7 @@ pub(crate) async fn discover_machine(
         .filter_map(|gpu| gpu.platform_info.as_ref())
         .collect();
 
-    let nvlink_info = if hardware_info.is_gbx00()
+    let nvlink_info = if hardware_info.is_mnnvl_capable()
         && !gpu_platform_infos.is_empty()
         && api
             .runtime_config
@@ -115,21 +106,173 @@ pub(crate) async fn discover_machine(
         None
     };
 
+    let secure_remote_ip = if api.runtime_config.allow_insecure_discovery {
+        None
+    } else {
+        Some(remote_ip.ok_or_else(|| {
+            CarbideError::InvalidArgument(
+                "could not determine client IP address for discovery".to_string(),
+            )
+        })?)
+    };
+
+    // Keep readers that are waiting behind instance allocation out of open
+    // database transactions. Hold the same permit through the main discovery
+    // transaction so the admin-lock queue remains bounded too.
+    let admin_admission = db::machine_interface::admin_lock_admission().await;
+
+    // Resolve direct underlay ownership before taking the long-lived machine
+    // and admin locks below. This authenticates the already-arrived request
+    // against one ownership snapshot, then releases the address-table read
+    // lock. The main transaction locks and verifies only the same interface;
+    // it does not re-evaluate overlay ownership after authentication.
+    let direct_interface_id = if let Some(remote_ip) = secure_remote_ip {
+        let mut source_txn = api.txn_begin().await?;
+        let direct_interface =
+            db::machine_interface::find_by_ip(source_txn.as_pgconn(), remote_ip).await?;
+        let direct_interface_id = if let Some(interface) = direct_interface {
+            match find_overlay_address_owner(source_txn.as_pgconn(), remote_ip).await? {
+                OverlayAddressOwnerLookup::NotFound => Some(interface.id),
+                OverlayAddressOwnerLookup::One(owner)
+                    if is_same_host_inband_interface(&interface, &owner) =>
+                {
+                    Some(interface.id)
+                }
+                OverlayAddressOwnerLookup::One(_) | OverlayAddressOwnerLookup::Ambiguous => {
+                    tracing::warn!(
+                        machine_interface_id = %interface.id,
+                        %remote_ip,
+                        "discovery source IP matches unrelated underlay and overlay owners"
+                    );
+                    return Err(discovery_source_owner_error().into());
+                }
+            }
+        } else {
+            None
+        };
+        source_txn.commit().await?;
+        direct_interface_id
+    } else {
+        None
+    };
+
     let mut txn = api.txn_begin().await?;
+
+    // Advisory-lock the admin segments before any machine-interface row
+    // writes in this transaction (`associate_interface_with_dpu_machine`,
+    // the proactive host-interface create, `set_primary_interface`), so the
+    // whole transaction holds locks in the allocator order (segment advisory
+    // lock first, then interface rows) all the way to the reconcile pass --
+    // which re-acquires the same locks as a no-op.
+    db::machine_interface::lock_all_admin_segments(&mut txn).await?;
+
     tracing::debug!(
-        ?remote_ip,
-        ?interface_id,
+        remote_ip_address = ?remote_ip,
+        caller_machine_interface_id = ?machine_discovery_info.machine_interface_id,
         "discover_machine loading interface"
     );
+
+    // Who's discovery info is this? DiscoverMachine is an anonymous call, and so normally we should
+    // look it up ourselves from the client IP. But that isn't feasible in integration tests, so
+    // config.allow_insecure_discovery lets the caller pass a machine_interface_id.
+    let caller_interface = if let Some(remote_ip) = secure_remote_ip {
+        if let Some(expected_interface_id) = direct_interface_id {
+            match db::machine_interface::find_optional_for_update_by_ip(&mut txn, remote_ip).await?
+            {
+                Some(interface) if interface.id == expected_interface_id => interface,
+                _ => {
+                    tracing::warn!(
+                        machine_interface_id = %expected_interface_id,
+                        %remote_ip,
+                        "discovery source interface changed during authentication"
+                    );
+                    return Err(discovery_source_owner_error().into());
+                }
+            }
+        } else {
+            // Caller may be an allocated instance running scout (e.g. for machine validation). We
+            // need the machine_interface_id in the payload to know which interface to use. We will
+            // check it against the caller's IP to make sure it belongs to instance on the same
+            // machine.
+            let machine_interface_id = machine_discovery_info.machine_interface_id.ok_or_else(|| {
+                CarbideError::InvalidArgument(
+                    "no machine_interface found for client IP address, and no machine_interface_id was provided".to_string(),
+                )
+            })?;
+            db::machine_interface::find_for_update_if_matches_instance_ip(
+                &mut txn,
+                machine_interface_id,
+                remote_ip,
+            )
+            .await?
+            .ok_or_else(|| {
+                tracing::error!(
+                    %machine_interface_id,
+                    %remote_ip,
+                    "potential machine impersonation attempt: caller-provided machine_interface_id does not belong to this remote IP, or the IP has ambiguous overlay ownership"
+                );
+                discovery_source_owner_error()
+            })?
+        }
+    } else {
+        let interface_id = machine_discovery_info.machine_interface_id.ok_or_else(|| {
+            CarbideError::InvalidArgument(
+                "machine_interface_id is required for insecure discovery".to_string(),
+            )
+        })?;
+        let interface = db::machine_interface::find_one(&mut txn, interface_id).await?;
+        tracing::warn!(
+            machine_interface_id = %interface_id,
+            "Allowing insecure discovery: trusting caller-provided machine_interface_id. This is for integration tests only and must not be done in production."
+        );
+        interface
+    };
+
+    let site_explorer_creates_machines = api
+        .runtime_config
+        .site_explorer
+        .create_machines
+        .load(Ordering::Relaxed);
+
+    // Now that we know who's submitting this DiscoveryInfo, make sure they're not submitting info
+    // for another host in an attempt to get their machine certificate.
+    let authorized = match caller_interface.machine_id.as_ref() {
+        Some(caller_machine_id) if caller_machine_id == &stable_machine_id => {
+            // The stable machine ID generated from the discovery info matches the caller's machine
+            // ID, good.
+            true
+        }
+        Some(caller_machine_id)
+            if caller_machine_id.machine_type().is_predicted_host()
+                && stable_machine_id.machine_type().is_host() =>
+        {
+            // This is a predicted host being promoted to a known host, which we allow.
+            true
+        }
+        None if hardware_info.is_dpu() && machine_discovery_info.create_machine => {
+            // There's no machine ID at all yet, and this is a dpu attempting to create a machine
+            // entry from DiscoveryInfo. We only allow this if site explorer isn't configured to
+            // create machines.
+            !site_explorer_creates_machines
+        }
+        _ => false,
+    };
+    if !authorized {
+        return Err(CarbideError::PermissionDeniedError(
+            "machine discovery is not authorized for the selected interface".to_string(),
+        )
+        .into());
+    }
 
     if !hardware_info.is_dpu()
         && hardware_info.tpm_ek_certificate.is_none()
         && api.runtime_config.tpm_required
     {
         return Err(CarbideError::InvalidArgument(format!(
-                "Ignoring DiscoverMachine request for non-tpm enabled host with InterfaceId {interface_id:?}"
-            ))
-            .into());
+            "ignoring DiscoverMachine request for non-tpm enabled host with InterfaceId {:?}",
+            caller_interface.id,
+        ))
+        .into());
     } else if !hardware_info.is_dpu() && hardware_info.tpm_ek_certificate.is_some() {
         // this means we do have an EK cert for a host
 
@@ -150,28 +293,23 @@ pub(crate) async fn discover_machine(
         .await?;
     }
 
-    let interface =
-        db::machine_interface::find_by_ip_or_id(&mut txn, remote_ip, interface_id).await?;
     if !hardware_info.is_dpu()
         && hardware_info.tpm_ek_certificate.is_none()
         && stable_machine_id.source() == MachineIdSource::ProductBoardChassisSerial
-        && let Some(existing_machine_id) = interface.machine_id
+        && let Some(existing_machine_id) = caller_interface.machine_id
         && existing_machine_id.source() == MachineIdSource::Tpm
         && existing_machine_id.machine_type().is_host()
     {
         return Err(CarbideError::FailedPrecondition(format!(
-            "TPM EK certificate missing for host discovery on InterfaceId {interface_id:?}; refusing to derive serial-based machine id {stable_machine_id} for existing TPM-derived machine id {existing_machine_id}"
+            "TPM EK certificate missing for host discovery on InterfaceId {:?}; refusing to derive serial-based machine id {} for existing TPM-derived machine id {}",
+            caller_interface.id, stable_machine_id, existing_machine_id,
         ))
         .into());
     }
+
     let machine_id = if hardware_info.is_dpu() {
         // if site explorer is creating machine records and there isn't one for this machine return an error
-        if api
-            .runtime_config
-            .site_explorer
-            .create_machines
-            .load(Ordering::Relaxed)
-        {
+        if site_explorer_creates_machines {
             db::machine::find_one(
                 &mut txn,
                 &stable_machine_id,
@@ -183,7 +321,7 @@ pub(crate) async fn discover_machine(
             .await?
             .ok_or_else(|| {
                 CarbideError::InvalidArgument(format!(
-                    "Machine id {stable_machine_id} was not discovered by site-explorer."
+                    "machine id {stable_machine_id} was not discovered by site-explorer"
                 ))
             })?;
         }
@@ -193,14 +331,14 @@ pub(crate) async fn discover_machine(
                 &mut txn,
                 Some(&api.common_pools),
                 &stable_machine_id,
-                &interface,
+                &caller_interface,
             )
             .await?;
 
             // Update the record only when create_machine is enabled.
             // Site-explorer will update if machine is created by site-explorer.
             db::machine_interface::associate_interface_with_dpu_machine(
-                &interface.id,
+                &caller_interface.id,
                 &stable_machine_id,
                 &mut txn,
             )
@@ -217,56 +355,47 @@ pub(crate) async fn discover_machine(
             )
             .await?
             .ok_or_else(|| {
-                CarbideError::InvalidArgument(format!("Machine id {stable_machine_id} not found."))
+                CarbideError::InvalidArgument(format!("machine id {stable_machine_id} not found"))
             })?
         };
 
-        if db_machine.network_config.loopback_ip.is_none() {
-            let loopback_ip = db::machine::allocate_loopback_ip(
-                &api.common_pools,
-                &mut txn,
-                &stable_machine_id.to_string(),
-            )
-            .await?;
+        // Collect every missing address into one `network_config` write. Each
+        // write bumps the whole machine group, so writing one field at a time
+        // leaves the later call with a stale `network_config_version`.
+        let (mut network_config, network_config_version) = db_machine.network_config.clone().take();
+        let owner_id = stable_machine_id.to_string();
+        let mut network_config_changed = false;
 
-            let mut network_config = db_machine.network_config.value.clone();
+        if network_config.loopback_ip.is_none() {
+            let loopback_ip =
+                db::machine::allocate_loopback_ip(&api.common_pools, &mut txn, &owner_id).await?;
             network_config.loopback_ip = Some(loopback_ip);
-            db::machine::try_update_network_config(
-                &mut txn,
-                &stable_machine_id,
-                db_machine.network_config.version,
-                &network_config,
-            )
-            .await?;
+            network_config_changed = true;
         }
 
-        if api
-            .runtime_config
-            .vmaas_config
-            .as_ref()
-            .map(|vc| vc.secondary_overlay_support)
-            .unwrap_or_default()
-            && db_machine
-                .network_config
-                .secondary_overlay_vtep_ip
-                .is_none()
+        if network_config.loopback_ip_v6.is_none()
+            && let Some(loopback_ip_v6) =
+                db::machine::allocate_loopback_ip_v6(&api.common_pools, &mut txn, &owner_id).await?
         {
-            let secondary_vtep_ip = db::machine::allocate_secondary_vtep_ip(
-                &api.common_pools,
-                &mut txn,
-                &stable_machine_id.to_string(),
-            )
-            .await?;
+            network_config.loopback_ip_v6 = Some(loopback_ip_v6);
+            network_config_changed = true;
+        }
 
-            let mut network_config = db_machine.network_config.value.clone();
-            network_config.secondary_overlay_vtep_ip = Some(secondary_vtep_ip);
-            db::machine::try_update_network_config(
+        if network_config_changed
+            && !db::machine::try_update_network_config(
                 &mut txn,
                 &stable_machine_id,
-                db_machine.network_config.version,
+                network_config_version,
                 &network_config,
             )
-            .await?;
+            .await?
+        {
+            // The version error also rolls back the allocations above.
+            return Err(CarbideError::ConcurrentModificationError(
+                "machine",
+                network_config_version.to_string(),
+            )
+            .into());
         }
 
         db_machine.id
@@ -274,7 +403,7 @@ pub(crate) async fn discover_machine(
         // Now we know stable machine id for host. Let's update it in db.
         db::machine::try_sync_stable_id_with_current_machine_id_for_host(
             &mut txn,
-            &interface.machine_id,
+            &caller_interface.machine_id,
             &stable_machine_id,
         )
         .await?
@@ -352,7 +481,7 @@ pub(crate) async fn discover_machine(
             .await?;
 
             tracing::info!(
-                ?mi_id,
+                machine_interface_id = ?mi_id,
                 machine_id = %proactive_machine.id,
                 "Created host machine proactively",
             );
@@ -389,7 +518,7 @@ pub(crate) async fn discover_machine(
     {
         let Some(attest_key_info) = attest_key_info_opt else {
             return Err(CarbideError::InvalidArgument(
-                "Internal Error: This should have been handled above! AttestKeyInfo is not populated.".into(),
+                "internal error: this should have been handled above! AttestKeyInfo is not populated".into(),
             )
             .into());
         };
@@ -407,10 +536,10 @@ pub(crate) async fn discover_machine(
         )
     } else {
         tracing::info!(
-            "Attestation enabled is {}. Is_DPU is {}. Vending certs to machine with id {}",
-            api.runtime_config.attestation_enabled,
-            hardware_info.is_dpu(),
-            stable_machine_id,
+            attestation_enabled = api.runtime_config.attestation_enabled,
+            is_dpu = hardware_info.is_dpu(),
+            %stable_machine_id,
+            "Vending attestation certificates",
         );
 
         None
@@ -424,7 +553,7 @@ pub(crate) async fn discover_machine(
         && let Some(scout_version) = machine_discovery_info
             .discovery_reporter_version
             .as_deref()
-            .filter(|v| !v.is_empty())
+            .none_if_empty()
     {
         db::machine::update_last_scout_observed_version(
             &stable_machine_id,
@@ -435,6 +564,7 @@ pub(crate) async fn discover_machine(
     }
 
     txn.commit().await?;
+    drop(admin_admission);
 
     let machine_certificate = if attest_key_challenge.is_none() {
         if std::env::var("UNSUPPORTED_CERTIFICATE_PROVIDER").is_ok() {
@@ -456,7 +586,7 @@ pub(crate) async fn discover_machine(
         machine_id: Some(stable_machine_id),
         machine_certificate,
         attest_key_challenge,
-        machine_interface_id: Some(interface.id),
+        machine_interface_id: Some(caller_interface.id),
     }));
 
     if hardware_info.is_dpu()
@@ -481,6 +611,12 @@ pub(crate) async fn discover_machine(
     }
 
     response
+}
+
+fn discovery_source_owner_error() -> CarbideError {
+    CarbideError::PermissionDeniedError(
+        "discovery source IP and selected interface do not identify one host".to_string(),
+    )
 }
 
 // Host has completed discovery

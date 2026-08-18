@@ -30,7 +30,7 @@ use crate::CarbideError;
 use crate::api::metrics::ApiMetricsEmitter;
 use crate::api::{Api, log_request_data};
 use crate::compat::BuildAndFillLegacyFields;
-use crate::handlers::utils::convert_and_log_machine_id;
+use crate::handlers::utils::{StateHandlerWakeupFailed, WakeupTrigger, convert_and_log_machine_id};
 
 // Records Scout cleanup success/failure and wakes the host state controller.
 // The state controller decides whether cleanup returns to discovery or deprovision flow.
@@ -126,7 +126,11 @@ pub(crate) async fn cleanup_machine_completed(
             .enqueue_object(&machine_id)
             .await
     {
-        tracing::warn!(%err, %machine_id, "Failed to wake up state handler for machine");
+        carbide_instrument::emit(StateHandlerWakeupFailed {
+            trigger: WakeupTrigger::CleanupCompleted,
+            machine_id,
+            err: err.to_string(),
+        });
     }
 
     Ok(Response::new(rpc::MachineCleanupResult {}))
@@ -204,12 +208,12 @@ pub(crate) async fn forge_agent_control(
                     },
             } => {
                 tracing::info!(
-                    " context : {} id: {} is_enabled: {}, completed {}, total {}",
-                    context,
-                    id,
-                    is_enabled,
-                    completed,
-                    total,
+                    context = %context,
+                    machine_validation_id = %id,
+                    is_enabled = *is_enabled,
+                    completed_validation_count = *completed,
+                    total_validation_count = *total,
+                    "Machine validation progress reported by scout",
                 );
                 if *is_enabled {
                     db::machine_validation::update_status(
@@ -245,7 +249,7 @@ pub(crate) async fn forge_agent_control(
                 // cleanup: send it to discovery, which promotes it; the promoted host then
                 // waits for its storage cleanup. Mirrors the state handler's
                 // WaitingForDiscovery guard.
-                if host_machine.last_cleanup_time.is_some()
+                if host_machine.status.last_cleanup_time.is_some()
                     || !host_machine.id.machine_type().is_host()
                 {
                     (Action::discovery(), Some(txn))
@@ -282,12 +286,12 @@ pub(crate) async fn forge_agent_control(
                     },
                 ..
             } => {
-                let last_cleanup_time = host_machine.last_cleanup_time;
+                let last_cleanup_time = host_machine.status.last_cleanup_time;
                 let state_version = host_machine.state.version;
                 tracing::info!(
-                    "last_cleanup_time: {:?}, state_version: {:?}",
-                    last_cleanup_time,
-                    state_version
+                    last_cleanup_time = ?last_cleanup_time,
+                    machine_state_version = ?state_version,
+                    "Checking whether machine cleanup is current",
                 );
                 // Check scout has already cleaned up the machine
                 if last_cleanup_time.unwrap_or_default() > state_version.timestamp() {
@@ -301,11 +305,11 @@ pub(crate) async fn forge_agent_control(
                 bom_validating_state: BomValidating::UpdatingInventory(_),
             } => {
                 tracing::info!(
-                    "Request Discovery {} < {}",
-                    machine.last_discovery_time.unwrap_or_default(),
-                    machine.current_version().timestamp()
+                    last_discovery_time = %machine.status.last_discovery_time.unwrap_or_default(),
+                    current_version_time = %machine.current_version().timestamp(),
+                    "Checking whether machine discovery is stale",
                 );
-                if machine.last_discovery_time.unwrap_or_default()
+                if machine.status.last_discovery_time.unwrap_or_default()
                     < machine.current_version().timestamp()
                 {
                     (Action::discovery(), Some(txn))
@@ -318,10 +322,14 @@ pub(crate) async fn forge_agent_control(
             } => {
                 // Commit the transaction now, to avoid holding across an unrelated await point
                 txn.commit().await?;
-                match crate::handlers::dpa::process_scout_req(api, machine_id).await {
+                match crate::handlers::svpc::process_scout_req(api, machine_id).await {
                     Ok(action) => (action, None),
                     Err(e) => {
-                        tracing::error!("Error returned from process_scout_req: {e}");
+                        tracing::error!(
+                            machine_id = %machine_id,
+                            error = %e,
+                            "Failed to process Scout request",
+                        );
                         (Action::noop(), None)
                     }
                 }
@@ -345,7 +353,8 @@ pub(crate) async fn forge_agent_control(
                     Ok(task) => Action::FirmwareUpgrade(fac::FirmwareUpgrade { task: Some(task) }),
                     Err(e) => {
                         tracing::warn!(
-                            "Could not deserialize firmware upgrade task, sending no-op action to scout: {e}"
+                            error = %e,
+                            "Could not deserialize firmware upgrade task, sending no-op action to scout",
                         );
                         Action::noop()
                     }
@@ -358,7 +367,7 @@ pub(crate) async fn forge_agent_control(
                 tracing::info!(
                     machine_id = %machine.id,
                     machine_type = "Host",
-                    %state,
+                    agent_control_state = %state,
                     "forge agent control",
                 );
                 (Action::noop(), Some(txn))
@@ -386,7 +395,7 @@ fn record_reboot_duration_metric(
     metric_emitter: &ApiMetricsEmitter,
     machine: &model::machine::Machine,
 ) {
-    let Some(last_reboot_requested) = &machine.last_reboot_requested else {
+    let Some(last_reboot_requested) = &machine.status.last_reboot_requested else {
         return;
     };
 
@@ -407,6 +416,7 @@ fn record_reboot_duration_metric(
 
     // Extract product name and vendor from hardware info
     let product_name = machine
+        .status
         .hardware_info
         .as_ref()
         .and_then(|hi| hi.dmi_data.as_ref())
@@ -414,6 +424,7 @@ fn record_reboot_duration_metric(
         .unwrap_or_else(|| "unknown".to_string());
 
     let vendor = machine
+        .status
         .hardware_info
         .as_ref()
         .and_then(|hi| hi.dmi_data.as_ref())
@@ -456,7 +467,11 @@ pub(crate) async fn reboot_completed(
             .enqueue_object(&machine_id)
             .await
     {
-        tracing::warn!(%err, %machine_id, "Failed to wake up state handler for machine");
+        carbide_instrument::emit(StateHandlerWakeupFailed {
+            trigger: WakeupTrigger::RebootCompleted,
+            machine_id,
+            err: err.to_string(),
+        });
     }
 
     Ok(Response::new(rpc::MachineRebootCompletedResponse {}))

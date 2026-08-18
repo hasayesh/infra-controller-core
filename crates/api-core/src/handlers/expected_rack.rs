@@ -28,7 +28,7 @@ use crate::api::Api;
 
 /// add_expected_rack creates an expected rack record. Returns AlreadyExists
 /// if the expected rack record already exists.
-pub async fn add_expected_rack(
+pub(crate) async fn add_expected_rack(
     api: &Api,
     request: Request<rpc::ExpectedRack>,
 ) -> Result<Response<()>, Status> {
@@ -44,7 +44,7 @@ pub async fn add_expected_rack(
         .is_none()
     {
         return Err(CarbideError::InvalidArgument(format!(
-            "Unknown rack_profile_id: {}. Must be one of: {:?}",
+            "unknown rack_profile_id: {}. must be one of: {:?}",
             rack.rack_profile_id,
             api.runtime_config.rack_profiles.keys().collect::<Vec<_>>()
         ))
@@ -72,7 +72,7 @@ pub async fn add_expected_rack(
         .is_none()
     {
         return Err(CarbideError::InvalidArgument(format!(
-            "Unknown rack_profile_id: {}. Must be one of: {:?}",
+            "unknown rack_profile_id: {}. must be one of: {:?}",
             rack.rack_profile_id,
             api.runtime_config.rack_profiles.keys().collect::<Vec<_>>()
         ))
@@ -87,13 +87,13 @@ pub async fn add_expected_rack(
 }
 
 /// delete_expected_rack deletes an expected rack by its rack_id.
-pub async fn delete_expected_rack(
+pub(crate) async fn delete_expected_rack(
     api: &Api,
     request: Request<rpc::ExpectedRackRequest>,
 ) -> Result<Response<()>, Status> {
     let req = request.into_inner();
     let rack_id = RackId::from_str(&req.rack_id)
-        .map_err(|e| CarbideError::InvalidArgument(format!("Invalid rack ID: {}", e)))?;
+        .map_err(|e| CarbideError::InvalidArgument(format!("invalid rack ID: {}", e)))?;
     let mut txn = api.txn_begin().await?;
     db_expected_rack::delete(&mut txn, &rack_id)
         .await
@@ -103,7 +103,7 @@ pub async fn delete_expected_rack(
 }
 
 /// update_expected_rack updates an existing expected rack's rack_profile_id and metadata.
-pub async fn update_expected_rack(
+pub(crate) async fn update_expected_rack(
     api: &Api,
     request: Request<rpc::ExpectedRack>,
 ) -> Result<Response<()>, Status> {
@@ -119,7 +119,7 @@ pub async fn update_expected_rack(
         .is_none()
     {
         return Err(CarbideError::InvalidArgument(format!(
-            "Unknown rack_profile_id: {}. Must be one of: {:?}",
+            "unknown rack_profile_id: {}. must be one of: {:?}",
             rack.rack_profile_id,
             api.runtime_config.rack_profiles.keys().collect::<Vec<_>>()
         ))
@@ -144,13 +144,13 @@ pub async fn update_expected_rack(
 }
 
 /// get_expected_rack returns a specific expected rack by its rack_id.
-pub async fn get_expected_rack(
+pub(crate) async fn get_expected_rack(
     api: &Api,
     request: Request<rpc::ExpectedRackRequest>,
 ) -> Result<Response<rpc::ExpectedRack>, Status> {
     let req = request.into_inner();
     let rack_id = RackId::from_str(&req.rack_id)
-        .map_err(|e| CarbideError::InvalidArgument(format!("Invalid rack ID: {}", e)))?;
+        .map_err(|e| CarbideError::InvalidArgument(format!("invalid rack ID: {}", e)))?;
     let mut txn = api.txn_begin().await?;
     let expected_rack = db_expected_rack::find_by_rack_id(&mut txn, &rack_id)
         .await
@@ -164,7 +164,7 @@ pub async fn get_expected_rack(
 }
 
 /// get_all_expected_racks returns all expected racks.
-pub async fn get_all_expected_racks(
+pub(crate) async fn get_all_expected_racks(
     api: &Api,
     _request: Request<()>,
 ) -> Result<Response<rpc::ExpectedRackList>, Status> {
@@ -181,7 +181,7 @@ pub async fn get_all_expected_racks(
 }
 
 /// replace_all_expected_racks clears all expected racks and creates new ones from the request.
-pub async fn replace_all_expected_racks(
+pub(crate) async fn replace_all_expected_racks(
     api: &Api,
     request: Request<rpc::ExpectedRackList>,
 ) -> Result<Response<()>, Status> {
@@ -202,7 +202,7 @@ pub async fn replace_all_expected_racks(
             .is_none()
         {
             return Err(CarbideError::InvalidArgument(format!(
-                "Unknown rack_profile_id: {}",
+                "unknown rack_profile_id: {}",
                 rack.rack_profile_id
             ))
             .into());
@@ -218,7 +218,7 @@ pub async fn replace_all_expected_racks(
 }
 
 /// delete_all_expected_racks deletes all expected racks.
-pub async fn delete_all_expected_racks(
+pub(crate) async fn delete_all_expected_racks(
     api: &Api,
     _request: Request<()>,
 ) -> Result<Response<()>, Status> {

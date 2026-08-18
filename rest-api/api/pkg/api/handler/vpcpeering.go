@@ -78,7 +78,7 @@ func (cvph CreateVpcPeeringHandler) Handle(c echo.Context) error {
 	}
 
 	// Ensure our user is a provider or tenant for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, cvph.dbSession, org, dbUser, false, false)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, cvph.dbSession, org, dbUser, false, nil)
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -291,15 +291,13 @@ func (cvph CreateVpcPeeringHandler) Handle(c echo.Context) error {
 		vpcPeering = createdVpcPeering
 
 		// Create a status detail record for the VPC Peering
-		statusDetail, derr := sdDAO.CreateFromParams(ctx, tx, vpcPeering.ID.String(),
-			*cutil.GetPtr(cdbm.VpcPeeringStatusPending),
-			cutil.GetPtr("Received VPC Peering creation request, pending processing"))
+		statusDetail, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: vpcPeering.ID.String(), Status: *cutil.GetPtr(cdbm.VpcPeeringStatusPending), Message: cutil.GetPtr("Received VPC Peering creation request, pending processing")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating status detail for VPC Peering")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for VPC Peering", nil)
 		}
 		if statusDetail == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for VPC Peering", nil)
 		}
 
@@ -397,7 +395,7 @@ func (cvph CreateVpcPeeringHandler) Handle(c echo.Context) error {
 	}
 
 	// Update API model with best-known status.
-	apiVpcPeering := model.NewAPIVpcPeering(*vpcPeering)
+	apiVpcPeering := model.NewAPIVpcPeering(*vpcPeering, nil)
 	apiVpcPeering.Status = status
 
 	logger.Info().Msg("finishing API handler")
@@ -434,6 +432,9 @@ func NewGetAllVpcPeeringHandler(dbSession *cdb.Session, tc tclient.Client, cfg *
 // @Param org path string true "Name of NGC organization"
 // @Param siteId query string false "Filter by Site ID"
 // @Param isMultiTenant query bool false "Filter by single-tenant or multi-tenant peerings"
+// @Param status query string false "Filter by status (repeatable for multiple values)"
+// @Param vpcId query string false "Filter by VPC ID involved in the peering (as vpc1 or vpc2)"
+// @Param peerTenantId query string false "Filter by tenant ID of a VPC involved in the peering (repeatable for multiple values)"
 // @Param includeRelation query string false "Related entities to include in response e.g. 'Vpc1', 'Vpc2', 'Site'"
 // @Param pageNumber query integer false "Page number of results returned"
 // @Param pageSize query integer false "Number of results per page"
@@ -453,21 +454,27 @@ func (gavph GetAllVpcPeeringHandler) Handle(c echo.Context) error {
 	}
 
 	// Ensure our user is a provider or tenant for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gavph.dbSession, org, dbUser, false, false)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gavph.dbSession, org, dbUser, false, nil)
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
 
 	filterInput := cdbm.VpcPeeringFilterInput{}
 
+	qParams := c.QueryParams()
+
 	// Get Site ID from query param if specified and verify user has access to the Site
-	siteIDStr := c.QueryParam("siteId")
-	if siteIDStr != "" {
+	if siteIDStrs := qParams["siteId"]; len(siteIDStrs) > 0 {
+		siteIDStr := siteIDStrs[0]
 		providerSiteAuthorized := false
 		tenantSiteAuthorized := false
 
 		site, err := common.GetSiteFromIDString(ctx, nil, siteIDStr, gavph.dbSession)
 		if err != nil {
+			if errors.Is(err, common.ErrInvalidID) {
+				logger.Warn().Msg(fmt.Sprintf("invalid value in siteId query: %v", siteIDStr))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Invalid Site ID %v in query", siteIDStr), nil)
+			}
 			if errors.Is(err, cdb.ErrDoesNotExist) {
 				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Site specified in query does not exist", nil)
 			}
@@ -508,10 +515,9 @@ func (gavph GetAllVpcPeeringHandler) Handle(c echo.Context) error {
 	}
 
 	// Get isMultiTenant from query param if specified
-	isMultiTenantStr := c.QueryParam("isMultiTenant")
 	var isMultiTenant *bool
-	if isMultiTenantStr != "" {
-		isMultiTenantParam, err := strconv.ParseBool(isMultiTenantStr)
+	if isMultiTenantStrs := qParams["isMultiTenant"]; len(isMultiTenantStrs) > 0 {
+		isMultiTenantParam, err := strconv.ParseBool(isMultiTenantStrs[0])
 		if err != nil {
 			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isMultiTenant` query param", nil)
 		}
@@ -519,11 +525,99 @@ func (gavph GetAllVpcPeeringHandler) Handle(c echo.Context) error {
 	}
 
 	// Get and validate includeRelation params
-	qParams := c.QueryParams()
 	qIncludeRelations, errMsg := common.GetAndValidateQueryRelations(qParams, cdbm.VpcPeeringRelatedEntities)
 	if errMsg != "" {
 		logger.Warn().Msg(errMsg)
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, errMsg, nil)
+	}
+
+	// Get status from query param
+	qStatuses := qParams["status"]
+	if len(qStatuses) > 0 {
+		gavph.tracerSpan.SetAttribute(handlerSpan, attribute.StringSlice("status", qStatuses), logger)
+		for _, status := range qStatuses {
+			if !cdbm.VpcPeeringStatusMap[status] {
+				logger.Warn().Msg(fmt.Sprintf("invalid value in status query: %v", status))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Invalid Status value %v in query", status), nil)
+			}
+			filterInput.Statuses = append(filterInput.Statuses, status)
+		}
+	}
+
+	// Get vpcId from query param
+	vpcIDStrs := qParams["vpcId"]
+	if len(vpcIDStrs) > 0 {
+		gavph.tracerSpan.SetAttribute(handlerSpan, attribute.StringSlice("vpcId", vpcIDStrs), logger)
+		vpcIDs := make([]uuid.UUID, 0, len(vpcIDStrs))
+		for _, vpcIDStr := range vpcIDStrs {
+			vpcID, err := uuid.Parse(vpcIDStr)
+			if err != nil {
+				logger.Warn().Msg(fmt.Sprintf("invalid value in vpcId query: %v", vpcIDStr))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Invalid VPC ID %v in query", vpcIDStr), nil)
+			}
+			vpcIDs = append(vpcIDs, vpcID)
+		}
+		vpcDAO := cdbm.NewVpcDAO(gavph.dbSession)
+		vpcs, _, err := vpcDAO.GetAll(
+			ctx,
+			nil,
+			cdbm.VpcFilterInput{VpcIDs: vpcIDs},
+			cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)},
+			nil,
+		)
+		if err != nil {
+			logger.Error().Err(err).Msg("error retrieving VPCs from DB")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve VPCs specified in query", nil)
+		}
+		vpcIDsMap := make(map[uuid.UUID]struct{}, len(vpcs))
+		for _, vpc := range vpcs {
+			vpcIDsMap[vpc.ID] = struct{}{}
+		}
+		for _, vpcID := range vpcIDs {
+			if _, ok := vpcIDsMap[vpcID]; !ok {
+				logger.Warn().Msg(fmt.Sprintf("could not find VPC with ID %v specified in query", vpcID))
+				return cutil.NewAPIErrorResponse(c, http.StatusNotFound, fmt.Sprintf("Could not find VPC with ID %v specified in query", vpcID), nil)
+			}
+		}
+		filterInput.VpcIDs = vpcIDs
+	}
+
+	// Get peerTenantId from query param
+	peerTenantIDStrs := qParams["peerTenantId"]
+	if len(peerTenantIDStrs) > 0 {
+		gavph.tracerSpan.SetAttribute(handlerSpan, attribute.StringSlice("peerTenantId", peerTenantIDStrs), logger)
+		peerTenantIDs := make([]uuid.UUID, 0, len(peerTenantIDStrs))
+		for _, peerTenantIDStr := range peerTenantIDStrs {
+			peerTenantID, err := uuid.Parse(peerTenantIDStr)
+			if err != nil {
+				logger.Warn().Msg(fmt.Sprintf("invalid value in peerTenantId query: %v", peerTenantIDStr))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Invalid peer tenant ID %v in query", peerTenantIDStr), nil)
+			}
+			peerTenantIDs = append(peerTenantIDs, peerTenantID)
+		}
+		tnDAO := cdbm.NewTenantDAO(gavph.dbSession)
+		peerTenants, _, err := tnDAO.GetAll(
+			ctx,
+			nil,
+			cdbm.TenantFilterInput{TenantIDs: peerTenantIDs},
+			cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)},
+			nil,
+		)
+		if err != nil {
+			logger.Error().Err(err).Msg("error retrieving Tenants from DB")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve tenants specified in query", nil)
+		}
+		peerTenantIDsMap := make(map[uuid.UUID]struct{}, len(peerTenants))
+		for _, peerTenant := range peerTenants {
+			peerTenantIDsMap[peerTenant.ID] = struct{}{}
+		}
+		for _, peerTenantID := range peerTenantIDs {
+			if _, ok := peerTenantIDsMap[peerTenantID]; !ok {
+				logger.Warn().Msg(fmt.Sprintf("could not find tenant with ID %v specified in query", peerTenantID))
+				return cutil.NewAPIErrorResponse(c, http.StatusNotFound, fmt.Sprintf("Could not find tenant with ID %v specified in query", peerTenantID), nil)
+			}
+		}
+		filterInput.PeerTenantIDs = peerTenantIDs
 	}
 
 	// Validate pagination request
@@ -560,16 +654,47 @@ func (gavph GetAllVpcPeeringHandler) Handle(c echo.Context) error {
 		Offset:  pageRequest.Offset,
 		OrderBy: pageRequest.OrderBy,
 	}
+
+	// If VPC ID or peer tenant ID is specified, include the VPC and tenant relations
+	if len(vpcIDStrs) > 0 || len(peerTenantIDStrs) > 0 {
+		for _, relation := range []string{cdbm.Vpc1RelationName, cdbm.Vpc2RelationName, cdbm.TenantRelationName} {
+			if !slices.Contains(qIncludeRelations, relation) {
+				qIncludeRelations = append(qIncludeRelations, relation)
+			}
+		}
+	}
 	vpcPeerings, total, err := vpcPeeringDAO.GetAll(ctx, nil, filterInput, vpcPeeringPageInput, qIncludeRelations)
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving VPC Peerings from DB")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve VPC Peerings, DB error", nil)
 	}
 
+	dbMappedPeeringTenants := make(map[uuid.UUID]*cdbm.Tenant)
+	vpcPeeringTenantIDs := []uuid.UUID{}
+	for _, vpcPeering := range vpcPeerings {
+		if vpcPeering.Vpc1 != nil {
+			vpcPeeringTenantIDs = append(vpcPeeringTenantIDs, vpcPeering.Vpc1.TenantID)
+		}
+		if vpcPeering.Vpc2 != nil {
+			vpcPeeringTenantIDs = append(vpcPeeringTenantIDs, vpcPeering.Vpc2.TenantID)
+		}
+	}
+	if len(vpcPeeringTenantIDs) > 0 {
+		tenantDAO := cdbm.NewTenantDAO(gavph.dbSession)
+		tenants, _, err := tenantDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{TenantIDs: vpcPeeringTenantIDs}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+		if err != nil {
+			logger.Error().Err(err).Msg("error retrieving Tenants from DB")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenants, DB error", nil)
+		}
+		for _, tenant := range tenants {
+			dbMappedPeeringTenants[tenant.ID] = &tenant
+		}
+	}
+
 	// Build API response
 	apiVpcPeerings := make([]model.APIVpcPeering, len(vpcPeerings))
 	for i, vpcPeering := range vpcPeerings {
-		apiVpcPeerings[i] = model.NewAPIVpcPeering(vpcPeering)
+		apiVpcPeerings[i] = model.NewAPIVpcPeering(vpcPeering, dbMappedPeeringTenants)
 	}
 
 	// Create pagination response header
@@ -616,7 +741,7 @@ func NewGetVpcPeeringHandler(dbSession *cdb.Session, tc tclient.Client, cfg *con
 // @Security ApiKeyAuth
 // @Param org path string true "Name of NGC organization"
 // @Param id path string true "ID of VPC Peering"
-// @Param includeRelation query string false "Related entities to include in response e.g. 'Vpc1', 'Vpc2', 'Site'""
+// @Param includeRelation query string false "Related entities to include in response e.g. 'Vpc1', 'Vpc2', 'Site', 'Tenant'""
 // @Success 200 {object} model.APIVpcPeering
 // @Router /v2/org/{org}/nico/vpc-peering/{id} [get]
 func (gvph GetVpcPeeringHandler) Handle(c echo.Context) error {
@@ -632,7 +757,7 @@ func (gvph GetVpcPeeringHandler) Handle(c echo.Context) error {
 	}
 
 	// Ensure our user is a provider or tenant for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gvph.dbSession, org, dbUser, false, false)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gvph.dbSession, org, dbUser, false, nil)
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -673,7 +798,7 @@ func (gvph GetVpcPeeringHandler) Handle(c echo.Context) error {
 	if !providerAuthorized && tenant != nil {
 		// Get two VPCs of the VPC Peering
 		vpcDAO := cdbm.NewVpcDAO(gvph.dbSession)
-		vpc1, err := vpcDAO.GetByID(ctx, nil, vpcPeering.Vpc1ID, nil)
+		vpc1, err := vpcDAO.GetByID(ctx, nil, vpcPeering.Vpc1ID, []string{cdbm.TenantRelationName})
 		if err != nil {
 			if err == cdb.ErrDoesNotExist {
 				return cutil.NewAPIErrorResponse(c, http.StatusNotFound, fmt.Sprintf("Could not find VPC with ID: %s", vpcPeering.Vpc1ID.String()), nil)
@@ -681,7 +806,8 @@ func (gvph GetVpcPeeringHandler) Handle(c echo.Context) error {
 			logger.Error().Err(err).Msg("error retrieving VPC 1 of VPC Peering from DB")
 			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to retrieve VPC 1 with ID: %s, DB error", vpcPeering.Vpc1ID.String()), nil)
 		}
-		vpc2, err := vpcDAO.GetByID(ctx, nil, vpcPeering.Vpc2ID, nil)
+
+		vpc2, err := vpcDAO.GetByID(ctx, nil, vpcPeering.Vpc2ID, []string{cdbm.TenantRelationName})
 		if err != nil {
 			if err == cdb.ErrDoesNotExist {
 				return cutil.NewAPIErrorResponse(c, http.StatusNotFound, fmt.Sprintf("Could not find VPC with ID: %s", vpcPeering.Vpc2ID.String()), nil)
@@ -708,8 +834,32 @@ func (gvph GetVpcPeeringHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "User does not have access to the VPC Peering", nil)
 	}
 
+	// Map tenant to the VPCs
+	dbMappedPeeringTenants := make(map[uuid.UUID]*cdbm.Tenant)
+	tenantIDs := []uuid.UUID{}
+
+	if vpcPeering.Vpc1 != nil {
+		tenantIDs = append(tenantIDs, vpcPeering.Vpc1.TenantID)
+	}
+	if vpcPeering.Vpc2 != nil {
+		tenantIDs = append(tenantIDs, vpcPeering.Vpc2.TenantID)
+	}
+
+	// Fetch Tenants from DB if VPCs have tenants
+	if len(tenantIDs) > 0 {
+		tenantDAO := cdbm.NewTenantDAO(gvph.dbSession)
+		tenants, _, err := tenantDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{TenantIDs: tenantIDs}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+		if err != nil {
+			logger.Error().Err(err).Msg("error retrieving Tenants from DB")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenants, DB error", nil)
+		}
+		for _, tenant := range tenants {
+			dbMappedPeeringTenants[tenant.ID] = &tenant
+		}
+	}
+
 	// Convert to API model
-	apiVpcPeering := model.NewAPIVpcPeering(*vpcPeering)
+	apiVpcPeering := model.NewAPIVpcPeering(*vpcPeering, dbMappedPeeringTenants)
 
 	logger.Info().Msg("finishing API handler")
 
@@ -762,7 +912,7 @@ func (dvph DeleteVpcPeeringHandler) Handle(c echo.Context) error {
 	}
 
 	// Ensure our user is a provider or tenant for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, dvph.dbSession, org, dbUser, false, false)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, dvph.dbSession, org, dbUser, false, nil)
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}

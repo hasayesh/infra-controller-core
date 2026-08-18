@@ -112,7 +112,8 @@ func TestCreateExpectedSwitchHandler_Handle(t *testing.T) {
 	_, err = dbSession.DB.NewInsert().Model(unmanagedSite).Exec(ctx)
 	assert.Nil(t, err)
 
-	// Create an existing Expected Switch with a specific MAC address for duplicate test
+	// Create an existing Expected Switch with specific BMC and NVOS MAC
+	// addresses for the duplicate tests
 	esDAO := cdbm.NewExpectedSwitchDAO(dbSession)
 	existingMAC := "AA:BB:CC:DD:EE:11"
 	_, err = esDAO.Create(ctx, nil, cdbm.ExpectedSwitchCreateInput{
@@ -120,6 +121,7 @@ func TestCreateExpectedSwitchHandler_Handle(t *testing.T) {
 		SiteID:             site.ID,
 		BmcMacAddress:      existingMAC,
 		SwitchSerialNumber: "EXISTING-SWITCH-001",
+		NvosMacAddresses:   []string{"AA:BB:CC:DD:EE:22"},
 		Labels:             map[string]string{"env": "existing"},
 	})
 	assert.Nil(t, err)
@@ -148,7 +150,6 @@ func TestCreateExpectedSwitchHandler_Handle(t *testing.T) {
 			},
 		}
 	}
-
 	tests := []struct {
 		name           string
 		requestBody    model.APIExpectedSwitchCreateRequest
@@ -165,6 +166,7 @@ func TestCreateExpectedSwitchHandler_Handle(t *testing.T) {
 				SwitchSerialNumber: "SWITCH123",
 				NvOsUsername:       cutil.GetPtr("nvos-admin"),
 				NvOsPassword:       cutil.GetPtr("nvos-password"),
+				NvosMacAddresses:   []string{"00:11:22:33:44:66", "00:11:22:33:44:67"},
 				BmcIpAddress:       cutil.GetPtr("192.168.1.10"),
 				Labels:             map[string]string{"env": "test"},
 			},
@@ -255,6 +257,23 @@ func TestCreateExpectedSwitchHandler_Handle(t *testing.T) {
 			},
 			expectedStatus: http.StatusConflict,
 		},
+		{
+			name: "NVOS MAC claimed by another switch should return 409",
+			requestBody: model.APIExpectedSwitchCreateRequest{
+				SiteID:             site.ID.String(),
+				BmcMacAddress:      "00:11:22:33:44:AA",
+				DefaultBmcUsername: cutil.GetPtr("admin"),
+				DefaultBmcPassword: cutil.GetPtr("password"),
+				SwitchSerialNumber: "NVOS-DUP-SWITCH-001",
+				NvosMacAddresses:   []string{"aa-bb-cc-dd-ee-22"},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus: http.StatusConflict,
+		},
 	}
 
 	_ = infraProv
@@ -291,6 +310,9 @@ func TestCreateExpectedSwitchHandler_Handle(t *testing.T) {
 					if assert.NotNil(t, response.BmcIpAddress, "BmcIpAddress should not be nil in response") {
 						assert.Equal(t, *tt.requestBody.BmcIpAddress, *response.BmcIpAddress, "BmcIpAddress in response should match request")
 					}
+				}
+				if tt.requestBody.NvosMacAddresses != nil {
+					assert.Equal(t, tt.requestBody.NvosMacAddresses, response.NvosMacAddresses, "NvosMacAddresses in response should match request")
 				}
 			}
 		})
@@ -362,6 +384,27 @@ func TestGetAllExpectedSwitchHandler_Handle(t *testing.T) {
 			},
 		}
 	}
+	dualRoleTenant := &cdbm.Tenant{
+		ID:   uuid.New(),
+		Name: "dual-role-tenant",
+		Org:  org,
+	}
+	_, err = dbSession.DB.NewInsert().Model(dualRoleTenant).Exec(ctx)
+	assert.Nil(t, err)
+	createDualRoleUser := func(org string) *cdbm.User {
+		return &cdbm.User{
+			StarfleetID: cutil.GetPtr("dual-role-user"),
+			OrgData: cdbm.OrgData{
+				org: cdbm.Org{
+					ID:          124,
+					Name:        org,
+					DisplayName: org,
+					OrgType:     "ENTERPRISE",
+					Roles:       []string{authz.ProviderViewerRole, authz.TenantAdminRole},
+				},
+			},
+		}
+	}
 
 	tests := []struct {
 		name                 string
@@ -376,6 +419,24 @@ func TestGetAllExpectedSwitchHandler_Handle(t *testing.T) {
 			siteId: "",
 			setupContext: func(c echo.Context) {
 				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus: http.StatusOK,
+			checkResponseContent: func(t *testing.T, body []byte) {
+				var response []model.APIExpectedSwitch
+				err := json.Unmarshal(body, &response)
+				assert.Nil(t, err)
+				for _, es := range response {
+					assert.NotEqual(t, unmanagedES.ID, es.ID, "Unmanaged switch should not be in response")
+				}
+			},
+		},
+		{
+			name:   "dual-role caller without siteId uses provider-wide listing",
+			siteId: "",
+			setupContext: func(c echo.Context) {
+				c.Set("user", createDualRoleUser(org))
 				c.SetParamNames("orgName")
 				c.SetParamValues(org)
 			},
@@ -685,6 +746,18 @@ func TestUpdateExpectedSwitchHandler_Handle(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, unmanagedES)
 
+	// Create a second ExpectedSwitch on the managed site whose NVOS MAC the
+	// update conflict test tries to claim
+	conflictES, err := esDAO.Create(ctx, nil, cdbm.ExpectedSwitchCreateInput{
+		ExpectedSwitchID:   uuid.New(),
+		SiteID:             site.ID,
+		BmcMacAddress:      "00:11:22:33:44:CC",
+		SwitchSerialNumber: "CONFLICT-SWITCH-789",
+		NvosMacAddresses:   []string{"AA:BB:CC:DD:EE:33"},
+	})
+	assert.Nil(t, err)
+	assert.NotNil(t, conflictES)
+
 	// Add mock temporal client for the site
 	mockTemporalClient := &tmocks.Client{}
 	mockWorkflowRun := &tmocks.WorkflowRun{}
@@ -711,11 +784,15 @@ func TestUpdateExpectedSwitchHandler_Handle(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		id             string
-		requestBody    model.APIExpectedSwitchUpdateRequest
-		setupContext   func(c echo.Context)
-		expectedStatus int
+		name                 string
+		id                   string
+		requestBody          model.APIExpectedSwitchUpdateRequest
+		setupContext         func(c echo.Context)
+		expectedStatus       int
+		expectedBmcMac       string
+		expectedStoredBmcMac string
+		expectedErrorMsg     string
+		expectNoWorkflow     bool
 	}{
 		{
 			name: "successful update",
@@ -732,10 +809,93 @@ func TestUpdateExpectedSwitchHandler_Handle(t *testing.T) {
 			expectedStatus: http.StatusOK,
 		},
 		{
+			name: "BMC MAC formatting difference preserves stored identity",
+			id:   testES.ID.String(),
+			requestBody: model.APIExpectedSwitchUpdateRequest{
+				BmcMacAddress: cutil.GetPtr("00-11-22-33-44-dd"),
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testES.ID.String())
+			},
+			expectedStatus:       http.StatusOK,
+			expectedBmcMac:       testES.BmcMacAddress,
+			expectedStoredBmcMac: testES.BmcMacAddress,
+		},
+		{
+			name: "BMC MAC address cannot be changed",
+			id:   testES.ID.String(),
+			requestBody: model.APIExpectedSwitchUpdateRequest{
+				BmcMacAddress: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testES.ID.String())
+			},
+			expectedStatus:       http.StatusBadRequest,
+			expectedStoredBmcMac: testES.BmcMacAddress,
+			expectedErrorMsg:     "BMC MAC address cannot be changed after creation",
+			expectNoWorkflow:     true,
+		},
+		{
 			name: "successful update with BmcIpAddress",
 			id:   testES.ID.String(),
 			requestBody: model.APIExpectedSwitchUpdateRequest{
 				BmcIpAddress: cutil.GetPtr("192.168.1.42"),
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testES.ID.String())
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "successful update with NvosMacAddresses",
+			id:   testES.ID.String(),
+			requestBody: model.APIExpectedSwitchUpdateRequest{
+				NvosMacAddresses: []string{"00:11:22:33:44:66", "00:11:22:33:44:67"},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testES.ID.String())
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "update re-asserting its own NvosMacAddresses is not a conflict",
+			id:   testES.ID.String(),
+			requestBody: model.APIExpectedSwitchUpdateRequest{
+				NvosMacAddresses: []string{"00:11:22:33:44:66", "00:11:22:33:44:67"},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testES.ID.String())
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "update claiming another switch's NVOS MAC should return 409",
+			id:   testES.ID.String(),
+			requestBody: model.APIExpectedSwitchUpdateRequest{
+				NvosMacAddresses: []string{"aa-bb-cc-dd-ee-33"},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testES.ID.String())
+			},
+			expectedStatus: http.StatusConflict,
+		},
+		{
+			name: "successful update clearing NvosMacAddresses with an explicit empty list",
+			id:   testES.ID.String(),
+			requestBody: model.APIExpectedSwitchUpdateRequest{
+				NvosMacAddresses: []string{},
 			},
 			setupContext: func(c echo.Context) {
 				c.Set("user", createMockUser(org))
@@ -789,12 +949,30 @@ func TestUpdateExpectedSwitchHandler_Handle(t *testing.T) {
 
 			tt.setupContext(c)
 
+			workflowCallsBefore := len(mockTemporalClient.Calls)
 			err := handler.Handle(c)
 
 			assert.Nil(t, err)
 			assert.Equal(t, tt.expectedStatus, rec.Code)
 			if tt.expectedStatus != rec.Code {
 				t.Errorf("Response: %v", rec.Body.String())
+			}
+			if tt.expectedErrorMsg != "" {
+				assert.Contains(t, rec.Body.String(), tt.expectedErrorMsg)
+			}
+			if tt.expectedBmcMac != "" {
+				var response model.APIExpectedSwitch
+				err := json.Unmarshal(rec.Body.Bytes(), &response)
+				assert.Nil(t, err)
+				assert.Equal(t, tt.expectedBmcMac, response.BmcMacAddress)
+			}
+			if tt.expectedStoredBmcMac != "" {
+				stored, err := esDAO.Get(ctx, nil, testES.ID, nil, false)
+				assert.Nil(t, err)
+				assert.Equal(t, tt.expectedStoredBmcMac, stored.BmcMacAddress)
+			}
+			if tt.expectNoWorkflow {
+				assert.Len(t, mockTemporalClient.Calls, workflowCallsBefore)
 			}
 
 			// Verify BmcIpAddress round-trips through the update response when set
@@ -804,6 +982,19 @@ func TestUpdateExpectedSwitchHandler_Handle(t *testing.T) {
 				assert.Nil(t, err)
 				if assert.NotNil(t, response.BmcIpAddress, "BmcIpAddress should not be nil in response") {
 					assert.Equal(t, *tt.requestBody.BmcIpAddress, *response.BmcIpAddress, "BmcIpAddress in response should match request")
+				}
+			}
+
+			// Verify NvosMacAddresses round-trips through the update response when
+			// set; an explicit empty list clears the value
+			if tt.expectedStatus == http.StatusOK && tt.requestBody.NvosMacAddresses != nil {
+				var response model.APIExpectedSwitch
+				err := json.Unmarshal(rec.Body.Bytes(), &response)
+				assert.Nil(t, err)
+				if len(tt.requestBody.NvosMacAddresses) == 0 {
+					assert.Empty(t, response.NvosMacAddresses, "NvosMacAddresses should be cleared in response")
+				} else {
+					assert.Equal(t, tt.requestBody.NvosMacAddresses, response.NvosMacAddresses, "NvosMacAddresses in response should match request")
 				}
 			}
 		})

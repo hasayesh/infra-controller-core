@@ -16,12 +16,13 @@
  */
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
 use ::rpc::errors::RpcDataConversionError;
 use ::rpc::model::{RpcInto, RpcTryFrom};
 use ::rpc::{common as rpc_common, forge as rpc};
+use carbide_dpf::dpu_cr_name;
 use carbide_network::virtualization::VpcVirtualizationType;
 use carbide_secrets::credentials::{BgpCredentialType, CredentialKey, Credentials};
 use carbide_utils::arch::CpuArchitecture;
@@ -32,9 +33,10 @@ use db::{
     network_segment,
 };
 use futures_util::future::join_all;
+use ipnetwork::IpNetwork;
 use itertools::Itertools;
 use model::extension_service::{ExtensionService, ExtensionServiceVersionInfo};
-use model::hardware_info::MachineInventory;
+use model::hardware_info::{MachineInventory, MachineInventorySoftwareComponent};
 use model::instance::config::extension_services::InstanceExtensionServiceConfig;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::network::MachineNetworkStatusObservation;
@@ -46,8 +48,9 @@ use tonic::{Request, Response, Status};
 
 use crate::api::{Api, log_machine_id, log_request_data};
 use crate::cfg::file::VpcIsolationBehaviorType;
+use crate::handlers::astra::{get_astra_config, process_astra_config_status};
 use crate::handlers::extension_service;
-use crate::handlers::utils::convert_and_log_machine_id;
+use crate::handlers::utils::{StateHandlerWakeupFailed, WakeupTrigger, convert_and_log_machine_id};
 use crate::{CarbideError, cfg, ethernet_virtualization};
 
 /// vxlan48 is special HBN single vxlan device. It handles networking between machines on the
@@ -57,18 +60,86 @@ const HBN_SINGLE_VLAN_DEVICE: &str = "vxlan48";
 /// Consolidates host-level and DPU-level `ManagedHostNetworkConfig` into
 /// the single proto sent to `carbide-dpu-agent`. The host layer
 /// contributes shared fields (e.g. `use_admin_network`); the DPU layer
-/// contributes per-DPU fields (e.g. `loopback_ip`).
+/// contributes per-DPU fields (e.g. `loopback_ip`). The IPv6 loopback is
+/// present only for FNN so other agents keep their IPv4-only wire contract.
 fn build_consolidated_network_config(
     host_network_config: &model::machine::network::ManagedHostNetworkConfig,
     dpu_loopback_ip: IpAddr,
+    dpu_loopback_ip_v6: Option<Ipv6Addr>,
+    network_virtualization_type: VpcVirtualizationType,
 ) -> rpc::ManagedHostNetworkConfig {
     rpc::ManagedHostNetworkConfig {
         loopback_ip: dpu_loopback_ip.to_string(),
         quarantine_state: host_network_config.quarantine_state.clone().map(Into::into),
+        loopback_ip_v6: dpu_loopback_ip_v6
+            .filter(|_| network_virtualization_type == VpcVirtualizationType::Fnn)
+            .map(|ip| ip.to_string()),
     }
 }
 
-pub(crate) async fn get_managed_host_network_config_inner(
+/// FNN renders family-specific deny policies, while ETV exposes only its IPv4 policy. Filter at
+/// this per-DPU boundary so a mixed site can send IPv6 to FNN without changing the IPv4-only wire
+/// contract for ETV, Flat, and older agents.
+fn deny_prefixes_for_agent(
+    prefixes: &[IpNetwork],
+    network_virtualization_type: VpcVirtualizationType,
+) -> Vec<String> {
+    let supports_ipv6 = network_virtualization_type == VpcVirtualizationType::Fnn;
+
+    prefixes
+        .iter()
+        .filter(|prefix| supports_ipv6 || prefix.is_ipv4())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Builds the deprecated deny field with the same address-family contract as `deny_prefixes`.
+///
+/// Mutual isolation folds site-fabric prefixes into this field, so those prefixes must pass
+/// through the per-DPU filter as well.
+fn deprecated_deny_prefixes_for_agent(
+    deny_prefixes: &[String],
+    site_fabric_prefixes: &[IpNetwork],
+    isolation_behavior: VpcIsolationBehaviorType,
+    network_virtualization_type: VpcVirtualizationType,
+) -> Vec<String> {
+    match isolation_behavior {
+        VpcIsolationBehaviorType::MutualIsolation => {
+            let site_fabric_prefixes =
+                deny_prefixes_for_agent(site_fabric_prefixes, network_virtualization_type);
+            [site_fabric_prefixes.as_slice(), deny_prefixes].concat()
+        }
+        VpcIsolationBehaviorType::Open => deny_prefixes.to_vec(),
+    }
+}
+
+/// `preferred_physical_ip` chooses a stable address for the fallback tenant
+/// hostname. IPv4 remains the familiar name for a dual-stack interface, while
+/// choosing the lowest address within each family keeps the result independent
+/// of `HashMap` iteration order.
+fn preferred_physical_ip(ip_addresses: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
+    ip_addresses
+        .into_iter()
+        .min_by_key(|ip_address| (!ip_address.is_ipv4(), *ip_address))
+}
+
+/// `tenant_interface_fqdn` keeps the tenant's hostname intact when one was
+/// provided. Otherwise, the physical address becomes a valid DNS label through
+/// the same formatter used by IP-based host naming.
+fn tenant_interface_fqdn(
+    tenant_hostname: Option<&str>,
+    physical_ip: &IpAddr,
+    domain: &str,
+) -> Result<String, DatabaseError> {
+    let hostname = match tenant_hostname {
+        Some(hostname) => hostname.to_string(),
+        None => db::host_naming::address_to_hostname(physical_ip)?,
+    };
+
+    Ok(format!("{hostname}.{domain}"))
+}
+
+async fn get_managed_host_network_config_inner(
     api: &Api,
     dpu_machine_id: MachineId,
 ) -> Result<rpc::ManagedHostNetworkConfigResponse, tonic::Status> {
@@ -104,10 +175,11 @@ pub(crate) async fn get_managed_host_network_config_inner(
 
     let primary_dpu_snapshot = snapshot
         .host_snapshot
+        .status
         .interfaces
         .iter()
         .find(|x| x.primary_interface)
-        .ok_or_else(|| CarbideError::internal("Primary Interface is missing.".to_string()))?;
+        .ok_or_else(|| CarbideError::internal("primary interface is missing".to_string()))?;
 
     let primary_dpu = db::machine_interface::find_one(&mut txn, primary_dpu_snapshot.id).await?;
     let is_primary_dpu = primary_dpu
@@ -119,27 +191,10 @@ pub(crate) async fn get_managed_host_network_config_inner(
         Some(ip) => ip,
         None => {
             return Err(CarbideError::FailedPrecondition(format!(
-                "DPU {dpu_machine_id} needs discovery. Does not have a loopback IP yet."
+                "DPU {dpu_machine_id} needs discovery. does not have a loopback IP yet"
             ))
             .into());
         }
-    };
-
-    if api
-        .runtime_config
-        .vmaas_config
-        .as_ref()
-        .map(|vc| vc.secondary_overlay_support)
-        .unwrap_or_default()
-        && dpu_snapshot
-            .network_config
-            .secondary_overlay_vtep_ip
-            .is_none()
-    {
-        return Err(CarbideError::FailedPrecondition(format!(
-            "DPU {dpu_machine_id} needs discovery. Does not have a secondary VTEP IP yet."
-        ))
-        .into());
     };
 
     // its ok if there is no locator here.  if there isn't one, then only the primary dpu is allowed to be configred (checked below)
@@ -170,6 +225,8 @@ pub(crate) async fn get_managed_host_network_config_inner(
     // and keep it on admin. This prevents the host from using the DPU at all.
     let use_admin_network = snapshot.use_admin_network() || !dpu_has_tenant_interface_config;
 
+    let use_admin_network_changed = dpu_snapshot.network_config.use_admin_network_changed;
+
     let mut network_virtualization_type = VpcVirtualizationType::EthernetVirtualizer;
 
     let mut use_fnn_over_admin_nw = false;
@@ -190,6 +247,7 @@ pub(crate) async fn get_managed_host_network_config_inner(
 
     let booturl_override = if snapshot
         .host_snapshot
+        .status
         .hardware_info
         .as_ref()
         .map(|h| h.machine_type)
@@ -255,8 +313,12 @@ pub(crate) async fn get_managed_host_network_config_inner(
                 // network segment is empty, return error.
                 return Err(CarbideError::NetworkSegmentNotAllocated.into());
             };
-            let vpc = db::vpc::find_by_segment(&mut txn, network_segment_id)
-                .await?;
+            let Some(vpc) = db::vpc::find_by_segment(&mut txn, network_segment_id)
+                .await? else {
+                return Err(CarbideError::FailedPrecondition(
+                    "network segment is not a member of a VPC".to_string(),
+                ).into())
+            };
 
             network_virtualization_type = vpc.config.network_virtualization_type;
 
@@ -286,7 +348,12 @@ pub(crate) async fn get_managed_host_network_config_inner(
             }) {
                 // Make our DB query for the IDs to get our NetworkSecurityGroup
                 let network_security_group =
-                    network_security_group::find_by_ids(&mut txn, &[nsg_id.to_owned()], Some(tenant_id), false)
+                    network_security_group::find_by_ids(
+                        &mut txn,
+                        std::slice::from_ref(nsg_id),
+                        Some(tenant_id),
+                        false,
+                    )
                         .await?
                         .pop()
                         .ok_or(CarbideError::NotFoundError {
@@ -304,7 +371,6 @@ pub(crate) async fn get_managed_host_network_config_inner(
 
             let mut tenant_interfaces = Vec::with_capacity(interfaces.len());
 
-            //Get Physical interface
             let physical_iface = interfaces.iter().find(|x| {
                 rpc::InterfaceFunctionType::from(x.function_id.function_type())
                     == rpc::InterfaceFunctionType::Physical
@@ -317,15 +383,13 @@ pub(crate) async fn get_managed_host_network_config_inner(
                 .into());
             };
 
-            //Get Physical IP
-            let physical_ip: IpAddr = match physical_iface.ip_addrs.iter().next() {
-                Some((_, ip_addr)) => *ip_addr,
-                None => {
-                    return Err(CarbideError::internal(String::from(
-                        "Physical IP address not found",
-                    ))
-                    .into())
-                }
+            let Some(physical_ip) =
+                preferred_physical_ip(physical_iface.ip_addrs.values().copied())
+            else {
+                return Err(CarbideError::internal(String::from(
+                    "physical IP address not found",
+                ))
+                .into());
             };
 
             // All interfaces have the segment id allocated. It is already validated during
@@ -339,6 +403,19 @@ pub(crate) async fn get_managed_host_network_config_inner(
 
             let segment_details = segment_details.iter().map(|x|(x.id, x)).collect::<HashMap<_,_>>();
             let mut tenant_loopback_ips: HashMap<VpcId, String> = HashMap::new();
+
+            // Resolve every segment domain in a single query up front, then look each one up by id
+            // inside the interface loop. The domains map keeps its rows keyed by id so a missing
+            // entry still surfaces the same NotFoundError the per-interface lookup used to raise.
+            let subdomain_ids = segment_details
+                .values()
+                .filter_map(|segment| segment.config.subdomain_id)
+                .unique()
+                .collect_vec();
+            let domains_by_id =
+                db::dns::domain::find_by_uuids(txn.as_pgconn(), &subdomain_ids)
+                    .await
+                    .map_err(CarbideError::from)?;
 
             // if there is no device then this is a legacy config and only the primary dpu is allowed.
             // all other DPUs don't get interfaces
@@ -390,28 +467,21 @@ pub(crate) async fn get_managed_host_network_config_inner(
 
                 // Build the FQDN from this interface's segment domain.
                 let domain = match segment.config.subdomain_id {
-                    Some(domain_id) => {
-                        db::dns::domain::find_by_uuid(txn.as_pgconn(), domain_id)
-                            .await
-                            .map_err(CarbideError::from)?
-                            .ok_or_else(|| CarbideError::NotFoundError {
-                                kind: "domain",
-                                id: domain_id.to_string(),
-                            })?
-                            .name
-                    }
+                    Some(domain_id) => domains_by_id
+                        .get(&domain_id)
+                        .ok_or_else(|| CarbideError::NotFoundError {
+                            kind: "domain",
+                            id: domain_id.to_string(),
+                        })?
+                        .name
+                        .clone(),
                     None => "unknowndomain".to_string(),
                 };
-                let fqdn = if let Some(hostname) = &instance.config.tenant.hostname {
-                    format!("{hostname}.{domain}")
-                } else {
-                    let dashed_ip = physical_ip
-                        .to_string()
-                        .split('.')
-                        .collect::<Vec<_>>()
-                        .join("-");
-                    format!("{dashed_ip}.{domain}")
-                };
+                let fqdn = tenant_interface_fqdn(
+                    instance.config.tenant.hostname.as_deref(),
+                    &physical_ip,
+                    &domain,
+                )?;
 
                 let tenant_interface = ethernet_virtualization::tenant_network(
                     &mut txn,
@@ -452,6 +522,8 @@ pub(crate) async fn get_managed_host_network_config_inner(
     let network_config = build_consolidated_network_config(
         &snapshot.host_snapshot.network_config.value,
         loopback_ip,
+        dpu_snapshot.loopback_ip_v6(),
+        network_virtualization_type,
     );
 
     let asn = if network_virtualization_type == VpcVirtualizationType::Fnn {
@@ -461,36 +533,36 @@ pub(crate) async fn get_managed_host_network_config_inner(
                 dpu_snapshot.id
             );
 
-            tracing::error!(message);
+            tracing::error!(
+                dpu_machine_id = %dpu_snapshot.id,
+                "FNN-configured DPU has no ASN"
+            );
             CarbideError::internal(message)
         })?
     } else {
         api.eth_data.asn
     };
 
-    let deny_prefixes: Vec<String> = api
-        .eth_data
-        .deny_prefixes
-        .iter()
-        .map(|net| net.to_string())
-        .collect();
+    let deny_prefixes =
+        deny_prefixes_for_agent(&api.eth_data.deny_prefixes, network_virtualization_type);
 
-    let site_fabric_prefixes: Vec<String> = api
+    let site_fabric_networks = api
         .eth_data
         .site_fabric_prefixes
         .as_ref()
         .map(|s| s.as_ip_slice())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let site_fabric_prefixes: Vec<String> = site_fabric_networks
         .iter()
         .map(|net| net.to_string())
         .collect();
 
-    let deprecated_deny_prefixes = match api.runtime_config.vpc_isolation_behavior {
-        VpcIsolationBehaviorType::MutualIsolation => {
-            [site_fabric_prefixes.as_slice(), deny_prefixes.as_slice()].concat()
-        }
-        VpcIsolationBehaviorType::Open => deny_prefixes.clone(),
-    };
+    let deprecated_deny_prefixes = deprecated_deny_prefixes_for_agent(
+        &deny_prefixes,
+        site_fabric_networks,
+        api.runtime_config.vpc_isolation_behavior,
+        network_virtualization_type,
+    );
 
     // Strip the source_type for the route servers that we feed back to the DPUs -- they just care
     // about the IP address. Although, maybe in the future, we might be interested in sending the
@@ -517,23 +589,37 @@ pub(crate) async fn get_managed_host_network_config_inner(
 
     // First fetch from the database, while we have a transaction:
     let extension_service_info = if let Some(instance) = snapshot.instance.as_ref() {
-        let mut extension_service_info: Vec<ExtensionServiceInfo> =
-            Vec::with_capacity(instance.config.extension_services.service_configs.len());
-        for config in &instance.config.extension_services.service_configs {
-            // @TODO(Felicity): optimize database query to fetch all extension service versions at once.
-            //  This might be ok for now since the number of extension services is expected to be small.
-            let service_res =
-                db::extension_service::find_by_ids(&mut txn, &[config.service_id], false).await?;
-            let service =
-                service_res
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| CarbideError::NotFoundError {
-                        kind: "ExtensionService",
-                        id: config.service_id.to_string(),
-                    })?;
+        let service_configs = &instance.config.extension_services.service_configs;
 
-            let version = db::extension_service::find_version_info(
+        // Fetch every configured extension service in one query, then index by id so each config
+        // resolves its service from memory instead of issuing a query per config.
+        let service_ids = service_configs
+            .iter()
+            .map(|config| config.service_id)
+            .unique()
+            .collect_vec();
+        let services_by_id = db::extension_service::find_by_ids(&mut txn, &service_ids, false)
+            .await?
+            .into_iter()
+            .map(|service| (service.id, service))
+            .collect::<HashMap<_, _>>();
+
+        let mut extension_service_info: Vec<ExtensionServiceInfo> =
+            Vec::with_capacity(service_configs.len());
+        for config in service_configs {
+            let service = services_by_id
+                .get(&config.service_id)
+                .cloned()
+                .ok_or_else(|| CarbideError::NotFoundError {
+                    kind: "ExtensionService",
+                    id: config.service_id.to_string(),
+                })?;
+
+            // The pinned version is looked up individually so the exact
+            // `version == config.version` selection (and its full data/credential/observability
+            // payload) is preserved per config. The batched `services_by_id` lookup above already
+            // established the service exists, so this skips the per-service existence probe.
+            let version = db::extension_service::find_version_info_of_known_service(
                 &mut txn,
                 config.service_id,
                 Some(config.version),
@@ -584,6 +670,8 @@ pub(crate) async fn get_managed_host_network_config_inner(
     .await
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
+
+    let astra_config = get_astra_config(api, &snapshot).await?;
 
     let resp = rpc::ManagedHostNetworkConfigResponse {
         instance_id: snapshot.instance.as_ref().map(|instance| instance.id),
@@ -678,40 +766,6 @@ pub(crate) async fn get_managed_host_network_config_inner(
                 })
         }),
         routing_profile: deprecated_routing_profile,
-        traffic_intercept_config: api.runtime_config.vmaas_config.as_ref().map(|c| {
-            rpc::TrafficInterceptConfig {
-                bridging: c.bridging.as_ref().map(|b| rpc::TrafficInterceptBridging {
-                    internal_bridge_routing_prefix: b.internal_bridge_routing_prefix.to_string(),
-                    hbn_bridge: b.hbn_bridge.clone(),
-                    vf_intercept_bridge_name: b.vf_intercept_bridge_name.clone(),
-                    vf_intercept_bridge_port: b.vf_intercept_bridge_port.clone(),
-                    vf_intercept_bridge_sf: b.vf_intercept_bridge_sf.clone(),
-                    host_representor_intercept_bridging: b
-                        .host_representor_intercept_bridging
-                        .iter()
-                        .map(|(representor, bridge)| {
-                            (
-                                representor.clone(),
-                                rpc::HostRepresentorInterceptBridging {
-                                    bridge: bridge.bridge.clone(),
-                                    patch_port: bridge.patch_port.clone(),
-                                },
-                            )
-                        })
-                        .collect(),
-                }),
-                public_prefixes: c.public_prefixes.iter().map(|p| p.to_string()).collect(),
-                secondary_vtep_aggregate_prefixes: c
-                    .secondary_vtep_aggregate_prefixes
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect(),
-                additional_overlay_vtep_ip: dpu_snapshot
-                    .network_config
-                    .secondary_overlay_vtep_ip
-                    .map(|i| i.to_string()),
-            }
-        }),
 
         additional_route_target_imports: api
             .runtime_config
@@ -743,6 +797,8 @@ pub(crate) async fn get_managed_host_network_config_inner(
             },
             None => None,
         },
+        astra_config,
+        use_admin_network_changed,
     };
 
     // If this all worked, we shouldn't emit a log line
@@ -773,6 +829,76 @@ pub(crate) async fn update_agent_reported_inventory(
 
     let request = request.into_inner();
     let dpu_machine_id = convert_and_log_machine_id(request.machine_id.as_ref())?;
+
+    // For DPF-ingested DPUs the agent runs containerized and cannot enumerate
+    // the DPF services directly. Read service versions from the DPF operator
+    // on every inventory report so the DB stays current after upgrades.
+    let mut txn = api.txn_begin().await?;
+    let host_snapshot =
+        db::managed_host::load_snapshot(&mut txn, &dpu_machine_id, LoadSnapshotOptions::default())
+            .await?;
+    txn.commit().await?;
+
+    if let Some(snapshot) = host_snapshot
+        && snapshot.host_snapshot.config.dpf.used_for_ingestion
+    {
+        let machine = snapshot
+            .dpu_snapshots
+            .iter()
+            .find(|d| d.id == dpu_machine_id)
+            .ok_or_else(|| CarbideError::NotFoundError {
+                kind: "dpu",
+                id: dpu_machine_id.to_string(),
+            })?;
+
+        let dpf_sdk = api.dpf_sdk.as_ref().ok_or_else(|| {
+            CarbideError::internal(format!(
+                "dpf SDK unavailable but DPU {dpu_machine_id} was ingested via DPF"
+            ))
+        })?;
+
+        // Both BMC MACs are needed to build the DPU CR name queried from the DPF
+        // operator. If either is not yet recorded, skip the DPF inventory update
+        // for this report rather than rejecting it; a later heartbeat retries once
+        // the MACs are known.
+        let (Some(dpu_device_id), Some(host_node_id)) =
+            (machine.dpf_id(), snapshot.host_snapshot.dpf_id())
+        else {
+            tracing::debug!(
+                machine_id = %dpu_machine_id,
+                "skipping DPF service inventory update: DPU or host BMC MAC not yet known"
+            );
+            return Ok(Response::new(()));
+        };
+        let dpu_name = dpu_cr_name(&dpu_device_id, &host_node_id);
+
+        let service_versions = dpf_sdk
+            .get_service_versions_for_dpu(&dpu_name)
+            .await
+            .map_err(|e| CarbideError::internal(e.to_string()))?;
+
+        let inventory = MachineInventory {
+            components: service_versions
+                .into_iter()
+                .map(|v| MachineInventorySoftwareComponent {
+                    name: v.name,
+                    version: v.version,
+                    url: v.url,
+                })
+                .collect(),
+        };
+
+        let mut txn = api.txn_begin().await?;
+        db::machine::update_agent_reported_inventory(&mut txn, &dpu_machine_id, &inventory).await?;
+        txn.commit().await?;
+
+        tracing::debug!(
+            machine_id = %dpu_machine_id,
+            component_count = inventory.components.len(),
+            "updated DPF service inventory from operator",
+        );
+        return Ok(Response::new(()));
+    }
 
     if let Some(inventory) = request.inventory.as_ref() {
         let mut txn = api.txn_begin().await?;
@@ -850,6 +976,22 @@ pub(crate) async fn record_dpu_network_status(
 
     // Instance network observation is the part of network observation now.
     db::machine::update_network_status_observation(&mut txn, &dpu_machine_id, &machine_obs).await?;
+    if dpu_machine.network_config.value.use_admin_network_changed == Some(true)
+        && machine_obs.network_config_version.as_ref() == Some(&dpu_machine.network_config.version)
+    {
+        tracing::info!(
+            dpu_machine_id = %dpu_machine_id,
+            network_config_version = %dpu_machine.network_config.version,
+            agent_version = ?machine_obs.agent_version,
+            "Clearing use_admin_network_changed after matching-version ACK; OVS restart may have been skipped by agents that do not support the flag"
+        );
+        db::machine::clear_use_admin_network_changed_if_version_matches(
+            &mut txn,
+            &dpu_machine_id,
+            &dpu_machine.network_config.version,
+        )
+        .await?;
+    }
     tracing::trace!(
         machine_id = %dpu_machine_id,
         machine_network_config = ?request.network_config_version,
@@ -892,7 +1034,7 @@ pub(crate) async fn record_dpu_network_status(
             &mut txn,
             *host_interface_id,
             Some(timestamp.parse().map_err(|e| {
-                CarbideError::InvalidArgument(format!("Failed parsing dhcp timestamp: {e}"))
+                CarbideError::InvalidArgument(format!("failed parsing dhcp timestamp: {e}"))
             })?),
         )
         .await?;
@@ -923,7 +1065,7 @@ pub(crate) async fn record_dpu_network_status(
                 id: dpu_machine_id.to_string(),
             })?;
 
-        if snapshot.host_snapshot.dpf.used_for_ingestion {
+        if snapshot.host_snapshot.config.dpf.used_for_ingestion {
             // DPF-managed DPUs don't use this upgrade path. Clear any stale flag so the DPU
             // doesn't keep receiving upgrade signals after the host was switched to DPF.
             if dpu_machine.needs_agent_upgrade() {
@@ -942,6 +1084,10 @@ pub(crate) async fn record_dpu_network_status(
     }
 
     txn.commit().await?;
+
+    if let Some(astra_config_status) = request.astra_config_status.as_ref() {
+        process_astra_config_status(api, &dpu_machine_id, astra_config_status).await?;
+    }
 
     // If this all worked and the DPU is healthy, we shouldn't emit a log line
     // If there is any error the report, the logging of the follow-up report is
@@ -968,7 +1114,13 @@ pub(crate) async fn record_dpu_network_status(
     if any_observed_version_changed
         && let Err(err) = wakeup_host_state_handler_by_dpu_id(api, &dpu_machine_id).await
     {
-        tracing::warn!(%err, %dpu_machine_id, "Failed to wakeup state handler for host machine");
+        // The host machine could not even be looked up, so the identity in
+        // hand is the reporting DPU rather than the host that stays asleep.
+        carbide_instrument::emit(StateHandlerWakeupFailed {
+            trigger: WakeupTrigger::DpuNetworkStatus,
+            machine_id: dpu_machine_id,
+            err: err.to_string(),
+        });
     }
 
     Ok(Response::new(()))
@@ -978,15 +1130,21 @@ async fn wakeup_host_state_handler_by_dpu_id(
     api: &Api,
     dpu_machine_id: &MachineId,
 ) -> Result<(), DatabaseError> {
-    let mut txn = api.txn_begin().await?;
-    let host_machine =
-        db::machine::lookup_host_machine_ids_by_dpu_ids(&mut txn, &[*dpu_machine_id]).await?;
-    txn.rollback().await?;
-
-    if let Some(host_machine_id) = host_machine.first() {
-        api.machine_state_handler_enqueuer
-            .enqueue_object(host_machine_id)
+    let host_machines_by_dpu_ids =
+        db::machine::lookup_host_machine_ids_by_dpu_ids(&mut api.db_reader(), &[*dpu_machine_id])
             .await?;
+
+    if let Some(host_machine_id) = host_machines_by_dpu_ids.get(dpu_machine_id)
+        && let Err(err) = api
+            .machine_state_handler_enqueuer
+            .enqueue_object(host_machine_id)
+            .await
+    {
+        carbide_instrument::emit(StateHandlerWakeupFailed {
+            trigger: WakeupTrigger::DpuNetworkStatus,
+            machine_id: *host_machine_id,
+            err: err.to_string(),
+        });
     }
 
     Ok(())
@@ -1032,7 +1190,7 @@ pub(crate) async fn dpu_agent_upgrade_check(
     log_machine_id(&machine_id);
     if !machine_id.machine_type().is_dpu() {
         return Err(CarbideError::InvalidArgument(
-            "Upgrade check can only be performed on DPUs".into(),
+            "upgrade check can only be performed on DPUs".into(),
         )
         .into());
     }
@@ -1153,7 +1311,7 @@ pub(crate) async fn trigger_dpu_reprovisioning(
             .contains(&health_report::HealthAlertClassification::prevent_allocations())
     }) {
         return Err(CarbideError::InvalidArgument(format!(
-            "Machine {machine_id} must have a 'HostUpdateInProgress' health alert with the 'PreventAllocations' classification before reprovisioning. Set this precondition with: `machine health-override add --template host-update <id>`.",
+            "machine {machine_id} must have a 'HostUpdateInProgress' health alert with the 'PreventAllocations' classification before reprovisioning. set this precondition with: `machine health-override add --template host-update <id>`",
         )).into());
     }
 
@@ -1166,7 +1324,7 @@ pub(crate) async fn trigger_dpu_reprovisioning(
             Mode::Restart => {}
             _ => {
                 return Err(CarbideError::internal(
-                    "Reprovisioning is already started.".to_string(),
+                    "reprovisioning is already started".to_string(),
                 )
                 .into());
             }
@@ -1210,12 +1368,12 @@ pub(crate) async fn trigger_dpu_reprovisioning(
             // Restart case.
             // Restart is valid only for host_id.
             if !machine_id.machine_type().is_host() {
-                return Err(CarbideError::InvalidArgument("A restart has to be triggered for all DPUs together. Only host_id is accepted for restart operation.".to_string()).into());
+                return Err(CarbideError::InvalidArgument("A restart has to be triggered for all DPUs together. only host_id is accepted for restart operation".to_string()).into());
             }
 
             if !snapshot.has_managed_dpus() {
                 return Err(CarbideError::InvalidArgument(
-                    "Machine has no DPUs, cannot trigger DPU reprovisioning.".to_string(),
+                    "machine has no DPUs, cannot trigger DPU reprovisioning".to_string(),
                 )
                 .into());
             }
@@ -1234,7 +1392,7 @@ pub(crate) async fn trigger_dpu_reprovisioning(
 
             if ids.is_empty() {
                 return Err(CarbideError::InvalidArgument(
-                    format!("No DPUs are currently reprovisioning on {machine_id}, cannot restart reprovisioning. Use `set` to begin reprovisioning DPUs."),
+                    format!("no DPUs are currently reprovisioning on {machine_id}, cannot restart reprovisioning. use `set` to begin reprovisioning DPUs"),
                 )
                     .into());
             }
@@ -1294,7 +1452,7 @@ pub(crate) async fn list_dpu_waiting_for_reprovisioning(
 }
 
 /// Get the configured BGP password.
-pub(crate) async fn get_bgp_password(
+async fn get_bgp_password(
     credential_reader: &dyn carbide_secrets::credentials::CredentialReader,
     credential_key: carbide_secrets::credentials::CredentialKey,
 ) -> Result<String, CarbideError> {
@@ -1316,9 +1474,144 @@ pub(crate) async fn get_bgp_password(
 }
 
 #[cfg(test)]
-mod consolidated_network_config_tests {
-    use std::net::Ipv4Addr;
+mod deny_prefix_tests {
+    use carbide_test_support::value_scenarios;
 
+    use super::*;
+
+    #[test]
+    fn prefixes_follow_the_effective_virtualizer() {
+        let prefixes = ["192.0.2.0/24", "2001:db8::/32"].map(|prefix| prefix.parse().unwrap());
+        let ipv4_only = vec!["192.0.2.0/24".to_string()];
+
+        value_scenarios!(
+            run = |virtualization_type| {
+                deny_prefixes_for_agent(&prefixes, virtualization_type)
+            };
+            "dual-stack agent policy" {
+                VpcVirtualizationType::Fnn => vec![
+                    "192.0.2.0/24".to_string(),
+                    "2001:db8::/32".to_string(),
+                ],
+            }
+
+            "non-FNN wire compatibility" {
+                VpcVirtualizationType::EthernetVirtualizer => ipv4_only.clone(),
+                VpcVirtualizationType::EthernetVirtualizerWithNvue => ipv4_only.clone(),
+                VpcVirtualizationType::Flat => ipv4_only,
+            }
+        );
+    }
+
+    #[test]
+    fn deprecated_field_filters_dual_stack_site_fabric() {
+        let deny_prefixes = vec!["198.51.100.0/24".to_string()];
+        let site_fabric_prefixes =
+            ["192.0.2.0/24", "2001:db8::/32"].map(|prefix| prefix.parse().unwrap());
+        let fnn_prefixes = vec![
+            "192.0.2.0/24".to_string(),
+            "2001:db8::/32".to_string(),
+            "198.51.100.0/24".to_string(),
+        ];
+        let ipv4_only = vec!["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()];
+
+        value_scenarios!(
+            run = |virtualization_type| deprecated_deny_prefixes_for_agent(
+                &deny_prefixes,
+                &site_fabric_prefixes,
+                VpcIsolationBehaviorType::MutualIsolation,
+                virtualization_type,
+            );
+            "dual-stack FNN compatibility field" {
+                VpcVirtualizationType::Fnn => fnn_prefixes,
+            }
+
+            "IPv4-only compatibility field" {
+                VpcVirtualizationType::EthernetVirtualizer => ipv4_only.clone(),
+                VpcVirtualizationType::EthernetVirtualizerWithNvue => ipv4_only.clone(),
+                VpcVirtualizationType::Flat => ipv4_only,
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod tenant_fqdn_tests {
+    use carbide_test_support::Outcome::Yields;
+    use carbide_test_support::{scenarios, value_scenarios};
+
+    use super::*;
+
+    #[test]
+    fn physical_ip_selection_is_stable_and_prefers_ipv4() {
+        let ipv4_low: IpAddr = "192.0.2.10".parse().unwrap();
+        let ipv4_high: IpAddr = "192.0.2.20".parse().unwrap();
+        let ipv6_low: IpAddr = "2001:db8::10".parse().unwrap();
+        let ipv6_high: IpAddr = "2001:db8::20".parse().unwrap();
+
+        value_scenarios!(
+            run = preferred_physical_ip;
+            "no physical address" {
+                vec![] => None,
+            }
+
+            "one address family" {
+                vec![ipv4_high, ipv4_low] => Some(ipv4_low),
+                vec![ipv6_high, ipv6_low] => Some(ipv6_low),
+            }
+
+            "dual-stack address order" {
+                vec![ipv6_low, ipv4_high, ipv6_high, ipv4_low] => Some(ipv4_low),
+                vec![ipv4_low, ipv6_high, ipv4_high, ipv6_low] => Some(ipv4_low),
+            }
+        );
+    }
+
+    #[test]
+    fn tenant_fqdn_uses_the_configured_name_or_physical_address() {
+        struct FqdnCase {
+            tenant_hostname: Option<&'static str>,
+            physical_ip: IpAddr,
+        }
+
+        let ipv4: IpAddr = "192.0.2.10".parse().unwrap();
+        let ipv6: IpAddr = "2001:db8::10".parse().unwrap();
+
+        scenarios!(
+            run = |FqdnCase {
+                tenant_hostname,
+                physical_ip,
+            }| tenant_interface_fqdn(tenant_hostname, &physical_ip, "tenant.example").map_err(drop);
+            "tenant-supplied hostname" {
+                FqdnCase {
+                    tenant_hostname: Some("customer-host"),
+                    physical_ip: ipv6,
+                } => Yields("customer-host.tenant.example".to_string()),
+            }
+
+            "address-derived hostname" {
+                FqdnCase {
+                    tenant_hostname: None,
+                    physical_ip: ipv4,
+                } => Yields("192-0-2-10.tenant.example".to_string()),
+                FqdnCase {
+                    tenant_hostname: None,
+                    physical_ip: ipv6,
+                } => Yields(concat!(
+                    "2001-0db8-0000-0000-0000-0000-0000-0010",
+                    ".tenant.example"
+                )
+                .to_string()),
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod consolidated_network_config_tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use carbide_test_support::value_scenarios;
     use model::machine::network::{
         ManagedHostNetworkConfig, ManagedHostQuarantineMode, ManagedHostQuarantineState,
     };
@@ -1334,7 +1627,12 @@ mod consolidated_network_config_tests {
     #[test]
     fn dpu_loopback_ip_carries_through_with_empty_host_layer() {
         let host = ManagedHostNetworkConfig::default();
-        let consolidated = build_consolidated_network_config(&host, dpu_ip());
+        let consolidated = build_consolidated_network_config(
+            &host,
+            dpu_ip(),
+            None,
+            VpcVirtualizationType::EthernetVirtualizer,
+        );
         assert_eq!(consolidated.loopback_ip, "10.0.0.1");
         assert!(consolidated.quarantine_state.is_none());
     }
@@ -1350,15 +1648,20 @@ mod consolidated_network_config_tests {
             }),
             ..ManagedHostNetworkConfig::default()
         };
-        let consolidated = build_consolidated_network_config(&host, dpu_ip());
+        let consolidated = build_consolidated_network_config(
+            &host,
+            dpu_ip(),
+            None,
+            VpcVirtualizationType::EthernetVirtualizer,
+        );
         assert_eq!(consolidated.loopback_ip, "10.0.0.1");
         let qs = consolidated.quarantine_state.expect("quarantine_state");
         assert_eq!(qs.reason.as_deref(), Some("test"));
     }
 
     // Host-layer fields that aren't part of the consolidated proto shape
-    // (loopback_ip on the host, secondary_overlay_vtep_ip, use_admin_network)
-    // do NOT leak into the response -- the consolidator deliberately picks
+    // (loopback_ip on the host and use_admin_network) do NOT leak into the
+    // response -- the consolidator deliberately picks
     // only quarantine_state from the host layer. Catches accidental changes
     // to that contract.
     #[test]
@@ -1368,17 +1671,70 @@ mod consolidated_network_config_tests {
             // be served to the DPU agent -- the DPU's own loopback_ip
             // (passed separately) is what matters.
             loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))),
-            secondary_overlay_vtep_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 100))),
+            loopback_ip_v6: None,
             // The host-level use_admin_network is reported in a separate
             // top-level response field, not in this consolidated struct.
             use_admin_network: Some(false),
             quarantine_state: None,
+            use_admin_network_changed: None,
         };
-        let consolidated = build_consolidated_network_config(&host, dpu_ip());
+        let consolidated = build_consolidated_network_config(
+            &host,
+            dpu_ip(),
+            None,
+            VpcVirtualizationType::EthernetVirtualizer,
+        );
         assert_eq!(
             consolidated.loopback_ip, "10.0.0.1",
             "consolidator must use the dpu_loopback_ip arg, not host.loopback_ip"
         );
         assert!(consolidated.quarantine_state.is_none());
+    }
+
+    #[test]
+    fn dpu_ipv6_loopback_carries_through_independently() {
+        let host_ip = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1);
+        let first_dpu_ip = Ipv6Addr::new(0x2001, 0xdb8, 0x2390, 0, 0, 0, 0, 1);
+        let second_dpu_ip = Ipv6Addr::new(0x2001, 0xdb8, 0x2390, 0, 0, 0, 0, 2);
+
+        value_scenarios!(
+            run = |(host_loopback_ip_v6, dpu_loopback_ip_v6, virtualization_type)| {
+                let host = ManagedHostNetworkConfig {
+                    loopback_ip_v6: host_loopback_ip_v6,
+                    ..ManagedHostNetworkConfig::default()
+                };
+                build_consolidated_network_config(
+                    &host,
+                    dpu_ip(),
+                    dpu_loopback_ip_v6,
+                    virtualization_type,
+                )
+                .loopback_ip_v6
+            };
+            "FNN uses the requesting DPU's IPv6 loopback" {
+                (None, None, VpcVirtualizationType::Fnn) => None,
+                (Some(host_ip), None, VpcVirtualizationType::Fnn) => None,
+                (None, Some(first_dpu_ip), VpcVirtualizationType::Fnn) => {
+                    Some(first_dpu_ip.to_string())
+                },
+                (Some(host_ip), Some(second_dpu_ip), VpcVirtualizationType::Fnn) => {
+                    Some(second_dpu_ip.to_string())
+                },
+            }
+
+            "non-FNN agents keep the IPv4-only wire contract" {
+                (
+                    None,
+                    Some(first_dpu_ip),
+                    VpcVirtualizationType::EthernetVirtualizer,
+                ) => None,
+                (
+                    None,
+                    Some(first_dpu_ip),
+                    VpcVirtualizationType::EthernetVirtualizerWithNvue,
+                ) => None,
+                (None, Some(first_dpu_ip), VpcVirtualizationType::Flat) => None,
+            }
+        );
     }
 }

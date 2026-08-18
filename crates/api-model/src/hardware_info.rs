@@ -16,7 +16,6 @@
  */
 
 //! Describes hardware that is discovered by Forge
-
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
@@ -108,6 +107,12 @@ pub struct NvmeDevice {
     pub firmware_rev: String,
     #[serde(default)]
     pub serial: String,
+    /// Total capacity of the drive in MB, when discoverable.
+    #[serde(default)]
+    pub size_mb: Option<u32>,
+    /// Full sysfs device path (DEVPATH), used for SKU PCI-location validation.
+    #[serde(default)]
+    pub pci_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,13 +287,13 @@ pub struct TpmDescription {
 
 #[derive(thiserror::Error, Debug)]
 pub enum HardwareInfoError {
-    #[error("DPU Info is missing.")]
+    #[error("DPU info is missing")]
     MissingDpuInfo,
 
-    #[error("Mac address conversion error: {0}")]
+    #[error("mac address conversion error: {0}")]
     MacAddressConversionError(#[from] MacParseError),
 
-    #[error("Missing hardware info: {0}")]
+    #[error("missing hardware info: {0}")]
     MissingHardwareInfo(#[from] MissingHardwareInfo),
 }
 
@@ -327,10 +332,13 @@ impl HardwareInfo {
             .collect()
     }
 
-    pub fn is_gbx00(&self) -> bool {
-        self.dmi_data
-            .as_ref()
-            .is_some_and(|dmi| dmi.product_name.contains("GB200")) // TODO: for now just do GB200
+    /// Returns true when hardware reports at least one GPU with NVLink platform metadata
+    /// and an MNNVL family name on the GPU or, when absent there, in DMI `product_name`.
+    pub fn is_mnnvl_capable(&self) -> bool {
+        let dmi_product_name = self.dmi_data.as_ref().map(|dmi| dmi.product_name.as_str());
+        self.gpus
+            .iter()
+            .any(|gpu| is_mnnvl_capable_gpu(gpu, dmi_product_name))
     }
 
     pub fn is_dgx_h100(&self) -> bool {
@@ -338,6 +346,57 @@ impl HardwareInfo {
             .as_ref()
             .is_some_and(|dmi| dmi.sys_vendor == "NVIDIA" && dmi.product_name == "DGXH100")
     }
+
+    /// Chassis serial from the first GPU `platform_info`, when present and non-empty.
+    pub fn first_gpu_platform_chassis_serial(&self) -> Option<&str> {
+        self.gpus
+            .first()
+            .and_then(|gpu| gpu.platform_info.as_ref())
+            .map(|platform_info| platform_info.chassis_serial.as_str())
+            .filter(|serial| !serial.trim().is_empty())
+    }
+}
+
+/// Substrings matched against GPU `name` or DMI `product_name` to identify MNNVL-capable hardware.
+pub const MNNVL_KNOWN_GPU_NAMES: &[&str] = &["GB200", "GB300", "VR NVL"];
+
+/// Returns true when `name` contains any [`MNNVL_KNOWN_GPU_NAMES`] entry.
+pub fn gpu_name_indicates_mnnvl(name: &str) -> bool {
+    MNNVL_KNOWN_GPU_NAMES
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
+/// Returns true when a GPU has `platform_info` and its name matches an MNNVL marker, or when
+/// the GPU name does not match and DMI `product_name` does.
+pub fn is_mnnvl_capable_gpu(gpu: &Gpu, dmi_product_name: Option<&str>) -> bool {
+    if gpu.platform_info.is_none() {
+        return false;
+    }
+    if gpu_name_indicates_mnnvl(&gpu.name) {
+        return true;
+    }
+    dmi_product_name.is_some_and(gpu_name_indicates_mnnvl)
+}
+
+/// Builds SQL `LIKE` conditions matching GPU `name` or DMI `product_name` against
+/// [`MNNVL_KNOWN_GPU_NAMES`].
+pub fn mnnvl_gpu_name_sql_like_conditions() -> String {
+    let gpu_name_conditions = MNNVL_KNOWN_GPU_NAMES
+        .iter()
+        .map(|marker| format!("gpu->>'name' LIKE '%{marker}%'"))
+        .collect::<Vec<_>>()
+        .join("\n                      OR ");
+    let dmi_product_name_conditions = MNNVL_KNOWN_GPU_NAMES
+        .iter()
+        .map(|marker| {
+            format!(
+                "mt.topology->'discovery_data'->'Info'->'dmi_data'->>'product_name' LIKE '%{marker}%'"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n                      OR ");
+    format!("{gpu_name_conditions}\n                      OR {dmi_product_name_conditions}")
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -362,6 +421,7 @@ impl Display for MachineInventorySoftwareComponent {
 pub struct MachineNvLinkInfo {
     pub domain_uuid: NvLinkDomainId,
     /// Chassis serial from the first GPU `GpuPlatformInfo` at discovery (or operator RPC).
+    #[serde(default)]
     pub chassis_serial: String,
     pub gpus: Vec<NvLinkGpu>,
 }
@@ -414,6 +474,36 @@ mod tests {
     const DPU_INFO_JSON: &[u8] = include_bytes!("hardware_info/test_data/dpu_info.json");
     const DPU_BF3_INFO_JSON: &[u8] = include_bytes!("hardware_info/test_data/dpu_bf3_info.json");
     const X86_INFO_JSON: &[u8] = include_bytes!("hardware_info/test_data/x86_info.json");
+
+    /// Pre-NMX-C rows stored `nvlink_info` without `chassis_serial` (and GPUs carried `nmx_m_id`).
+    #[test]
+    fn machine_nvlink_info_deserializes_legacy_json_without_chassis_serial() {
+        let domain_uuid: NvLinkDomainId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".parse().unwrap();
+        let legacy_json = r#"{
+            "domain_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "gpus": [{
+                "nmx_m_id": "legacy-partition-id",
+                "tray_index": 0,
+                "slot_id": 1,
+                "device_id": 1,
+                "guid": 12345
+            }]
+        }"#;
+
+        let info: MachineNvLinkInfo = serde_json::from_str(legacy_json).unwrap();
+
+        assert_eq!(info.domain_uuid, domain_uuid);
+        assert_eq!(info.chassis_serial, "");
+        assert_eq!(
+            info.gpus,
+            vec![NvLinkGpu {
+                tray_index: 0,
+                slot_id: 1,
+                device_id: 1,
+                guid: 12345,
+            }]
+        );
+    }
 
     #[test]
     fn test_machine_inventory_json_representation() {
@@ -788,23 +878,11 @@ mod tests {
         );
     }
 
-    // `bmc_vendor()` maps the DMI `sys_vendor` string through `from_udev_dmi`, and
-    // falls back to `Unknown` when there is no DMI data at all.
     #[test]
     fn hardware_info_bmc_vendor() {
         value_scenarios!(
             run = |info| info.bmc_vendor();
-            "lenovo sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "Lenovo".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Lenovo,
-            }
-
-            "dell sys vendor" {
+            "DMI data delegates to BMCVendor" {
                 info_with_dmi(
                     CpuArchitecture::X86_64,
                     DmiData {
@@ -814,107 +892,151 @@ mod tests {
                 ) => bmc_vendor::BMCVendor::Dell,
             }
 
-            "nvidia sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::Aarch64,
-                    DmiData {
-                        sys_vendor: "NVIDIA".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Nvidia,
-            }
-
-            "mellanox url maps to nvidia" {
-                info_with_dmi(
-                    CpuArchitecture::Aarch64,
-                    DmiData {
-                        sys_vendor: "https://www.mellanox.com".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Nvidia,
-            }
-
-            "supermicro sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "Supermicro".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Supermicro,
-            }
-
-            "hpe sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "HPE".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Hpe,
-            }
-
-            "unrecognized sys vendor is unknown" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "Acme Corp".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Unknown,
-            }
-
-            "case-sensitive: lowercase dell is unknown" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "dell inc.".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Unknown,
-            }
-
-            "no dmi data is unknown" {
+            "missing DMI data falls back to unknown" {
                 HardwareInfo::default() => bmc_vendor::BMCVendor::Unknown,
             }
         );
     }
 
-    // `is_gbx00()` checks for a "GB200" substring in the product name; `is_dgx_h100()`
-    // wants an exact NVIDIA / DGXH100 pairing.
     #[test]
-    fn hardware_info_product_predicates() {
+    fn first_gpu_platform_chassis_serial() {
         value_scenarios!(
-            run = |(product_name, _)| {
-                info_with_dmi(
-                    CpuArchitecture::Aarch64,
-                    DmiData {
-                        product_name: product_name.to_string(),
-                        ..Default::default()
-                    },
-                )
-                .is_gbx00()
-            };
-            "exact GB200 product name" {
-                ("GB200", false) => true,
+            run = |info| info.first_gpu_platform_chassis_serial().map(str::to_string);
+            "no GPUs" {
+                HardwareInfo::default() => None,
             }
 
-            "GB200 as a substring" {
-                ("NVIDIA GB200 NVL72", false) => true,
+            "GPU with missing platform_info" {
+                hardware_info_with_gpu(gpu_without_platform_info("NVIDIA GB200")) => None,
             }
 
-            "different product is not gbx00" {
-                ("GB300", false) => false,
+            "blank chassis serial" {
+                hardware_info_with_gpu(gpu_with_platform_info("NVIDIA GB200", "")) => None,
             }
 
-            "empty product name is not gbx00" {
-                ("", false) => false,
+            "whitespace-only chassis serial" {
+                hardware_info_with_gpu(gpu_with_platform_info("NVIDIA GB200", "   \t  ")) => None,
             }
 
-            "case-sensitive: lowercase gb200 is not gbx00" {
-                ("gb200", false) => false,
+            "valid chassis serial" {
+                hardware_info_with_gpu(gpu_with_platform_info("NVIDIA GB200", "chassis-1"))
+                    => Some("chassis-1".to_string()),
             }
         );
+    }
+
+    fn hardware_info_with_gpu(gpu: Gpu) -> HardwareInfo {
+        let mut info = HardwareInfo::default();
+        info.gpus.push(gpu);
+        info
+    }
+
+    fn gpu_without_platform_info(name: &str) -> Gpu {
+        Gpu {
+            name: name.to_string(),
+            serial: String::new(),
+            driver_version: String::new(),
+            vbios_version: String::new(),
+            inforom_version: String::new(),
+            total_memory: String::new(),
+            frequency: String::new(),
+            pci_bus_id: String::new(),
+            platform_info: None,
+        }
+    }
+
+    fn gpu_with_platform_info(name: &str, chassis_serial: &str) -> Gpu {
+        Gpu {
+            name: name.to_string(),
+            serial: String::new(),
+            driver_version: String::new(),
+            vbios_version: String::new(),
+            inforom_version: String::new(),
+            total_memory: String::new(),
+            frequency: String::new(),
+            pci_bus_id: String::new(),
+            platform_info: Some(GpuPlatformInfo {
+                chassis_serial: chassis_serial.to_string(),
+                slot_number: 1,
+                tray_index: 1,
+                host_id: 1,
+                module_id: 1,
+                fabric_guid: "0x1".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn hardware_info_is_mnnvl_capable() {
+        value_scenarios!(
+            run = |(gpu_name, has_platform_info)| {
+                let mut info = HardwareInfo::default();
+                if has_platform_info {
+                    info.gpus.push(gpu_with_platform_info(gpu_name, "chassis-1"));
+                } else {
+                    info.gpus.push(Gpu {
+                        name: gpu_name.to_string(),
+                        serial: String::new(),
+                        driver_version: String::new(),
+                        vbios_version: String::new(),
+                        inforom_version: String::new(),
+                        total_memory: String::new(),
+                        frequency: String::new(),
+                        pci_bus_id: String::new(),
+                        platform_info: None,
+                    });
+                }
+                info.is_mnnvl_capable()
+            };
+            "GB200 GPU with platform_info is MNNVL capable" {
+                ("NVIDIA GB200", true) => true,
+            }
+
+            "GB300 GPU with platform_info is MNNVL capable" {
+                ("NVIDIA GB300", true) => true,
+            }
+
+            "VR GPU with platform_info is MNNVL capable" {
+                ("NVIDIA VR NVL72 ES", true) => true,
+            }
+
+            "GPU name without platform_info is not MNNVL capable" {
+                ("NVIDIA GB200", false) => false,
+            }
+
+            "platform_info without MNNVL GPU name is not MNNVL capable" {
+                ("NVIDIA H100 PCIe", true) => false,
+            }
+        );
+    }
+
+    #[test]
+    fn hardware_info_is_mnnvl_capable_falls_back_to_dmi_product_name() {
+        let mut info = info_with_dmi(
+            CpuArchitecture::Aarch64,
+            DmiData {
+                product_name: "GB200 NVL".to_string(),
+                ..Default::default()
+            },
+        );
+        info.gpus
+            .push(gpu_with_platform_info("NVIDIA H100 PCIe", "chassis-1"));
+        assert!(info.is_mnnvl_capable());
+    }
+
+    #[test]
+    fn mnnvl_gpu_name_sql_like_conditions_match_markers() {
+        let sql = mnnvl_gpu_name_sql_like_conditions();
+        for marker in MNNVL_KNOWN_GPU_NAMES {
+            assert!(
+                sql.contains(&format!("gpu->>'name' LIKE '%{marker}%'")),
+                "expected SQL filter to include GPU name marker {marker:?}, got: {sql}"
+            );
+            assert!(
+                sql.contains(&format!("dmi_data'->>'product_name' LIKE '%{marker}%'")),
+                "expected SQL filter to include DMI product_name marker {marker:?}, got: {sql}"
+            );
+        }
     }
 
     // `is_dgx_h100()` requires both sys_vendor == "NVIDIA" and product_name == "DGXH100".

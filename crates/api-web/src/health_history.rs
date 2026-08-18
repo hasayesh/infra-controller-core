@@ -37,7 +37,7 @@ struct MachineHealth {
 }
 
 /// Show the health history for a certain Machine
-pub async fn show_health_history(
+pub(super) async fn show_health_history(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(machine_id): AxumPath<String>,
 ) -> Response {
@@ -54,7 +54,7 @@ pub async fn show_health_history(
     (StatusCode::OK, Html(display.render().unwrap())).into_response()
 }
 
-pub async fn show_health_history_json(
+pub(super) async fn show_health_history_json(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(machine_id): AxumPath<String>,
 ) -> Response {
@@ -65,7 +65,7 @@ pub async fn show_health_history_json(
     (StatusCode::OK, Json(health_records)).into_response()
 }
 
-pub async fn fetch_health_records(
+async fn fetch_health_records(
     api: &Api,
     machine_id: &str,
 ) -> Result<(MachineId, Vec<HealthHistoryRecord>), (http::StatusCode, String)> {
@@ -76,7 +76,7 @@ pub async fn fetch_health_records(
     let health_records = match fetch_health_history(api, &machine_id).await {
         Ok(records) => records,
         Err(err) => {
-            tracing::error!(%err, %machine_id, "find_machine_health_histories");
+            tracing::error!(error = %err, %machine_id, "find_machine_health_histories");
             return Err((StatusCode::INTERNAL_SERVER_ERROR, String::new()));
         }
     };

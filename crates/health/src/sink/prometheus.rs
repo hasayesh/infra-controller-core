@@ -96,6 +96,9 @@ impl PrometheusSink {
         if let Some(machine_id) = context.machine_id() {
             labels.push((Cow::Borrowed("machine_id"), machine_id.to_string()));
         }
+        if let Some(system_uuid) = context.system_uuid() {
+            labels.push((Cow::Borrowed("system_uuid"), system_uuid.to_string()));
+        }
         if let Some(switch_id) = context.switch_id() {
             labels.push((Cow::Borrowed("switch_id"), switch_id.to_string()));
         }
@@ -154,12 +157,12 @@ impl PrometheusSink {
         }
     }
 
-    fn remove_collector_metrics(&self, context: &EventContext) {
+    fn remove_collector_metrics(&self, context: &EventContext) -> Result<(), HealthError> {
         let Some(endpoint_metrics) = self.stream_metrics.get::<str>(context.endpoint_key()) else {
-            return;
+            return Ok(());
         };
         let Some((_, metrics)) = endpoint_metrics.remove(context.collector_type) else {
-            return;
+            return Ok(());
         };
 
         metrics.clear();
@@ -170,7 +173,10 @@ impl PrometheusSink {
                 collector = context.collector_type,
                 "Failed to unregister Prometheus stream metrics"
             );
+            return Err(error.into());
         }
+
+        Ok(())
     }
 }
 
@@ -179,7 +185,11 @@ impl DataSink for PrometheusSink {
         "prometheus_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), HealthError> {
         match event {
             CollectorEvent::MetricCollectionStart => {
                 match self.get_or_create_stream_metrics(context) {
@@ -191,11 +201,18 @@ impl DataSink for PrometheusSink {
                             collector = context.collector_type,
                             "Failed to initialize Prometheus stream metrics"
                         );
+                        return Err(error);
                     }
                 }
             }
             CollectorEvent::Metric(sample) => match self.get_or_create_stream_metrics(context) {
                 Ok(stream_metrics) => {
+                    let mut labels = sample.labels.clone();
+                    for (name, value) in context.labels() {
+                        if labels.iter().all(|(existing, _)| existing.as_ref() != name) {
+                            labels.push((Cow::Owned(name.clone()), value.clone()));
+                        }
+                    }
                     stream_metrics.record(
                         GaugeReading::new(
                             Self::metric_reading_key(sample),
@@ -204,7 +221,7 @@ impl DataSink for PrometheusSink {
                             sample.unit.clone(),
                             sample.value,
                         )
-                        .with_labels(sample.labels.clone()),
+                        .with_labels(labels),
                     );
                 }
                 Err(error) => {
@@ -216,6 +233,7 @@ impl DataSink for PrometheusSink {
                         metric_type = sample.metric_type,
                         "Failed to record Prometheus metric sample"
                     );
+                    return Err(error);
                 }
             },
             CollectorEvent::MetricCollectionEnd => {
@@ -226,11 +244,13 @@ impl DataSink for PrometheusSink {
                     entry.value().sweep_stale();
                 }
             }
-            CollectorEvent::CollectorRemoved => self.remove_collector_metrics(context),
+            CollectorEvent::CollectorRemoved => return self.remove_collector_metrics(context),
             CollectorEvent::Log(_)
             | CollectorEvent::Firmware(_)
             | CollectorEvent::HealthReport(_) => {}
         }
+
+        Ok(())
     }
 }
 
@@ -263,14 +283,19 @@ mod tests {
                 mac: MacAddress::from_str("42:9e:b1:bd:9d:dd").unwrap(),
             },
             collector_type: "sensor_collector",
+            labels: Default::default(),
             metadata: Some(EndpointMetadata::Machine(MachineData {
-                machine_id: "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
-                    .parse()
-                    .expect("valid machine id"),
+                machine_id: Some(
+                    "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
+                        .parse()
+                        .expect("valid machine id"),
+                ),
                 machine_serial: Some("MN-001".to_string()),
+                system_uuid: Some(uuid::uuid!("4c4c4544-0044-4710-8052-cac04f4b4632")).into(),
                 slot_number: Some(15),
                 tray_index: Some(5),
                 nvlink_domain_uuid: Some(NvLinkDomainId::nil()),
+                driver_version: None,
             })),
             rack_id: Some(RackId::new("RACK_1")),
         };
@@ -287,6 +312,10 @@ mod tests {
             Some("fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0")
         );
         assert_eq!(label_value("serial_number"), Some("MN-001"));
+        assert_eq!(
+            label_value("system_uuid"),
+            Some("4c4c4544-0044-4710-8052-cac04f4b4632")
+        );
         assert_eq!(label_value("rack_id"), Some("RACK_1"));
         assert_eq!(label_value("machine_slot_number"), Some("15"));
         assert_eq!(label_value("machine_tray_index"), Some("5"));
@@ -300,6 +329,9 @@ mod tests {
     fn test_stream_static_labels_includes_switch_placement_metadata() {
         let switch_id = test_switch_id("switch-a");
         let switch_id_label = switch_id.to_string();
+        let nvlink_domain_uuid = NvLinkDomainId::new();
+        let nvlink_domain_uuid_label = nvlink_domain_uuid.to_string();
+
         let context = EventContext {
             endpoint_key: "11:22:33:44:55:66".to_string(),
             addr: BmcAddr {
@@ -308,13 +340,16 @@ mod tests {
                 mac: MacAddress::from_str("11:22:33:44:55:66").unwrap(),
             },
             collector_type: "switch_collector",
+            labels: Default::default(),
             metadata: Some(EndpointMetadata::Switch(SwitchData {
                 id: Some(switch_id),
                 serial: "SN-SWITCH-001".to_string(),
                 slot_number: Some(7),
                 tray_index: Some(3),
+                nvlink_domain_uuid: Some(nvlink_domain_uuid),
                 endpoint_role: SwitchEndpointRole::Host,
                 is_primary: false,
+                nmxc_enabled: false,
                 nmxt_enabled: false,
             })),
             rack_id: Some(RackId::new("RACK_2")),
@@ -332,5 +367,10 @@ mod tests {
         assert_eq!(label_value("rack_id"), Some("RACK_2"));
         assert_eq!(label_value("switch_slot_number"), Some("7"));
         assert_eq!(label_value("switch_tray_index"), Some("3"));
+
+        assert_eq!(
+            label_value("nvlink_domain_uuid"),
+            Some(nvlink_domain_uuid_label.as_str())
+        );
     }
 }

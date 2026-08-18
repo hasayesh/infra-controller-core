@@ -22,11 +22,11 @@
 // Component Manager equivalents in Core; they continue to call the
 // existing machine-level RPCs that the legacy path used.
 //
-// During the migration the embedded service config keeps compute pointed
-// at compute/nicolegacy by default. Operators flip the
-// COMPONENT_MANAGER_COMPUTE environment variable to "nico" once the
-// matching Core configuration (compute_tray_use_state_controller / SoT
-// firmware objects) is in place.
+// The embedded service config selects this implementation by default.
+// Operators can still opt back into compute/nicolegacy via
+// COMPONENT_MANAGER_COMPUTE=nicolegacy. Core must be configured with
+// compute_tray_use_state_controller=true (and SoT firmware objects) for
+// this path to work.
 package nico
 
 import (
@@ -38,7 +38,6 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/nicoapi"
-	pb "github.com/NVIDIA/infra-controller/rest-api/flow/internal/nicoapi/gen"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/componentmanager"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/componentmanager/capability"
 	cmcatalog "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/componentmanager/catalog"
@@ -51,6 +50,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/devicetypes"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/firmwarecomponents"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/types"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 // ImplementationName is the name used to identify this implementation in
@@ -113,6 +113,8 @@ func Descriptor() cmcatalog.Descriptor {
 		Capabilities: capability.CapabilitySet{
 			capability.CapabilityBringUpControl,
 			capability.CapabilityBringUpStatus,
+			capability.CapabilityDecommissionControl,
+			capability.CapabilityDecommissionStatus,
 			capability.CapabilityFirmwareControl,
 			capability.CapabilityFirmwareStatus,
 			capability.CapabilityInjectExpectation,
@@ -135,12 +137,12 @@ func (m *Manager) Descriptor() cmcatalog.Descriptor {
 	return Descriptor()
 }
 
-func machineIDsProto(ids []string) *pb.MachineIdList {
-	pbIDs := make([]*pb.MachineId, len(ids))
+func machineIDsProto(ids []string) *corev1.MachineIdList {
+	pbIDs := make([]*corev1.MachineId, len(ids))
 	for i, id := range ids {
-		pbIDs[i] = &pb.MachineId{Id: id}
+		pbIDs[i] = &corev1.MachineId{Id: id}
 	}
-	return &pb.MachineIdList{MachineIds: pbIDs}
+	return &corev1.MachineIdList{MachineIds: pbIDs}
 }
 
 // ensureMachinesOperable is the per-Manager policy gate for disruptive
@@ -224,26 +226,26 @@ func (m *Manager) PowerControl(
 		return fmt.Errorf("refused: %w", err)
 	}
 
-	var action pb.SystemPowerControl
+	var action corev1.SystemPowerControl
 	switch info.Operation {
 	case operations.PowerOperationPowerOn, operations.PowerOperationForcePowerOn:
-		action = pb.SystemPowerControl_SYSTEM_POWER_CONTROL_ON
+		action = corev1.SystemPowerControl_SYSTEM_POWER_CONTROL_ON
 	case operations.PowerOperationPowerOff:
-		action = pb.SystemPowerControl_SYSTEM_POWER_CONTROL_GRACEFUL_SHUTDOWN
+		action = corev1.SystemPowerControl_SYSTEM_POWER_CONTROL_GRACEFUL_SHUTDOWN
 	case operations.PowerOperationForcePowerOff:
-		action = pb.SystemPowerControl_SYSTEM_POWER_CONTROL_FORCE_OFF
+		action = corev1.SystemPowerControl_SYSTEM_POWER_CONTROL_FORCE_OFF
 	case operations.PowerOperationRestart, operations.PowerOperationWarmReset:
-		action = pb.SystemPowerControl_SYSTEM_POWER_CONTROL_GRACEFUL_RESTART
+		action = corev1.SystemPowerControl_SYSTEM_POWER_CONTROL_GRACEFUL_RESTART
 	case operations.PowerOperationForceRestart:
-		action = pb.SystemPowerControl_SYSTEM_POWER_CONTROL_FORCE_RESTART
+		action = corev1.SystemPowerControl_SYSTEM_POWER_CONTROL_FORCE_RESTART
 	case operations.PowerOperationColdReset:
-		action = pb.SystemPowerControl_SYSTEM_POWER_CONTROL_AC_POWERCYCLE
+		action = corev1.SystemPowerControl_SYSTEM_POWER_CONTROL_AC_POWERCYCLE
 	default:
 		return fmt.Errorf("unsupported power operation for compute: %v", info.Operation)
 	}
 
-	req := &pb.ComponentPowerControlRequest{
-		Target: &pb.ComponentPowerControlRequest_MachineIds{
+	req := &corev1.ComponentPowerControlRequest{
+		Target: &corev1.ComponentPowerControlRequest_MachineIds{
 			MachineIds: machineIDsProto(target.ComponentIDs),
 		},
 		Action:                action,
@@ -256,7 +258,7 @@ func (m *Manager) PowerControl(
 	}
 
 	for _, r := range resp.GetResults() {
-		if r.GetStatus() != pb.ComponentManagerStatusCode_COMPONENT_MANAGER_STATUS_CODE_SUCCESS {
+		if r.GetStatus() != corev1.ComponentManagerStatusCode_COMPONENT_MANAGER_STATUS_CODE_SUCCESS {
 			return fmt.Errorf("power control failed for %s: %s", r.GetComponentId(), r.GetError())
 		}
 	}
@@ -276,8 +278,8 @@ func (m *Manager) GetPowerStatus(
 		return nil, fmt.Errorf("target is invalid: %w", err)
 	}
 
-	req := &pb.GetComponentInventoryRequest{
-		Target: &pb.GetComponentInventoryRequest_MachineIds{
+	req := &corev1.GetComponentInventoryRequest{
+		Target: &corev1.GetComponentInventoryRequest_MachineIds{
 			MachineIds: machineIDsProto(target.ComponentIDs),
 		},
 	}
@@ -405,9 +407,9 @@ func (m *Manager) firmwareControlComputeTrays(
 		return err
 	}
 
-	req := &pb.UpdateComponentFirmwareRequest{
-		Target: &pb.UpdateComponentFirmwareRequest_ComputeTrays{
-			ComputeTrays: &pb.UpdateComputeTrayFirmwareTarget{
+	req := &corev1.UpdateComponentFirmwareRequest{
+		Target: &corev1.UpdateComponentFirmwareRequest_ComputeTrays{
+			ComputeTrays: &corev1.UpdateComputeTrayFirmwareTarget{
 				MachineIds: machineIDsProto(target.ComponentIDs),
 				Components: subComponents,
 			},
@@ -422,7 +424,7 @@ func (m *Manager) firmwareControlComputeTrays(
 	}
 
 	for _, r := range resp.GetResults() {
-		if r.GetStatus() != pb.ComponentManagerStatusCode_COMPONENT_MANAGER_STATUS_CODE_SUCCESS {
+		if r.GetStatus() != corev1.ComponentManagerStatusCode_COMPONENT_MANAGER_STATUS_CODE_SUCCESS {
 			return fmt.Errorf("firmware update failed for %s: %s", r.GetComponentId(), r.GetError())
 		}
 	}
@@ -463,8 +465,8 @@ func (m *Manager) GetFirmwareStatus(
 		return nil, fmt.Errorf("target is invalid: %w", err)
 	}
 
-	req := &pb.GetComponentFirmwareStatusRequest{
-		Target: &pb.GetComponentFirmwareStatusRequest_MachineIds{
+	req := &corev1.GetComponentFirmwareStatusRequest{
+		Target: &corev1.GetComponentFirmwareStatusRequest_MachineIds{
 			MachineIds: machineIDsProto(target.ComponentIDs),
 		},
 	}
@@ -474,7 +476,7 @@ func (m *Manager) GetFirmwareStatus(
 		return nil, fmt.Errorf("GetComponentFirmwareStatus failed: %w", err)
 	}
 
-	grouped := make(map[string][]*pb.FirmwareUpdateStatus)
+	grouped := make(map[string][]*corev1.FirmwareUpdateStatus)
 	for _, s := range resp.GetStatuses() {
 		compID := s.GetResult().GetComponentId()
 		grouped[compID] = append(grouped[compID], s)
@@ -498,7 +500,7 @@ func (m *Manager) GetFirmwareStatus(
 // once the proto carries sub-component identification. Until then, a
 // missing sub-component cannot be distinguished from "no update needed"
 // and is treated as not-yet-completed.
-func aggregateNICoStatuses(compID string, statuses []*pb.FirmwareUpdateStatus) operations.FirmwareUpdateStatus {
+func aggregateNICoStatuses(compID string, statuses []*corev1.FirmwareUpdateStatus) operations.FirmwareUpdateStatus {
 	if len(statuses) == 0 {
 		return operations.FirmwareUpdateStatus{
 			ComponentID: compID,
@@ -626,4 +628,53 @@ func nicoToBringUpState(s nicoapi.BringUpState) operations.MachineBringUpState {
 	default:
 		return operations.MachineBringUpStateNotDiscovered
 	}
+}
+
+// Decommission initiates decommissioning of the target compute machines via NICo.
+func (m *Manager) Decommission(
+	ctx context.Context,
+	target common.Target,
+	_ operations.DecommissionTaskInfo,
+) error {
+	if err := target.Validate(); err != nil {
+		return fmt.Errorf("target is invalid: %w", err)
+	}
+
+	for _, machineID := range target.ComponentIDs {
+		if err := m.nicoClient.DecommissionMachine(ctx, machineID); err != nil {
+			return fmt.Errorf("DecommissionMachine failed for %s: %w", machineID, err)
+		}
+	}
+
+	log.Info().
+		Strs("machine_ids", target.ComponentIDs).
+		Msg("Decommission initiated for compute components")
+	return nil
+}
+
+// GetDecommissionStatus returns the current decommission state for each
+// target compute machine, keyed by machine ID.
+func (m *Manager) GetDecommissionStatus(
+	ctx context.Context,
+	target common.Target,
+) (map[string]string, error) {
+	if err := target.Validate(); err != nil {
+		return nil, fmt.Errorf("target is invalid: %w", err)
+	}
+
+	states, err := m.nicoClient.FindMachineControllerStates(ctx, target.ComponentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("FindMachineControllerStates: %w", err)
+	}
+
+	// Ensure every requested component is present in the result.
+	result := make(map[string]string, len(target.ComponentIDs))
+	for _, id := range target.ComponentIDs {
+		if s, ok := states[id]; ok {
+			result[id] = s
+		} else {
+			result[id] = ""
+		}
+	}
+	return result, nil
 }

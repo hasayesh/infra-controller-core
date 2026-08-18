@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use carbide_dpf::DpuPhase;
 use carbide_dpf::types::{DpuDeviceSummary, DpuNodeSummary, HostDpfSnapshot};
+use carbide_dpf::{DpuDeploymentType, DpuPhase};
 use carbide_machine_controller::dpf::{DpfOperations, MockDpfOperations};
 use carbide_uuid::machine::MachineId;
 use model::machine::{
@@ -34,6 +34,7 @@ use model::machine::{
 };
 use tokio::time::timeout;
 
+use super::{dpf_config, get_host_state};
 use crate::tests::common::api_fixtures::{
     TestEnvOverrides, TestManagedHost, create_managed_host_with_dpf,
     create_managed_host_with_dpf_multi, create_test_env_with_overrides, get_config,
@@ -78,7 +79,9 @@ fn provisioning_mock_with_dpu_count(
     mock.expect_register_dpu_node().returning(|_| Ok(()));
     mock.expect_release_maintenance_hold().returning(|_| Ok(()));
     mock.expect_is_reboot_required().returning(|_| Ok(false));
-    mock.expect_verify_node_labels().returning(|_| Ok(true));
+    mock.expect_deployment_type_for_dpu()
+        .returning(|_, _| Ok(DpuDeploymentType::Bf3));
+    mock.expect_verify_node_labels().returning(|_, _| Ok(true));
     mock.expect_snapshot_host()
         .returning(move |_| Ok(snapshot_with_crs_present(dpu_count)));
     mock.expect_get_dpu_phase().returning(move |_, _| {
@@ -89,14 +92,6 @@ fn provisioning_mock_with_dpu_count(
         }
     });
     mock
-}
-
-fn dpf_config() -> crate::cfg::file::DpfConfig {
-    crate::cfg::file::DpfConfig {
-        enabled: true,
-        bfb_url: "http://example.com/test.bfb".to_string(),
-        ..Default::default()
-    }
 }
 
 /// Build the DPU reprovision states map for the given DPF sub-state.
@@ -165,15 +160,6 @@ async fn set_assigned_reprovision_dpf_state(
         },
     };
     write_host_state(pool, host_id, &state).await;
-}
-
-async fn get_host_state(
-    env: &crate::tests::common::api_fixtures::TestEnv,
-    mh: &TestManagedHost,
-) -> ManagedHostState {
-    let mut txn = env.db_txn().await;
-    let machine = mh.host().db_machine(&mut txn).await;
-    machine.state.value
 }
 
 async fn dpu_device_names(pool: &sqlx::PgPool, mh: &TestManagedHost) -> HashSet<String> {
@@ -376,7 +362,9 @@ fn capturing_mock(
     mock.expect_register_dpu_node().returning(|_| Ok(()));
     mock.expect_release_maintenance_hold().returning(|_| Ok(()));
     mock.expect_is_reboot_required().returning(|_| Ok(false));
-    mock.expect_verify_node_labels().returning(|_| Ok(true));
+    mock.expect_deployment_type_for_dpu()
+        .returning(|__, _| Ok(DpuDeploymentType::Bf3));
+    mock.expect_verify_node_labels().returning(|_, _| Ok(true));
     mock.expect_snapshot_host()
         .returning(move |_| Ok(snapshot_with_crs_present(dpu_count)));
 

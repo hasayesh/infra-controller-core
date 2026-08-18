@@ -21,14 +21,14 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use health_report::{HealthProbeId, HealthReport};
-use nvue_client::NvueClient;
+use health_report::HealthProbeId;
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::{HBNDeviceNames, hbn};
 mod bgp;
-pub mod probe_ids;
+pub(crate) mod nvue;
+mod probe_ids;
 
 const HBN_DAEMONS_FILE: &str = "etc/frr/daemons";
 const DHCP_SERVER_FILE: &str = "etc/supervisor/conf.d/default-forge-dhcp-server.conf";
@@ -94,7 +94,7 @@ fn passed(
 }
 
 /// Is enough of HBN ready so that we can configure it?
-pub fn is_up(health_report: &health_report::HealthReport) -> bool {
+pub(super) fn is_up(health_report: &health_report::HealthReport) -> bool {
     let has_failed_services = health_report
         .alerts
         .iter()
@@ -115,19 +115,21 @@ pub fn is_up(health_report: &health_report::HealthReport) -> bool {
     hbn_healthy && !has_failed_services
 }
 
-pub struct HealthCheckParams<'a> {
-    pub hbn_root: &'a Path,
-    pub host_routes: &'a [&'a str],
-    pub has_changed_configs: bool,
-    pub min_healthy_links: u32,
-    pub route_servers: &'a [String],
-    pub hbn_device_names: HBNDeviceNames,
-    pub include_dhcp_server: bool,
-    pub run_restricted_mode_check: bool,
+pub(super) struct HealthCheckParams<'a> {
+    pub(super) hbn_root: &'a Path,
+    pub(super) host_routes: &'a [&'a str],
+    pub(super) has_changed_configs: bool,
+    pub(super) min_healthy_links: u32,
+    pub(super) route_servers: &'a [String],
+    /// Whether this check should require the FNN IPv6-unicast underlay.
+    pub(super) should_check_ipv6_unicast: bool,
+    pub(super) hbn_device_names: HBNDeviceNames,
+    pub(super) include_dhcp_server: bool,
+    pub(super) run_restricted_mode_check: bool,
 }
 
 /// Check the health of HBN
-pub async fn health_check(params: HealthCheckParams<'_>) -> health_report::HealthReport {
+pub(super) async fn health_check(params: HealthCheckParams<'_>) -> health_report::HealthReport {
     let mut hr = health_report::HealthReport::empty("forge-dpu-agent".to_string());
 
     // Check whether the disk is full
@@ -167,10 +169,13 @@ pub async fn health_check(params: HealthCheckParams<'_>) -> health_report::Healt
     bgp::check_bgp_stats(
         &mut hr,
         &container_id,
-        params.host_routes,
-        params.min_healthy_links,
-        params.route_servers,
-        params.hbn_device_names,
+        bgp::BgpHealthCheckParams {
+            host_routes: params.host_routes,
+            min_healthy_links: params.min_healthy_links,
+            route_servers: params.route_servers,
+            should_check_ipv6_unicast: params.should_check_ipv6_unicast,
+            hbn_device_names: &params.hbn_device_names,
+        },
     )
     .await;
     check_files(&mut hr, params.hbn_root, &EXPECTED_FILES);
@@ -202,7 +207,10 @@ async fn check_hbn_services_running(
     {
         Ok(s) => s,
         Err(err) => {
-            tracing::warn!("check_hbn_services_running supervisorctl status: {err}");
+            tracing::warn!(
+                error = %err,
+                "Failed to get supervisorctl status for HBN health check"
+            );
             failed(
                 hr,
                 probe_ids::SupervisorctlStatus.clone(),
@@ -215,7 +223,10 @@ async fn check_hbn_services_running(
     let st = match parse_status(&sctl) {
         Ok(s) => s,
         Err(err) => {
-            tracing::warn!("check_hbn_services_running supervisorctl status parse: {err}");
+            tracing::warn!(
+                error = %err,
+                "Failed to parse supervisorctl status for HBN health check"
+            );
             failed(
                 hr,
                 probe_ids::SupervisorctlStatus.clone(),
@@ -231,7 +242,11 @@ async fn check_hbn_services_running(
         match st.status_of(&service) {
             SctlState::Running => passed(hr, probe_ids::ServiceRunning.clone(), Some(service)),
             status => {
-                tracing::warn!("check_hbn_services_running {service}: {status}");
+                tracing::warn!(
+                    service = service.as_str(),
+                    service_state = %status,
+                    "HBN service is not running"
+                );
                 failed(
                     hr,
                     probe_ids::ServiceRunning.clone(),
@@ -255,7 +270,10 @@ async fn check_dhcp_server(hr: &mut health_report::HealthReport, container_id: &
     {
         Ok(s) => s,
         Err(err) => {
-            tracing::warn!("check_hbn_services_running supervisorctl status: {err}");
+            tracing::warn!(
+                error = %err,
+                "Failed to get supervisorctl status for DHCP health check"
+            );
             failed(
                 hr,
                 probe_ids::SupervisorctlStatus.clone(),
@@ -268,7 +286,10 @@ async fn check_dhcp_server(hr: &mut health_report::HealthReport, container_id: &
     let st = match parse_status(&sctl) {
         Ok(s) => s,
         Err(err) => {
-            tracing::warn!("check_hbn_services_running supervisorctl status parse: {err}");
+            tracing::warn!(
+                error = %err,
+                "Failed to parse supervisorctl status for DHCP health check"
+            );
             failed(
                 hr,
                 probe_ids::SupervisorctlStatus.clone(),
@@ -306,12 +327,12 @@ async fn check_ifreload(hr: &mut health_report::HealthReport, container_id: &str
             if stdout.is_empty() {
                 passed(hr, probe_ids::Ifreload.clone(), None);
             } else {
-                tracing::warn!("check_ifreload: {stdout}");
+                tracing::warn!(stdout = stdout.as_str(), "ifreload syntax check failed");
                 failed(hr, probe_ids::Ifreload.clone(), None, stdout);
             }
         }
         Err(err) => {
-            tracing::warn!("check_ifreload: {err}");
+            tracing::warn!(error = %err, "ifreload syntax check failed");
             failed(hr, probe_ids::Ifreload.clone(), None, err.to_string());
         }
     }
@@ -341,7 +362,7 @@ fn check_files(hr: &mut health_report::HealthReport, hbn_root: &Path, expected_f
         let stat = match std::fs::metadata(path) {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!("check_files {filename}: {err}");
+                tracing::warn!(filename, error = %err, "Failed to read file metadata");
                 failed(
                     hr,
                     probe_ids::FileIsValid.clone(),
@@ -355,8 +376,10 @@ fn check_files(hr: &mut health_report::HealthReport, hbn_root: &Path, expected_f
             dhcp_server_size = stat.len();
         } else if stat.len() < MIN_SIZE {
             tracing::warn!(
-                "check_files {filename}: Too small {} < {MIN_SIZE} bytes",
-                stat.len()
+                filename,
+                file_size_bytes = stat.len(),
+                minimum_file_size_bytes = MIN_SIZE,
+                "file is too small"
             );
             failed(
                 hr,
@@ -373,7 +396,12 @@ fn check_files(hr: &mut health_report::HealthReport, hbn_root: &Path, expected_f
     }
 
     if dhcp_server_size < MIN_SIZE {
-        tracing::warn!("check_files {DHCP_SERVER_FILE}: Too small");
+        tracing::warn!(
+            filename = DHCP_SERVER_FILE,
+            file_size_bytes = dhcp_server_size,
+            minimum_file_size_bytes = MIN_SIZE,
+            "file is too small"
+        );
         failed(
             hr,
             probe_ids::FileIsValid.clone(),
@@ -415,9 +443,9 @@ async fn check_restricted_mode(hr: &mut health_report::HealthReport) {
     };
     if !out.status.success() {
         tracing::debug!(
-            "STDERR {}: {}",
-            super::pretty_cmd(cmd.as_std()),
-            String::from_utf8_lossy(&out.stderr)
+            command = %super::pretty_cmd(cmd.as_std()),
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "STDERR"
         );
         failed(
             hr,
@@ -459,12 +487,12 @@ async fn check_restricted_mode(hr: &mut health_report::HealthReport) {
 
 fn parse_mlxprivhost(s: &str) -> eyre::Result<String> {
     let Some(level_line) = s.lines().find(|line| line.contains("level")) else {
-        eyre::bail!("Invalid mlxprivhost output, missing 'level' line:\n{s}");
+        eyre::bail!("invalid mlxprivhost output, missing 'level' line:\n{s}");
     };
     // Example ouput:
     // level                         : RESTRICTED
     let Some(level) = level_line.split(':').nth(1).map(|level| level.trim()) else {
-        eyre::bail!("Invalid level line, needs a single colon: '{level_line}'");
+        eyre::bail!("invalid level line, needs a single colon: '{level_line}'");
     };
     Ok(level.to_string())
 }
@@ -499,9 +527,9 @@ async fn check_disk_utilization(hr: &mut health_report::HealthReport) {
     };
     if !out.status.success() {
         tracing::debug!(
-            "STDERR {}: {}",
-            super::pretty_cmd(cmd.as_std()),
-            String::from_utf8_lossy(&out.stderr)
+            command = %super::pretty_cmd(cmd.as_std()),
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "STDERR"
         );
         failed(
             hr,
@@ -576,7 +604,7 @@ fn parse_disk_utilization(df_out: &str) -> eyre::Result<DiskUtilizations> {
     for line in df_out.lines().skip(1) {
         let parts: Vec<&str> = line.split_ascii_whitespace().collect();
         if parts.len() < 6 {
-            tracing::warn!("du status line too short: '{line}'");
+            tracing::warn!(line, "df output line too short");
             continue;
         }
 
@@ -590,7 +618,7 @@ fn parse_disk_utilization(df_out: &str) -> eyre::Result<DiskUtilizations> {
         let utilization: u32 = match utilization.parse() {
             Ok(u) => u,
             Err(_) => {
-                tracing::warn!("Can not parse disk utilization in line '{line}'");
+                tracing::warn!(line, "Can not parse disk utilization in line");
                 continue;
             }
         };
@@ -615,7 +643,7 @@ fn parse_status(status_out: &str) -> eyre::Result<SctlStatus> {
     for line in status_out.lines() {
         let parts: Vec<&str> = line.split_ascii_whitespace().collect();
         if parts.len() < 2 {
-            tracing::warn!("supervisorctl status line too short: '{line}'");
+            tracing::warn!(line, "supervisorctl status line too short");
             continue;
         }
         let state: SctlState = match parts[1].parse() {
@@ -623,8 +651,9 @@ fn parse_status(status_out: &str) -> eyre::Result<SctlStatus> {
             Err(_err) => {
                 // unreachable but future proof. SctlState::from_str is currently infallible.
                 tracing::warn!(
-                    "supervisorctl status invalid state '{}' in line '{line}'",
-                    parts[1]
+                    supervisor_state = parts[1],
+                    line,
+                    "supervisorctl status invalid state in line"
                 );
                 continue;
             }
@@ -657,7 +686,7 @@ impl FromStr for SctlState {
             "EXITED" => Self::Exited,
             "FATAL" => Self::Fatal,
             _ => {
-                tracing::warn!("Unknown supervisorctl status '{s}'");
+                tracing::warn!(supervisor_state = s, "Unknown supervisorctl status");
                 Self::Unknown
             }
         })
@@ -696,22 +725,6 @@ enum SctlState {
     Stopping,
     Exited,
     Fatal,
-}
-
-pub async fn nvue_api_health(nvue_client: &NvueClient) -> HealthReport {
-    // All we can really do here is check that the API is alive. The HBN flavor of NVUE
-    // doesn't seem to expose much of anything that we can look at for node health.
-    let mut report = HealthReport::empty("forge-dpu-agent".into());
-    match nvue_client.system_info().await {
-        Ok(_) => passed(&mut report, probe_ids::NvueApiRunning.clone(), None),
-        Err(e) => failed(
-            &mut report,
-            probe_ids::NvueApiRunning.clone(),
-            None,
-            format!("Error communicating with NVUE API: {e}"),
-        ),
-    }
-    report
 }
 
 #[cfg(test)]

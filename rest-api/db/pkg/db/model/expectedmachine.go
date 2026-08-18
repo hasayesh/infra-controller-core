@@ -6,13 +6,14 @@ package model
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 
 	"github.com/uptrace/bun"
@@ -47,29 +48,67 @@ var (
 type ExpectedMachine struct {
 	bun.BaseModel `bun:"table:expected_machine,alias:em"`
 
-	ID                       uuid.UUID `bun:"id,pk"`
-	SiteID                   uuid.UUID `bun:"site_id,type:uuid,notnull"`
-	Site                     *Site     `bun:"rel:belongs-to,join:site_id=id"`
-	BmcMacAddress            string    `bun:"bmc_mac_address,notnull"`
-	ChassisSerialNumber      string    `bun:"chassis_serial_number,notnull"`
-	SkuID                    *string   `bun:"sku_id"`
-	Sku                      *SKU      `bun:"rel:belongs-to,join:sku_id=id"`
-	MachineID                *string   `bun:"machine_id"`
-	Machine                  *Machine  `bun:"rel:belongs-to,join:machine_id=id"`
-	FallbackDpuSerialNumbers []string  `bun:"fallback_dpu_serial_numbers,array"`
-	BmcIpAddress             *string   `bun:"bmc_ip_address"`
-	RackID                   *string   `bun:"rack_id"`
-	Name                     *string   `bun:"name"`
-	Manufacturer             *string   `bun:"manufacturer"`
-	Model                    *string   `bun:"model"`
-	Description              *string   `bun:"description"`
-	SlotID                   *int32    `bun:"slot_id"`
-	TrayIdx                  *int32    `bun:"tray_idx"`
-	HostID                   *int32    `bun:"host_id"`
-	Labels                   Labels    `bun:"labels,type:jsonb"`
-	Created                  time.Time `bun:"created,nullzero,notnull,default:current_timestamp"`
-	Updated                  time.Time `bun:"updated,nullzero,notnull,default:current_timestamp"`
-	CreatedBy                uuid.UUID `bun:"type:uuid,notnull"`
+	ID                       uuid.UUID            `bun:"id,pk"`
+	SiteID                   uuid.UUID            `bun:"site_id,type:uuid,notnull"`
+	Site                     *Site                `bun:"rel:belongs-to,join:site_id=id"`
+	BmcMacAddress            string               `bun:"bmc_mac_address,notnull"`
+	ChassisSerialNumber      string               `bun:"chassis_serial_number,notnull"`
+	SkuID                    *string              `bun:"sku_id"`
+	Sku                      *SKU                 `bun:"rel:belongs-to,join:sku_id=id"`
+	MachineID                *string              `bun:"machine_id"`
+	Machine                  *Machine             `bun:"rel:belongs-to,join:machine_id=id"`
+	FallbackDpuSerialNumbers []string             `bun:"fallback_dpu_serial_numbers,array"`
+	BmcIpAddress             *string              `bun:"bmc_ip_address"`
+	RackID                   *string              `bun:"rack_id"`
+	Name                     *string              `bun:"name"`
+	Manufacturer             *string              `bun:"manufacturer"`
+	Model                    *string              `bun:"model"`
+	Description              *string              `bun:"description"`
+	SlotID                   *int32               `bun:"slot_id"`
+	TrayIdx                  *int32               `bun:"tray_idx"`
+	HostID                   *int32               `bun:"host_id"`
+	IsDpfEnabled             *bool                `bun:"is_dpf_enabled"`
+	Labels                   Labels               `bun:"labels,type:jsonb"`
+	HostLifecycleProfile     HostLifecycleProfile `bun:"host_lifecycle_profile,type:jsonb,notnull"`
+	Created                  time.Time            `bun:"created,nullzero,notnull,default:current_timestamp"`
+	Updated                  time.Time            `bun:"updated,nullzero,notnull,default:current_timestamp"`
+	CreatedBy                uuid.UUID            `bun:"type:uuid,notnull"`
+}
+
+// HostLifecycleProfile holds per-host lifecycle settings that affect how a host
+// progresses through its state machine. It is persisted alongside the
+// ExpectedMachine as JSONB and mirrored to Core via the workflow proto.
+type HostLifecycleProfile struct {
+	// DisableLockdown, when non-nil, controls whether the host is locked down
+	// during lifecycle management. A nil value means the setting is unset, so
+	// Core preserves its existing value (patch semantics).
+	DisableLockdown *bool `json:"disable_lockdown,omitempty"`
+}
+
+// HasSetFields reports whether the profile carries at least one explicitly set
+// field. Keep this method in sync when adding fields to HostLifecycleProfile so
+// update paths do not mistake an empty patch object for a requested write.
+func (h HostLifecycleProfile) HasSetFields() bool {
+	return h.DisableLockdown != nil
+}
+
+// ToProto returns the workflow proto for this profile, or nil when no setting
+// is present so the outer field stays unset and Core preserves its DB value.
+func (h HostLifecycleProfile) ToProto() *corev1.HostLifecycleProfile {
+	if !h.HasSetFields() {
+		return nil
+	}
+	return &corev1.HostLifecycleProfile{DisableLockdown: h.DisableLockdown}
+}
+
+// FromProto populates the receiver from a workflow proto profile. A nil proto
+// clears the receiver to its zero value.
+func (h *HostLifecycleProfile) FromProto(proto *corev1.HostLifecycleProfile) {
+	if proto == nil {
+		*h = HostLifecycleProfile{}
+		return
+	}
+	h.DisableLockdown = proto.DisableLockdown
 }
 
 // ExpectedMachineCredentials carries the BMC credentials for one
@@ -83,9 +122,9 @@ type ExpectedMachineCredentials struct {
 // ToProto builds the workflow proto for this ExpectedMachine. BMC
 // credentials are passed in because they aren't persisted on the record;
 // labels are read from em.Labels.
-func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *cwssaws.ExpectedMachine {
-	proto := &cwssaws.ExpectedMachine{
-		Id:                       &cwssaws.UUID{Value: em.ID.String()},
+func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *corev1.ExpectedMachine {
+	proto := &corev1.ExpectedMachine{
+		Id:                       &corev1.UUID{Value: em.ID.String()},
 		BmcMacAddress:            em.BmcMacAddress,
 		ChassisSerialNumber:      em.ChassisSerialNumber,
 		FallbackDpuSerialNumbers: em.FallbackDpuSerialNumbers,
@@ -96,7 +135,7 @@ func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *cwssaws.Ex
 		proto.BmcIpAddress = em.BmcIpAddress
 	}
 	if em.RackID != nil {
-		proto.RackId = &cwssaws.RackId{Id: *em.RackID}
+		proto.RackId = &corev1.RackId{Id: *em.RackID}
 	}
 	if em.Name != nil {
 		proto.Name = em.Name
@@ -119,6 +158,10 @@ func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *cwssaws.Ex
 	if em.HostID != nil {
 		proto.HostId = em.HostID
 	}
+	if em.IsDpfEnabled != nil {
+		proto.IsDpfEnabled = em.IsDpfEnabled
+	}
+	proto.HostLifecycleProfile = em.HostLifecycleProfile.ToProto()
 
 	if creds.Username != nil {
 		proto.BmcUsername = *creds.Username
@@ -127,7 +170,7 @@ func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *cwssaws.Ex
 		proto.BmcPassword = *creds.Password
 	}
 
-	metadata := &cwssaws.Metadata{
+	metadata := &corev1.Metadata{
 		Labels: expectedComponentLabelsInput{
 			Manufacturer: em.Manufacturer,
 			Model:        em.Model,
@@ -154,7 +197,7 @@ func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *cwssaws.Ex
 // table). A nil proto is a no-op. An invalid or missing proto.Id leaves
 // em.ID unchanged so the caller can validate the proto's UUID before
 // calling.
-func (em *ExpectedMachine) FromProto(proto *cwssaws.ExpectedMachine, linkedMachineID *string) {
+func (em *ExpectedMachine) FromProto(proto *corev1.ExpectedMachine, linkedMachineID *string) {
 	if proto == nil {
 		return
 	}
@@ -183,6 +226,8 @@ func (em *ExpectedMachine) FromProto(proto *cwssaws.ExpectedMachine, linkedMachi
 	em.TrayIdx = proto.TrayIdx
 	em.HostID = proto.HostId
 	em.Labels.FromProto(proto.Metadata.GetLabels())
+	em.IsDpfEnabled = proto.IsDpfEnabled
+	em.HostLifecycleProfile.FromProto(proto.GetHostLifecycleProfile())
 }
 
 // ExpectedMachineCreateInput input parameters for Create method
@@ -204,6 +249,8 @@ type ExpectedMachineCreateInput struct {
 	TrayIdx                  *int32
 	HostID                   *int32
 	Labels                   map[string]string
+	IsDpfEnabled             *bool
+	HostLifecycleProfile     HostLifecycleProfile
 	CreatedBy                uuid.UUID
 }
 
@@ -225,6 +272,8 @@ type ExpectedMachineUpdateInput struct {
 	TrayIdx                  *int32
 	HostID                   *int32
 	Labels                   map[string]string
+	IsDpfEnabled             *bool
+	HostLifecycleProfile     *HostLifecycleProfile
 }
 
 // ExpectedMachineClearInput input parameters for Clear method
@@ -299,6 +348,8 @@ type ExpectedMachineDAO interface {
 	GetAll(ctx context.Context, tx *db.Tx, filter ExpectedMachineFilterInput, page paginator.PageInput, includeRelations []string) ([]ExpectedMachine, int, error)
 	// Get returns row for specified ID
 	Get(ctx context.Context, tx *db.Tx, expectedMachineID uuid.UUID, includeRelations []string, forUpdate bool) (*ExpectedMachine, error)
+	// LockForUpdate locks rows in canonical ID order for the transaction
+	LockForUpdate(ctx context.Context, tx *db.Tx, expectedMachineIDs []uuid.UUID) error
 }
 
 // ExpectedMachineSQLDAO is an implementation of the ExpectedMachineDAO interface
@@ -366,6 +417,8 @@ func (emsd ExpectedMachineSQLDAO) CreateMultiple(ctx context.Context, tx *db.Tx,
 			TrayIdx:                  input.TrayIdx,
 			HostID:                   input.HostID,
 			Labels:                   input.Labels,
+			IsDpfEnabled:             input.IsDpfEnabled,
+			HostLifecycleProfile:     input.HostLifecycleProfile,
 			CreatedBy:                input.CreatedBy,
 		}
 		expectedMachines = append(expectedMachines, em)
@@ -441,6 +494,63 @@ func (emsd ExpectedMachineSQLDAO) Get(ctx context.Context, tx *db.Tx, expectedMa
 	}
 
 	return em, nil
+}
+
+// LockForUpdate locks ExpectedMachine rows in canonical ID order until the
+// transaction completes. Batch writers call this before any row-specific
+// writes so later operations cannot acquire overlapping row sets in a
+// conflicting order.
+func (emsd ExpectedMachineSQLDAO) LockForUpdate(ctx context.Context, tx *db.Tx, expectedMachineIDs []uuid.UUID) error {
+	if tx == nil {
+		return errors.New("transaction is required to lock ExpectedMachine rows")
+	}
+	if len(expectedMachineIDs) == 0 {
+		return nil
+	}
+
+	ctx, expectedMachineDAOSpan := emsd.tracerSpan.CreateChildInCurrentContext(ctx, "ExpectedMachineDAO.LockForUpdate")
+	if expectedMachineDAOSpan != nil {
+		defer expectedMachineDAOSpan.End()
+		emsd.tracerSpan.SetAttribute(expectedMachineDAOSpan, "batch_size", len(expectedMachineIDs))
+	}
+
+	uniqueIDs := make([]uuid.UUID, 0, len(expectedMachineIDs))
+	seenIDs := make(map[uuid.UUID]struct{}, len(expectedMachineIDs))
+	for _, expectedMachineID := range expectedMachineIDs {
+		if _, seen := seenIDs[expectedMachineID]; seen {
+			continue
+		}
+		seenIDs[expectedMachineID] = struct{}{}
+		uniqueIDs = append(uniqueIDs, expectedMachineID)
+	}
+
+	var locked []ExpectedMachine
+	err := db.GetIDB(tx, emsd.dbSession).
+		NewSelect().
+		Model(&locked).
+		Column("id").
+		Where("em.id IN (?)", bun.In(uniqueIDs)).
+		OrderExpr("em.id ASC").
+		For("UPDATE").
+		Scan(ctx)
+	if err != nil {
+		return err
+	}
+	if len(locked) != len(uniqueIDs) {
+		lockedIDs := make(map[uuid.UUID]struct{}, len(locked))
+		for _, expectedMachine := range locked {
+			lockedIDs[expectedMachine.ID] = struct{}{}
+		}
+		missingIDs := make([]uuid.UUID, 0, len(uniqueIDs)-len(locked))
+		for _, expectedMachineID := range uniqueIDs {
+			if _, ok := lockedIDs[expectedMachineID]; !ok {
+				missingIDs = append(missingIDs, expectedMachineID)
+			}
+		}
+		return fmt.Errorf("ExpectedMachine rows %v were not found while locking: %w", missingIDs, db.ErrDoesNotExist)
+	}
+
+	return nil
 }
 
 // setQueryWithFilter populates the lookup query based on specified filter
@@ -576,11 +686,13 @@ func (emsd ExpectedMachineSQLDAO) Update(ctx context.Context, tx *db.Tx, input E
 	return &results[0], nil
 }
 
-// UpdateMultiple updates multiple ExpectedMachines with the given parameters using a single bulk UPDATE query
-// All inputs should update the same set of fields for optimal performance
+// UpdateMultiple updates multiple ExpectedMachines with the given parameters.
+// Fields shared by the inputs use one bulk UPDATE. BMC IP and host lifecycle
+// profile updates may be omitted by individual rows, so they are applied only
+// to the rows that provide them.
 // The updated fields are assumed to be set to non-null values.
-// Since there are 2 operations (UPDATE, SELECT), it is required that
-// this library call happens within a transaction
+// Since the updates are followed by a SELECT, this library call must happen
+// within a transaction.
 func (emsd ExpectedMachineSQLDAO) UpdateMultiple(ctx context.Context, tx *db.Tx, inputs []ExpectedMachineUpdateInput) ([]ExpectedMachine, error) {
 	// Create a child span and set the attributes for current request
 	ctx, expectedMachineDAOSpan := emsd.tracerSpan.CreateChildInCurrentContext(ctx, "ExpectedMachineDAO.UpdateMultiple")
@@ -597,6 +709,12 @@ func (emsd ExpectedMachineSQLDAO) UpdateMultiple(ctx context.Context, tx *db.Tx,
 	expectedMachines := make([]*ExpectedMachine, 0, len(inputs))
 	ids := make([]uuid.UUID, 0, len(inputs))
 	columnsSet := make(map[string]bool)
+	// `bmc_ip_address` is applied only to rows that provide it. The shared
+	// column list would otherwise clear rows whose PATCH input omitted it.
+	bmcIPUpdates := make([]*ExpectedMachine, 0, len(inputs))
+	// host_lifecycle_profile is applied in its own bulk update scoped to only the
+	// rows that set it (see below), so rows that omit it keep their existing value.
+	hlpUpdates := make([]*ExpectedMachine, 0, len(inputs))
 
 	for _, input := range inputs {
 		em := &ExpectedMachine{
@@ -628,8 +746,10 @@ func (emsd ExpectedMachineSQLDAO) UpdateMultiple(ctx context.Context, tx *db.Tx,
 			columnsSet["machine_id"] = true
 		}
 		if input.BmcIpAddress != nil {
-			em.BmcIpAddress = input.BmcIpAddress
-			columnsSet["bmc_ip_address"] = true
+			bmcIPUpdates = append(bmcIPUpdates, &ExpectedMachine{
+				ID:           input.ExpectedMachineID,
+				BmcIpAddress: input.BmcIpAddress,
+			})
 		}
 		if input.RackID != nil {
 			em.RackID = input.RackID
@@ -663,9 +783,27 @@ func (emsd ExpectedMachineSQLDAO) UpdateMultiple(ctx context.Context, tx *db.Tx,
 			em.HostID = input.HostID
 			columnsSet["host_id"] = true
 		}
+		if input.IsDpfEnabled != nil {
+			em.IsDpfEnabled = input.IsDpfEnabled
+			columnsSet["is_dpf_enabled"] = true
+		}
 
 		expectedMachines = append(expectedMachines, em)
 		ids = append(ids, input.ExpectedMachineID)
+
+		// host_lifecycle_profile is deliberately kept out of the shared
+		// columnsSet. The bulk UPDATE applies one column list to every row, so
+		// folding it in would write the column for rows that omitted it (their
+		// model carries the zero value here), silently clearing the persisted
+		// profile. Apply it separately only to rows that included the field and
+		// merge the JSONB patch below so empty or partial profiles preserve
+		// existing stored values.
+		if input.HostLifecycleProfile != nil {
+			hlpUpdates = append(hlpUpdates, &ExpectedMachine{
+				ID:                   input.ExpectedMachineID,
+				HostLifecycleProfile: *input.HostLifecycleProfile,
+			})
+		}
 	}
 
 	// Build column list
@@ -677,7 +815,14 @@ func (emsd ExpectedMachineSQLDAO) UpdateMultiple(ctx context.Context, tx *db.Tx,
 
 	// Add summary tracing attributes
 	if expectedMachineDAOSpan != nil && len(inputs) > 0 {
-		emsd.tracerSpan.SetAttribute(expectedMachineDAOSpan, "columns_updated", strings.Join(columns, ","))
+		traceColumns := append([]string(nil), columns...)
+		if len(bmcIPUpdates) > 0 {
+			traceColumns = append(traceColumns, "bmc_ip_address")
+		}
+		if len(hlpUpdates) > 0 {
+			traceColumns = append(traceColumns, "host_lifecycle_profile")
+		}
+		emsd.tracerSpan.SetAttribute(expectedMachineDAOSpan, "columns_updated", strings.Join(traceColumns, ","))
 		emsd.tracerSpan.SetAttribute(expectedMachineDAOSpan, "first_id", ids[0].String())
 		if len(ids) > 1 {
 			emsd.tracerSpan.SetAttribute(expectedMachineDAOSpan, "last_id", ids[len(ids)-1].String())
@@ -692,6 +837,32 @@ func (emsd ExpectedMachineSQLDAO) UpdateMultiple(ctx context.Context, tx *db.Tx,
 		Exec(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(bmcIPUpdates) > 0 {
+		_, err = db.GetIDB(tx, emsd.dbSession).NewUpdate().
+			Model(&bmcIPUpdates).
+			Column("bmc_ip_address").
+			Bulk().
+			Exec(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Apply host_lifecycle_profile only to the rows that provided it. Rows that
+	// omitted it are absent here and keep their persisted value. Merge the JSONB
+	// patch like Site config updates so an empty object is a no-op and future
+	// profile fields can be updated independently.
+	for _, em := range hlpUpdates {
+		_, err = db.GetIDB(tx, emsd.dbSession).NewUpdate().
+			Model((*ExpectedMachine)(nil)).
+			Set("host_lifecycle_profile = host_lifecycle_profile || ?::jsonb", em.HostLifecycleProfile).
+			Where("id = ?", em.ID).
+			Exec(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Fetch the updated expected machines

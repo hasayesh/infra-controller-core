@@ -51,6 +51,9 @@ func testTenantAccountSetupSchema(t *testing.T, dbSession *cdb.Session) {
 	// create Site table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.Site)(nil))
 	assert.Nil(t, err)
+	// create TenantSite table
+	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.TenantSite)(nil))
+	assert.Nil(t, err)
 	// create Allocation table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.Allocation)(nil))
 	assert.Nil(t, err)
@@ -67,7 +70,12 @@ func testTenantAccountSetupSchema(t *testing.T, dbSession *cdb.Session) {
 
 func testTenantAccountBuildInfrastructureProvider(t *testing.T, dbSession *cdb.Session, name string, org string, user *cdbm.User) *cdbm.InfrastructureProvider {
 	ipDAO := cdbm.NewInfrastructureProviderDAO(dbSession)
-	ip, err := ipDAO.CreateFromParams(context.Background(), nil, name, cutil.GetPtr("Test Infrastructure Provider"), org, nil, user)
+	ip, err := ipDAO.Create(context.Background(), nil, cdbm.InfrastructureProviderCreateInput{
+		Name:        name,
+		DisplayName: cutil.GetPtr("Test Infrastructure Provider"),
+		Org:         org,
+		CreatedBy:   user.ID,
+	})
 	assert.Nil(t, err)
 	return ip
 }
@@ -149,7 +157,7 @@ func testTenantAccountBuildTenantAccount(t *testing.T, dbSession *cdb.Session, a
 
 func testTenantAccountBuildStatusDetail(t *testing.T, dbSession *cdb.Session, entityID uuid.UUID, status string) {
 	sdDAO := cdbm.NewStatusDetailDAO(dbSession)
-	ssd, err := sdDAO.CreateFromParams(context.Background(), nil, entityID.String(), status, nil)
+	ssd, err := sdDAO.Create(context.Background(), nil, cdbm.StatusDetailCreateInput{EntityID: entityID.String(), Status: status, Message: nil})
 	assert.Nil(t, err)
 	assert.NotNil(t, ssd)
 	assert.Equal(t, entityID.String(), ssd.EntityID)
@@ -705,6 +713,109 @@ func TestTenantAccountHandler_Update(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTenantAccountHandler_UpdateSiteCapabilities(t *testing.T) {
+	ctx := context.Background()
+	dbSession := testTenantAccountInitDB(t)
+	defer dbSession.Close()
+
+	testTenantAccountSetupSchema(t, dbSession)
+
+	ipOrg := "test-capabilities-ip-org"
+	tenantOrg := "test-capabilities-tenant-org"
+	ipUser := testTenantAccountBuildUser(t, dbSession, "test-capabilities-user", []string{ipOrg}, []string{authz.ProviderAdminRole}, "Site", "Admin")
+	ip := testTenantAccountBuildInfrastructureProvider(t, dbSession, "Test Capabilities Infrastructure Provider", ipOrg, ipUser)
+	tenant := testTenantAccountBuildTenant(t, dbSession, tenantOrg, "Test Capabilities Tenant", ipUser)
+	tenantAccount := testTenantAccountBuildTenantAccount(
+		t,
+		dbSession,
+		uuid.New().String(),
+		ip,
+		tenant,
+		tenantOrg,
+		cdbm.TenantAccountStatusReady,
+		ipUser.ID,
+		uuid.Nil,
+	)
+	site := testTenantAccountBuildSite(t, dbSession, ip, "test-capabilities-site", ipUser)
+	tenantSite := cdbm.TestBuildTenantSite(t, dbSession, tenant, site, nil, ipUser)
+
+	handler := NewUpdateTenantAccountHandler(dbSession, &tmocks.Client{}, common.GetTestConfig())
+	sendUpdate := func(caps model.APITenantAccountSiteCapabilitiesUpdateRequest) (*httptest.ResponseRecorder, *model.APITenantAccount) {
+		t.Helper()
+
+		body, err := json.Marshal(model.APITenantAccountUpdateRequest{SiteCapabilities: &caps})
+		require.NoError(t, err)
+
+		e := echo.New()
+		req := httptest.NewRequest(http.MethodPatch, "/", strings.NewReader(string(body)))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		ec := e.NewContext(req, rec)
+		ec.SetParamNames("orgName", "id")
+		ec.SetParamValues(ipOrg, tenantAccount.ID.String())
+		ec.Set("user", ipUser)
+		ec.SetRequest(ec.Request().WithContext(ctx))
+
+		require.NoError(t, handler.Handle(ec))
+		if rec.Code != http.StatusOK {
+			t.Logf("response: %s", rec.Body.String())
+		}
+		require.Equal(t, http.StatusOK, rec.Code)
+
+		response := &model.APITenantAccount{}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), response))
+		return rec, response
+	}
+
+	siteOverrideCaps := model.APITenantAccountSiteCapabilitiesUpdateRequest{
+		{
+			SiteIDs:                  []string{},
+			TargetedInstanceCreation: cutil.GetPtr(true),
+		},
+		{
+			SiteIDs:                  []string{site.ID.String()},
+			TargetedInstanceCreation: cutil.GetPtr(false),
+		},
+	}
+	_, response := sendUpdate(siteOverrideCaps)
+	assert.Equal(t, []model.APITenantAccountSiteCapability{
+		{SiteIDs: []string{}, TargetedInstanceCreation: true},
+		{
+			SiteIDs:                  []string{site.ID.String()},
+			TargetedInstanceCreation: false,
+		},
+	}, response.SiteCapabilities)
+
+	tenantAccountDAO := cdbm.NewTenantAccountDAO(dbSession)
+	updatedTenantAccount, err := tenantAccountDAO.GetByID(ctx, nil, tenantAccount.ID, nil)
+	require.NoError(t, err)
+	assert.True(t, updatedTenantAccount.Config.TargetedInstanceCreation)
+
+	tenantSiteDAO := cdbm.NewTenantSiteDAO(dbSession)
+	updatedTenantSite, err := tenantSiteDAO.GetByID(ctx, nil, tenantSite.ID, nil)
+	require.NoError(t, err)
+	require.NotNil(t, updatedTenantSite.Config.TargetedInstanceCreation)
+	assert.False(t, *updatedTenantSite.Config.TargetedInstanceCreation)
+
+	accountOnlyCaps := model.APITenantAccountSiteCapabilitiesUpdateRequest{
+		{
+			TargetedInstanceCreation: cutil.GetPtr(false),
+		},
+	}
+	_, response = sendUpdate(accountOnlyCaps)
+	assert.Equal(t, []model.APITenantAccountSiteCapability{
+		{SiteIDs: []string{}, TargetedInstanceCreation: false},
+	}, response.SiteCapabilities)
+
+	updatedTenantAccount, err = tenantAccountDAO.GetByID(ctx, nil, tenantAccount.ID, nil)
+	require.NoError(t, err)
+	assert.False(t, updatedTenantAccount.Config.TargetedInstanceCreation)
+
+	updatedTenantSite, err = tenantSiteDAO.GetByID(ctx, nil, tenantSite.ID, nil)
+	require.NoError(t, err)
+	assert.Nil(t, updatedTenantSite.Config.TargetedInstanceCreation)
 }
 
 func TestTenantAccountHandler_GetByID(t *testing.T) {

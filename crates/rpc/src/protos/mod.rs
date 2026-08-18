@@ -35,6 +35,27 @@ pub mod scout_firmware_upgrade {
 #[rustfmt::skip]
 pub mod forge {
     include!(concat!(env!("OUT_DIR"), "/forge.rs"));
+
+    /// Expected-interface Rust name for the legacy protobuf
+    /// `ExpectedHostNic` boundary.
+    ///
+    /// The protobuf descriptor keeps its existing message and field names so
+    /// deployed clients remain protobuf wire- and ProtoJSON-compatible. New
+    /// Rust callers should use this alias and the accessors below.
+    pub type ExpectedInterface = ExpectedHostNic;
+
+    impl ExpectedMachine {
+        /// Return the interfaces from the legacy `host_nics` protobuf field.
+        pub fn interfaces(&self) -> &[ExpectedInterface] {
+            &self.host_nics
+        }
+
+        /// Return mutable interfaces from the legacy `host_nics` protobuf
+        /// field.
+        pub fn interfaces_mut(&mut self) -> &mut Vec<ExpectedInterface> {
+            &mut self.host_nics
+        }
+    }
 }
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
@@ -65,6 +86,12 @@ pub mod mlx_device {
 #[rustfmt::skip]
 pub mod site_explorer {
     include!(concat!(env!("OUT_DIR"), "/site_explorer.rs"));
+
+    /// Observed-state Rust name for the legacy protobuf `NicMode` boundary.
+    ///
+    /// The protobuf descriptor retains `NicMode` for compatibility with
+    /// existing generated clients. New Rust callers should use this alias.
+    pub type BlueFieldOperatingMode = NicMode;
 }
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
@@ -77,6 +104,12 @@ pub mod dns {
 #[rustfmt::skip]
 pub mod fmds {
     include!(concat!(env!("OUT_DIR"), "/fmds.rs"));
+}
+
+#[allow(non_snake_case, unknown_lints, clippy::all)]
+#[rustfmt::skip]
+pub mod agent_local {
+    include!(concat!(env!("OUT_DIR"), "/agent_local.rs"));
 }
 
 #[allow(clippy::all, deprecated)]

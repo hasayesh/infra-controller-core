@@ -21,11 +21,12 @@ import (
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	cdbu "github.com/NVIDIA/infra-controller/rest-api/db/pkg/util"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun/extra/bundebug"
 	tmocks "go.temporal.io/sdk/mocks"
 )
@@ -194,10 +195,11 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 
 	// Test cases
 	tests := []struct {
-		name           string
-		requestBody    model.APIExpectedMachineCreateRequest
-		setupContext   func(c echo.Context)
-		expectedStatus int
+		name             string
+		requestBody      model.APIExpectedMachineCreateRequest
+		setupContext     func(c echo.Context)
+		expectedStatus   int
+		expectedErrorMsg *string
 	}{
 		{
 			name: "successful creation",
@@ -283,6 +285,21 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 				c.SetParamValues(org)
 			},
 			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name: "site ID is empty",
+			requestBody: model.APIExpectedMachineCreateRequest{
+				SiteID:              "",
+				BmcMacAddress:       "00:11:22:33:44:88",
+				ChassisSerialNumber: "CHASSIS127",
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus:   http.StatusBadRequest,
+			expectedErrorMsg: cutil.GetPtr("Site ID specified in request data is not valid"),
 		},
 		{
 			name: "cannot create on unmanaged site",
@@ -402,6 +419,8 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 						assert.Equal(t, *tt.requestBody.BmcIpAddress, *response.BmcIpAddress, "BmcIpAddress in response should match request")
 					}
 				}
+			} else if tt.expectedErrorMsg != nil {
+				assert.Contains(t, rec.Body.String(), *tt.expectedErrorMsg, fmt.Sprintf("Expected: %s, got: %s", *tt.expectedErrorMsg, rec.Body.String()))
 			}
 		})
 	}
@@ -509,10 +528,7 @@ func TestGetAllExpectedMachineHandler_Handle(t *testing.T) {
 		Name:           "privileged-tenant",
 		Org:            privilegedTenantOrg,
 		OrgDisplayName: cutil.GetPtr("Privileged Tenant Org"),
-		Config: &cdbm.TenantConfig{
-			TargetedInstanceCreation: true,
-		},
-		CreatedBy: privilegedTenantUserID,
+		CreatedBy:      privilegedTenantUserID,
 	}
 	_, err = dbSession.DB.NewInsert().Model(privilegedTenant).Exec(ctx)
 	assert.Nil(t, err)
@@ -528,6 +544,18 @@ func TestGetAllExpectedMachineHandler_Handle(t *testing.T) {
 	assert.Nil(t, err)
 
 	privilegedTenantUser := createMockUser(privilegedTenantOrg, authz.TenantAdminRole)
+	_, err = dbSession.DB.NewInsert().Model(&cdbm.TenantAccount{
+		ID:                        uuid.New(),
+		AccountNumber:             common.GenerateAccountNumber(),
+		TenantID:                  &privilegedTenant.ID,
+		TenantOrg:                 privilegedTenantOrg,
+		InfrastructureProviderID:  infraProv.ID,
+		InfrastructureProviderOrg: org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    cdbm.TenantAccountConfig{TargetedInstanceCreation: true},
+		CreatedBy:                 privilegedTenantUserID,
+	}).Exec(ctx)
+	assert.Nil(t, err)
 
 	// Dual-role org: same org acts as both Infrastructure Provider and privileged Tenant
 	dualRoleOrg := "dual-role-org"
@@ -545,10 +573,7 @@ func TestGetAllExpectedMachineHandler_Handle(t *testing.T) {
 		Name:           "dual-role-tenant",
 		Org:            dualRoleOrg,
 		OrgDisplayName: cutil.GetPtr("Dual Role Org"),
-		Config: &cdbm.TenantConfig{
-			TargetedInstanceCreation: true,
-		},
-		CreatedBy: dualRoleUserID,
+		CreatedBy:      dualRoleUserID,
 	}
 	_, err = dbSession.DB.NewInsert().Model(dualRoleTenant).Exec(ctx)
 	assert.Nil(t, err)
@@ -583,15 +608,46 @@ func TestGetAllExpectedMachineHandler_Handle(t *testing.T) {
 	_, err = dbSession.DB.NewInsert().Model(dualRoleTenantSite).Exec(ctx)
 	assert.Nil(t, err)
 
-	// External site owned by a different provider but accessible to dual-role tenant via TenantSite
+	// External site owned by a different provider; tenant access requires an
+	// explicit per-site TargetedInstanceCreation override because the Ready
+	// TenantAccount on the unmanaged provider has the capability disabled globally.
+	siteOverrideTrue := true
 	dualRoleExternalTenantSite := &cdbm.TenantSite{
 		ID:        uuid.New(),
 		TenantID:  dualRoleTenant.ID,
 		TenantOrg: dualRoleOrg,
 		SiteID:    unmanagedSite.ID,
+		Config:    cdbm.TenantSiteConfig{TargetedInstanceCreation: &siteOverrideTrue},
 		CreatedBy: dualRoleUserID,
 	}
 	_, err = dbSession.DB.NewInsert().Model(dualRoleExternalTenantSite).Exec(ctx)
+	assert.Nil(t, err)
+
+	_, err = dbSession.DB.NewInsert().Model(&cdbm.TenantAccount{
+		ID:                        uuid.New(),
+		AccountNumber:             common.GenerateAccountNumber(),
+		TenantID:                  &dualRoleTenant.ID,
+		TenantOrg:                 dualRoleOrg,
+		InfrastructureProviderID:  dualRoleIP.ID,
+		InfrastructureProviderOrg: dualRoleOrg,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    cdbm.TenantAccountConfig{TargetedInstanceCreation: true},
+		CreatedBy:                 dualRoleUserID,
+	}).Exec(ctx)
+	assert.Nil(t, err)
+	// Ready account with the unmanaged provider has global capability disabled;
+	// the external/unmanaged site is reachable via the explicit TenantSite override above.
+	_, err = dbSession.DB.NewInsert().Model(&cdbm.TenantAccount{
+		ID:                        uuid.New(),
+		AccountNumber:             common.GenerateAccountNumber(),
+		TenantID:                  &dualRoleTenant.ID,
+		TenantOrg:                 dualRoleOrg,
+		InfrastructureProviderID:  unmanagedIP.ID,
+		InfrastructureProviderOrg: unmanagedIP.Org,
+		Status:                    cdbm.TenantAccountStatusReady,
+		Config:                    cdbm.TenantAccountConfig{TargetedInstanceCreation: false},
+		CreatedBy:                 dualRoleUserID,
+	}).Exec(ctx)
 	assert.Nil(t, err)
 
 	dualRoleEM, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
@@ -1132,6 +1188,46 @@ func TestGetExpectedMachineHandler_Handle(t *testing.T) {
 	})
 }
 
+func TestBmcMacUnchanged(t *testing.T) {
+	stored := "00:11:22:33:44:DD"
+	tests := []struct {
+		name      string
+		submitted *string
+		expected  bool
+	}{
+		{
+			name:     "omitted",
+			expected: true,
+		},
+		{
+			name:      "exact",
+			submitted: cutil.GetPtr(stored),
+			expected:  true,
+		},
+		{
+			name:      "case and separator differ",
+			submitted: cutil.GetPtr("00-11-22-33-44-dd"),
+			expected:  true,
+		},
+		{
+			name:      "dotted notation",
+			submitted: cutil.GetPtr("0011.2233.44dd"),
+			expected:  true,
+		},
+		{
+			name:      "physical MAC differs",
+			submitted: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
+			expected:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, bmcMacUnchanged(stored, tt.submitted))
+		})
+	}
+}
+
 func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 	// Setup
 	e := echo.New()
@@ -1195,9 +1291,14 @@ func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 	// Add mock temporal client for the site
 	mockTemporalClient := &tmocks.Client{}
 	mockWorkflowRun := &tmocks.WorkflowRun{}
+	var capturedRequest *corev1.ExpectedMachine
 	mockWorkflowRun.On("GetID").Return("test-workflow-id")
 	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).Return(nil)
-	mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "UpdateExpectedMachine", mock.Anything).Return(mockWorkflowRun, nil)
+	mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "UpdateExpectedMachine", mock.Anything).
+		Run(func(args mock.Arguments) {
+			capturedRequest, _ = args.Get(3).(*corev1.ExpectedMachine)
+		}).
+		Return(mockWorkflowRun, nil)
 	scp.IDClientMap[site.ID.String()] = mockTemporalClient
 
 	handler := NewUpdateExpectedMachineHandler(dbSession, scp, cfg)
@@ -1241,10 +1342,10 @@ func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 			expectedStatus: http.StatusOK,
 		},
 		{
-			name: "successful MAC address update",
+			name: "unchanged MAC address spelling is accepted",
 			id:   testEM.ID.String(),
 			requestBody: model.APIExpectedMachineUpdateRequest{
-				BmcMacAddress: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
+				BmcMacAddress: cutil.GetPtr("00-11-22-33-44-dd"),
 			},
 			setupContext: func(c echo.Context) {
 				c.Set("user", createMockUser(org))
@@ -1256,7 +1357,24 @@ func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 				var response model.APIExpectedMachine
 				err := json.Unmarshal(body, &response)
 				assert.Nil(t, err)
-				assert.Equal(t, "AA:BB:CC:DD:EE:FF", response.BmcMacAddress, "MAC address in response should match the updated value")
+				assert.Equal(t, testEM.BmcMacAddress, response.BmcMacAddress,
+					"an equivalent spelling must preserve the stored MAC")
+			},
+		},
+		{
+			name: "BMC MAC address cannot be changed",
+			id:   testEM.ID.String(),
+			requestBody: model.APIExpectedMachineUpdateRequest{
+				BmcMacAddress: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testEM.ID.String())
+			},
+			expectedStatus: http.StatusBadRequest,
+			checkResponseContent: func(t *testing.T, body []byte) {
+				assert.Contains(t, string(body), "BMC MAC address cannot be changed after creation")
 			},
 		},
 		{
@@ -1274,11 +1392,10 @@ func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 			expectedStatus: http.StatusBadRequest,
 		},
 		{
-			name: "cannot update on unmanaged site",
+			name: "site access is checked before BMC MAC identity",
 			id:   unmanagedEM.ID.String(),
 			requestBody: model.APIExpectedMachineUpdateRequest{
-				ChassisSerialNumber: cutil.GetPtr("SHOULD-NOT-UPDATE"),
-				Labels:              map[string]string{"env": "fail"},
+				BmcMacAddress: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
 			},
 			setupContext: func(c echo.Context) {
 				c.Set("user", createMockUser(org))
@@ -1286,6 +1403,9 @@ func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 				c.SetParamValues(org, unmanagedEM.ID.String())
 			},
 			expectedStatus: http.StatusForbidden,
+			checkResponseContent: func(t *testing.T, body []byte) {
+				assert.NotContains(t, string(body), "BMC MAC address cannot be changed")
+			},
 		},
 		{
 			name: "invalid SKU ID returns 422",
@@ -1342,8 +1462,158 @@ func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 			}
 
 			// Check response content if provided
-			if tt.checkResponseContent != nil && rec.Code == http.StatusOK {
+			if tt.checkResponseContent != nil && rec.Code == tt.expectedStatus {
 				tt.checkResponseContent(t, rec.Body.Bytes())
+			}
+		})
+	}
+
+	mockTemporalClient.AssertNumberOfCalls(t, "ExecuteWorkflow", 2)
+	require.NotNil(t, capturedRequest)
+	assert.Equal(t, testEM.BmcMacAddress, capturedRequest.GetBmcMacAddress(),
+		"Core must receive the stored BMC MAC spelling")
+	stored, err := emDAO.Get(ctx, nil, testEM.ID, nil, false)
+	require.NoError(t, err)
+	assert.Equal(t, testEM.BmcMacAddress, stored.BmcMacAddress,
+		"PATCH must never change the stored BMC MAC spelling or identity")
+}
+
+func TestUpdateExpectedMachineHandler_BmcIpAddressPatchSemantics(t *testing.T) {
+	e := echo.New()
+	dbSession := testExpectedMachineInitDB(t)
+	defer dbSession.Close()
+
+	cfg := common.GetTestConfig()
+	tcfg, _ := cfg.GetTemporalConfig()
+	scp := sc.NewClientPool(tcfg)
+	org := "test-org"
+	_, site := testExpectedMachineSetupTestData(t, dbSession, org)
+	ctx := context.Background()
+
+	originalIP := "192.0.2.30"
+	emDAO := cdbm.NewExpectedMachineDAO(dbSession)
+	testEM, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+		ExpectedMachineID:   uuid.New(),
+		SiteID:              site.ID,
+		BmcMacAddress:       "00:11:22:33:44:C1",
+		ChassisSerialNumber: "BMC-IP-PATCH-001",
+		BmcIpAddress:        &originalIP,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, testEM)
+
+	var capturedRequests []*corev1.ExpectedMachine
+	mockTemporalClient := &tmocks.Client{}
+	mockWorkflowRun := &tmocks.WorkflowRun{}
+	mockWorkflowRun.On("GetID").Return("test-workflow-id")
+	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).Return(nil)
+	mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "UpdateExpectedMachine", mock.Anything).
+		Run(func(args mock.Arguments) {
+			if request, ok := args.Get(3).(*corev1.ExpectedMachine); ok {
+				capturedRequests = append(capturedRequests, request)
+			}
+		}).
+		Return(mockWorkflowRun, nil)
+	scp.IDClientMap[site.ID.String()] = mockTemporalClient
+
+	handler := NewUpdateExpectedMachineHandler(dbSession, scp, cfg)
+	user := &cdbm.User{
+		StarfleetID: cutil.GetPtr("test-user"),
+		OrgData: cdbm.OrgData{
+			org: cdbm.Org{
+				ID:          123,
+				Name:        org,
+				DisplayName: org,
+				OrgType:     "ENTERPRISE",
+				Roles:       []string{authz.ProviderAdminRole},
+			},
+		},
+	}
+	updatedIP := "192.0.2.31"
+	emptyIP := ""
+	tests := []struct {
+		name           string
+		body           string
+		wantStatus     int
+		wantIP         *string
+		wantWorkflowIP *string
+		requests       int
+	}{
+		{
+			name:       "omission preserves address",
+			body:       `{"name":"preserved-address"}`,
+			wantStatus: http.StatusOK,
+			wantIP:     &originalIP,
+		},
+		{
+			name:           "address sets value",
+			body:           `{"bmcIpAddress":"192.0.2.31"}`,
+			wantStatus:     http.StatusOK,
+			wantIP:         &updatedIP,
+			wantWorkflowIP: &updatedIP,
+		},
+		{
+			name:           "empty string clears address",
+			body:           `{"bmcIpAddress":""}`,
+			wantStatus:     http.StatusOK,
+			wantWorkflowIP: &emptyIP,
+		},
+		{
+			name:       "explicit null preserves address",
+			body:       `{"bmcIpAddress":null}`,
+			wantStatus: http.StatusOK,
+			wantIP:     &originalIP,
+		},
+		{
+			name:           "repeated empty string remains cleared",
+			body:           `{"bmcIpAddress":""}`,
+			wantStatus:     http.StatusOK,
+			wantWorkflowIP: &emptyIP,
+			requests:       2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := emDAO.Update(ctx, nil, cdbm.ExpectedMachineUpdateInput{
+				ExpectedMachineID: testEM.ID,
+				BmcIpAddress:      &originalIP,
+			})
+			require.NoError(t, err)
+
+			requestCount := tc.requests
+			if requestCount == 0 {
+				requestCount = 1
+			}
+			for range requestCount {
+				workflowCount := len(capturedRequests)
+				url := "/v2/org/" + org + "/nico/expected-machine/" + testEM.ID.String()
+				req := httptest.NewRequest(http.MethodPatch, url, bytes.NewBufferString(tc.body))
+				req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+				rec := httptest.NewRecorder()
+				c := e.NewContext(req, rec)
+				c.Set("user", user)
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testEM.ID.String())
+
+				err := handler.Handle(c)
+				assert.NoError(t, err)
+				assert.Equal(t, tc.wantStatus, rec.Code, "Response: %s", rec.Body.String())
+
+				stored, err := emDAO.Get(ctx, nil, testEM.ID, nil, false)
+				assert.NoError(t, err)
+				assert.Equal(t, tc.wantIP, stored.BmcIpAddress)
+				if tc.wantStatus != http.StatusOK {
+					assert.Len(t, capturedRequests, workflowCount)
+					continue
+				}
+
+				var response model.APIExpectedMachine
+				assert.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+				assert.Equal(t, tc.wantIP, response.BmcIpAddress)
+				if assert.Len(t, capturedRequests, workflowCount+1) {
+					assert.Equal(t, tc.wantWorkflowIP, capturedRequests[workflowCount].BmcIpAddress)
+				}
 			}
 		})
 	}
@@ -1488,10 +1758,116 @@ func TestDeleteExpectedMachineHandler_Handle(t *testing.T) {
 	}
 }
 
+// TestExpectedMachineTenantSiteOverrideDenied verifies that TenantSite association
+// does not grant access when global capability is enabled but the Site override is false.
+func TestExpectedMachineTenantSiteOverrideDenied(t *testing.T) {
+	dbSession := testExpectedMachineInitDB(t)
+	defer dbSession.Close()
+	ctx := context.Background()
+
+	ipOrg := "test-ip-org-override"
+	ip := &cdbm.InfrastructureProvider{
+		ID:   uuid.New(),
+		Name: "test-provider-override",
+		Org:  ipOrg,
+	}
+	_, err := dbSession.DB.NewInsert().Model(ip).Exec(ctx)
+	assert.Nil(t, err)
+
+	site := &cdbm.Site{
+		ID:                       uuid.New(),
+		Name:                     "test-site-override",
+		Org:                      ipOrg,
+		InfrastructureProviderID: ip.ID,
+		Status:                   cdbm.SiteStatusRegistered,
+	}
+	_, err = dbSession.DB.NewInsert().Model(site).Exec(ctx)
+	assert.Nil(t, err)
+
+	tenantOrg := "test-tenant-org-override"
+	tenant := &cdbm.Tenant{
+		ID:             uuid.New(),
+		Name:           "test-tenant-override",
+		Org:            tenantOrg,
+		OrgDisplayName: cutil.GetPtr("Test Tenant Override"),
+	}
+	_, err = dbSession.DB.NewInsert().Model(tenant).Exec(ctx)
+	assert.Nil(t, err)
+
+	tenantUser := &cdbm.User{
+		ID:    uuid.New(),
+		Email: cutil.GetPtr("tenant-override@example.com"),
+		OrgData: cdbm.OrgData{
+			tenantOrg: cdbm.Org{
+				ID:          125,
+				Name:        tenantOrg,
+				DisplayName: "Test Tenant Org Override",
+				OrgType:     "ENTERPRISE",
+				Roles:       []string{authz.TenantAdminRole},
+			},
+		},
+	}
+	_, err = dbSession.DB.NewInsert().Model(tenantUser).Exec(ctx)
+	assert.Nil(t, err)
+
+	tenantAccount := &cdbm.TenantAccount{
+		ID:                       uuid.New(),
+		AccountNumber:            "TA-override",
+		TenantID:                 &tenant.ID,
+		TenantOrg:                tenantOrg,
+		InfrastructureProviderID: ip.ID,
+		Status:                   cdbm.TenantAccountStatusReady,
+		Config:                   cdbm.TenantAccountConfig{TargetedInstanceCreation: true},
+		CreatedBy:                tenantUser.ID,
+	}
+	_, err = dbSession.DB.NewInsert().Model(tenantAccount).Exec(ctx)
+	assert.Nil(t, err)
+
+	siteOverrideFalse := false
+	tenantSite := &cdbm.TenantSite{
+		ID:        uuid.New(),
+		TenantID:  tenant.ID,
+		TenantOrg: tenantOrg,
+		SiteID:    site.ID,
+		Config:    cdbm.TenantSiteConfig{TargetedInstanceCreation: &siteOverrideFalse},
+		CreatedBy: tenantUser.ID,
+	}
+	_, err = dbSession.DB.NewInsert().Model(tenantSite).Exec(ctx)
+	assert.Nil(t, err)
+
+	cfg := common.GetTestConfig()
+	e := echo.New()
+	handler := NewCreateExpectedMachineHandler(dbSession, sc.NewClientPool(nil), cfg)
+
+	reqBody, err := json.Marshal(model.APIExpectedMachineCreateRequest{
+		SiteID:              site.ID.String(),
+		BmcMacAddress:       "AA:BB:CC:DD:EE:99",
+		DefaultBmcUsername:  cutil.GetPtr("admin"),
+		DefaultBmcPassword:  cutil.GetPtr("password"),
+		ChassisSerialNumber: "OVERRIDE-DENIED-CHASSIS",
+	})
+	assert.Nil(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v2/org/"+tenantOrg+"/nico/expected-machine", bytes.NewReader(reqBody))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set("user", tenantUser)
+	c.SetParamNames("orgName")
+	c.SetParamValues(tenantOrg)
+
+	err = handler.Handle(c)
+	assert.Nil(t, err)
+	assert.Equal(t, http.StatusForbidden, rec.Code, "Response: %v", rec.Body.String())
+}
+
 // TestTenantWithTargetedInstanceCreationCapability tests that tenants with TargetedInstanceCreation
 // capability can create, get, update, and delete Expected Machines
 func TestTenantWithTargetedInstanceCreationCapability(t *testing.T) {
 	dbSession := testExpectedMachineInitDB(t)
+	defer dbSession.Close()
 
 	ctx := context.Background()
 	var err error
@@ -1523,9 +1899,6 @@ func TestTenantWithTargetedInstanceCreationCapability(t *testing.T) {
 		Name:           "test-tenant",
 		Org:            tenantOrg,
 		OrgDisplayName: cutil.GetPtr("Test Tenant"),
-		Config: &cdbm.TenantConfig{
-			TargetedInstanceCreation: true,
-		},
 	}
 	_, err = dbSession.DB.NewInsert().Model(tenant).Exec(ctx)
 	assert.Nil(t, err)
@@ -1547,7 +1920,9 @@ func TestTenantWithTargetedInstanceCreationCapability(t *testing.T) {
 	_, err = dbSession.DB.NewInsert().Model(tenantUser).Exec(ctx)
 	assert.Nil(t, err)
 
-	// Create TenantAccount linking tenant to infrastructure provider
+	// Create a Ready TenantAccount with TargetedInstanceCreation enabled. The
+	// TenantSite below has no explicit override and therefore inherits this
+	// account default.
 	tenantAccount := &cdbm.TenantAccount{
 		ID:                       uuid.New(),
 		AccountNumber:            "TA-12345",
@@ -1555,6 +1930,7 @@ func TestTenantWithTargetedInstanceCreationCapability(t *testing.T) {
 		TenantOrg:                tenantOrg,
 		InfrastructureProviderID: ip.ID,
 		Status:                   cdbm.TenantAccountStatusReady,
+		Config:                   cdbm.TenantAccountConfig{TargetedInstanceCreation: true},
 		CreatedBy:                tenantUser.ID,
 	}
 	_, err = dbSession.DB.NewInsert().Model(tenantAccount).Exec(ctx)
@@ -1577,9 +1953,6 @@ func TestTenantWithTargetedInstanceCreationCapability(t *testing.T) {
 		Name:           "test-tenant-no-cap",
 		Org:            tenantOrg2,
 		OrgDisplayName: cutil.GetPtr("Test Tenant No Cap"),
-		Config: &cdbm.TenantConfig{
-			TargetedInstanceCreation: false, // No capability
-		},
 	}
 	_, err = dbSession.DB.NewInsert().Model(tenant2).Exec(ctx)
 	assert.Nil(t, err)
@@ -1866,12 +2239,12 @@ func TestCreateExpectedMachinesHandler_Handle(t *testing.T) {
 	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			// Cast result to BatchExpectedMachineOperationResponse and populate
-			if resultPtr, ok := args.Get(1).(*cwssaws.BatchExpectedMachineOperationResponse); ok {
+			if resultPtr, ok := args.Get(1).(*corev1.BatchExpectedMachineOperationResponse); ok {
 				// Extract machines from the captured request
-				if req, ok := capturedRequest.(*cwssaws.BatchExpectedMachineOperationRequest); ok {
+				if req, ok := capturedRequest.(*corev1.BatchExpectedMachineOperationRequest); ok {
 					if req.ExpectedMachines != nil && req.ExpectedMachines.ExpectedMachines != nil {
 						// Create results for each machine (all successful for tests)
-						results := make([]*cwssaws.ExpectedMachineOperationResult, 0, len(req.ExpectedMachines.ExpectedMachines))
+						results := make([]*corev1.ExpectedMachineOperationResult, 0, len(req.ExpectedMachines.ExpectedMachines))
 						for idx, machine := range req.ExpectedMachines.ExpectedMachines {
 							if machine != nil && machine.Id != nil {
 								success := true
@@ -1882,7 +2255,7 @@ func TestCreateExpectedMachinesHandler_Handle(t *testing.T) {
 										errMsg = &msg
 									}
 								}
-								result := &cwssaws.ExpectedMachineOperationResult{
+								result := &corev1.ExpectedMachineOperationResult{
 									Id:      machine.Id,
 									Success: success,
 								}
@@ -2105,14 +2478,14 @@ func TestCreateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow(t *testi
 	_, site := testExpectedMachineSetupTestData(t, dbSession, org)
 
 	// Capture the proto struct forwarded to the Temporal workflow.
-	var capturedRequest *cwssaws.ExpectedMachine
+	var capturedRequest *corev1.ExpectedMachine
 	mockTemporalClient := &tmocks.Client{}
 	mockWorkflowRun := &tmocks.WorkflowRun{}
 	mockWorkflowRun.On("GetID").Return("test-workflow-id")
 	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).Return(nil)
 	mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "CreateExpectedMachine", mock.Anything).
 		Run(func(args mock.Arguments) {
-			if req, ok := args.Get(3).(*cwssaws.ExpectedMachine); ok {
+			if req, ok := args.Get(3).(*corev1.ExpectedMachine); ok {
 				capturedRequest = req
 			}
 		}).
@@ -2172,6 +2545,83 @@ func TestCreateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow(t *testi
 	}
 }
 
+func TestCreateExpectedMachineHandler_DpfEnabledForwardedToWorkflow(t *testing.T) {
+	e := echo.New()
+	dbSession := testExpectedMachineInitDB(t)
+	defer dbSession.Close()
+
+	cfg := common.GetTestConfig()
+	tcfg, _ := cfg.GetTemporalConfig()
+	scp := sc.NewClientPool(tcfg)
+
+	org := "test-org"
+	_, site := testExpectedMachineSetupTestData(t, dbSession, org)
+
+	var capturedRequest *corev1.ExpectedMachine
+	mockTemporalClient := &tmocks.Client{}
+	mockWorkflowRun := &tmocks.WorkflowRun{}
+	mockWorkflowRun.On("GetID").Return("test-workflow-id")
+	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).Return(nil)
+	mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "CreateExpectedMachine", mock.Anything).
+		Run(func(args mock.Arguments) {
+			if req, ok := args.Get(3).(*corev1.ExpectedMachine); ok {
+				capturedRequest = req
+			}
+		}).
+		Return(mockWorkflowRun, nil)
+	scp.IDClientMap[site.ID.String()] = mockTemporalClient
+
+	handler := NewCreateExpectedMachineHandler(dbSession, scp, cfg)
+
+	rawBody := map[string]interface{}{
+		"siteId":              site.ID.String(),
+		"bmcMacAddress":       "00:AA:BB:CC:DD:EF",
+		"chassisSerialNumber": "DPF-TEST-CHASSIS-001",
+		"isDpfEnabled":        false,
+	}
+	reqBody, err := json.Marshal(rawBody)
+	assert.Nil(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v2/org/"+org+"/nico/expected-machine", bytes.NewReader(reqBody))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req = req.WithContext(context.Background())
+
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set("user", &cdbm.User{
+		StarfleetID: cutil.GetPtr("test-user"),
+		OrgData: cdbm.OrgData{
+			org: cdbm.Org{
+				ID:          123,
+				Name:        org,
+				DisplayName: org,
+				OrgType:     "ENTERPRISE",
+				Roles:       []string{"FORGE_PROVIDER_ADMIN"},
+			},
+		},
+	})
+	c.SetParamNames("orgName")
+	c.SetParamValues(org)
+
+	err = handler.Handle(c)
+	assert.Nil(t, err)
+	assert.Equal(t, http.StatusCreated, rec.Code, "Response: %s", rec.Body.String())
+
+	if assert.NotNil(t, capturedRequest, "workflow should have received a request") {
+		if assert.NotNil(t, capturedRequest.IsDpfEnabled) {
+			assert.False(t, *capturedRequest.IsDpfEnabled)
+		}
+		assert.False(t, capturedRequest.DpfEnabled)
+	}
+
+	var apiResponse model.APIExpectedMachine
+	err = json.Unmarshal(rec.Body.Bytes(), &apiResponse)
+	assert.Nil(t, err)
+	if assert.NotNil(t, apiResponse.IsDpfEnabled) {
+		assert.False(t, *apiResponse.IsDpfEnabled)
+	}
+}
+
 // TestUpdateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow is a regression test for the
 // same spec / JSON struct tag mismatch bug described in
 // TestCreateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow, but for the PATCH
@@ -2201,14 +2651,14 @@ func TestUpdateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow(t *testi
 	assert.NotNil(t, testEM)
 
 	// Capture the proto struct forwarded to the Temporal workflow.
-	var capturedRequest *cwssaws.ExpectedMachine
+	var capturedRequest *corev1.ExpectedMachine
 	mockTemporalClient := &tmocks.Client{}
 	mockWorkflowRun := &tmocks.WorkflowRun{}
 	mockWorkflowRun.On("GetID").Return("test-workflow-id")
 	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).Return(nil)
 	mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "UpdateExpectedMachine", mock.Anything).
 		Run(func(args mock.Arguments) {
-			if req, ok := args.Get(3).(*cwssaws.ExpectedMachine); ok {
+			if req, ok := args.Get(3).(*corev1.ExpectedMachine); ok {
 				capturedRequest = req
 			}
 		}).
@@ -2296,6 +2746,25 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 	_, err := dbSession.DB.NewInsert().Model(site2).Exec(ctx)
 	assert.Nil(t, err)
 
+	// Create a Site outside the caller's provider relationship so identity
+	// validation cannot reveal data before the access check.
+	unmanagedIP := &cdbm.InfrastructureProvider{
+		ID:   uuid.New(),
+		Name: "unmanaged-batch-provider",
+		Org:  "other-org",
+	}
+	_, err = dbSession.DB.NewInsert().Model(unmanagedIP).Exec(ctx)
+	assert.Nil(t, err)
+	unmanagedSite := &cdbm.Site{
+		ID:                       uuid.New(),
+		Name:                     "unmanaged-batch-site",
+		Org:                      "other-org",
+		InfrastructureProviderID: unmanagedIP.ID,
+		Status:                   cdbm.SiteStatusRegistered,
+	}
+	_, err = dbSession.DB.NewInsert().Model(unmanagedSite).Exec(ctx)
+	assert.Nil(t, err)
+
 	// Create test ExpectedMachines on site 1
 	emDAO := cdbm.NewExpectedMachineDAO(dbSession)
 	testEM1, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
@@ -2305,6 +2774,14 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 		ChassisSerialNumber:      "BATCH-UPDATE-001",
 		FallbackDpuSerialNumbers: []string{"DPU010"},
 		Labels:                   map[string]string{"env": "test"},
+	})
+	assert.Nil(t, err)
+
+	unmanagedEM, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+		ExpectedMachineID:   uuid.New(),
+		SiteID:              unmanagedSite.ID,
+		BmcMacAddress:       "00:11:22:33:44:13",
+		ChassisSerialNumber: "BATCH-UPDATE-UNMANAGED",
 	})
 	assert.Nil(t, err)
 
@@ -2350,12 +2827,12 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			// Cast result to BatchExpectedMachineOperationResponse and populate
-			if resultPtr, ok := args.Get(1).(*cwssaws.BatchExpectedMachineOperationResponse); ok {
+			if resultPtr, ok := args.Get(1).(*corev1.BatchExpectedMachineOperationResponse); ok {
 				// Extract machines from the captured request
-				if req, ok := capturedRequest.(*cwssaws.BatchExpectedMachineOperationRequest); ok {
+				if req, ok := capturedRequest.(*corev1.BatchExpectedMachineOperationRequest); ok {
 					if req.ExpectedMachines != nil && req.ExpectedMachines.ExpectedMachines != nil {
 						// Create results for each machine (all successful for tests)
-						results := make([]*cwssaws.ExpectedMachineOperationResult, 0, len(req.ExpectedMachines.ExpectedMachines))
+						results := make([]*corev1.ExpectedMachineOperationResult, 0, len(req.ExpectedMachines.ExpectedMachines))
 						for idx, machine := range req.ExpectedMachines.ExpectedMachines {
 							if machine != nil && machine.Id != nil {
 								success := true
@@ -2366,7 +2843,7 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 										errMsg = &msg
 									}
 								}
-								result := &cwssaws.ExpectedMachineOperationResult{
+								result := &corev1.ExpectedMachineOperationResult{
 									Id:      machine.Id,
 									Success: success,
 								}
@@ -2437,6 +2914,120 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 				err := json.Unmarshal(body, &response)
 				assert.Nil(t, err)
 				assert.Equal(t, 2, len(response))
+			},
+		},
+		{
+			name: "unchanged MAC address spellings are accepted",
+			requestBody: []model.APIExpectedMachineUpdateRequest{
+				{
+					ID:            cutil.GetPtr(testEM1.ID.String()),
+					BmcMacAddress: cutil.GetPtr("00-11-22-33-44-10"),
+				},
+				{
+					ID:            cutil.GetPtr(testEM2.ID.String()),
+					BmcMacAddress: cutil.GetPtr("00:11:22:33:44:11"),
+				},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus: http.StatusOK,
+			validateResp: func(t *testing.T, body []byte) {
+				var response []model.APIExpectedMachine
+				err := json.Unmarshal(body, &response)
+				require.NoError(t, err)
+				require.Len(t, response, 2)
+
+				responseByID := make(map[uuid.UUID]model.APIExpectedMachine, len(response))
+				for _, machine := range response {
+					responseByID[machine.ID] = machine
+				}
+				assert.Equal(t, testEM1.BmcMacAddress, responseByID[testEM1.ID].BmcMacAddress)
+				assert.Equal(t, testEM2.BmcMacAddress, responseByID[testEM2.ID].BmcMacAddress)
+
+				request, ok := capturedRequest.(*corev1.BatchExpectedMachineOperationRequest)
+				require.True(t, ok)
+				workflowMachines := request.GetExpectedMachines().GetExpectedMachines()
+				require.Len(t, workflowMachines, 2)
+
+				workflowByID := make(map[string]*corev1.ExpectedMachine, len(workflowMachines))
+				for _, machine := range workflowMachines {
+					workflowByID[machine.GetId().GetValue()] = machine
+				}
+				require.Contains(t, workflowByID, testEM1.ID.String())
+				require.Contains(t, workflowByID, testEM2.ID.String())
+				assert.Equal(t, testEM1.BmcMacAddress,
+					workflowByID[testEM1.ID.String()].GetBmcMacAddress())
+				assert.Equal(t, testEM2.BmcMacAddress,
+					workflowByID[testEM2.ID.String()].GetBmcMacAddress())
+			},
+		},
+		{
+			name: "BMC MAC address change rejects the whole batch",
+			requestBody: []model.APIExpectedMachineUpdateRequest{
+				{
+					ID:            cutil.GetPtr(testEM1.ID.String()),
+					BmcMacAddress: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
+				},
+				{
+					ID:                  cutil.GetPtr(testEM2.ID.String()),
+					ChassisSerialNumber: cutil.GetPtr("REJECTED-BATCH-CHANGE"),
+				},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus: http.StatusBadRequest,
+			validateResp: func(t *testing.T, body []byte) {
+				assert.Contains(t, string(body), "BMC MAC address cannot be changed after creation")
+				stored, err := emDAO.Get(ctx, nil, testEM2.ID, nil, false)
+				require.NoError(t, err)
+				assert.NotEqual(t, "REJECTED-BATCH-CHANGE", stored.ChassisSerialNumber,
+					"a rejected batch must not update another machine")
+			},
+		},
+		{
+			name: "BMC MAC address swap is rejected",
+			requestBody: []model.APIExpectedMachineUpdateRequest{
+				{
+					ID:            cutil.GetPtr(testEM1.ID.String()),
+					BmcMacAddress: cutil.GetPtr(testEM2.BmcMacAddress),
+				},
+				{
+					ID:            cutil.GetPtr(testEM2.ID.String()),
+					BmcMacAddress: cutil.GetPtr(testEM1.BmcMacAddress),
+				},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus: http.StatusBadRequest,
+			validateResp: func(t *testing.T, body []byte) {
+				assert.Contains(t, string(body), "BMC MAC address cannot be changed after creation")
+			},
+		},
+		{
+			name: "site access is checked before BMC MAC identity",
+			requestBody: []model.APIExpectedMachineUpdateRequest{
+				{
+					ID:            cutil.GetPtr(unmanagedEM.ID.String()),
+					BmcMacAddress: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
+				},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus: http.StatusForbidden,
+			validateResp: func(t *testing.T, body []byte) {
+				assert.NotContains(t, string(body), "BMC MAC address cannot be changed")
 			},
 		},
 		{
@@ -2556,21 +3147,18 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 			},
 		},
 		{
-			name: "bad siteID with duplicate MAC and duplicate serial should fail with validation errors",
+			name: "duplicate serial should fail before database lookup",
 			requestBody: []model.APIExpectedMachineUpdateRequest{
 				{
 					ID:                  cutil.GetPtr(testEM1.ID.String()),
-					BmcMacAddress:       cutil.GetPtr("ff:ff:ff:ff:ff:ff"),    // lowercase
 					ChassisSerialNumber: cutil.GetPtr("Duplicate-Everything"), // mixed case
 				},
 				{
 					ID:                  cutil.GetPtr(testEM2.ID.String()),
-					BmcMacAddress:       cutil.GetPtr("FF:FF:FF:FF:FF:FF"),    // uppercase (duplicate MAC, different case)
 					ChassisSerialNumber: cutil.GetPtr("DUPLICATE-EVERYTHING"), // uppercase (duplicate serial, different case)
 				},
 				{
 					ID:                  cutil.GetPtr("00000000-0000-0000-0000-000000000099"), // non-existent ID (bad siteID)
-					BmcMacAddress:       cutil.GetPtr("AA:AA:AA:AA:AA:AA"),
 					ChassisSerialNumber: cutil.GetPtr("NONEXISTENT-SERIAL"),
 				},
 			},
@@ -2581,7 +3169,8 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 			},
 			expectedStatus: http.StatusBadRequest,
 			validateResp: func(t *testing.T, body []byte) {
-				// Verify error response contains validation errors for duplicate MAC and serial
+				// Verify the request-level duplicate is reported before the
+				// handler reaches its database lookup for the missing ID.
 				bodyStr := string(body)
 				t.Logf("Response body: %s", bodyStr)
 
@@ -2591,14 +3180,12 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 				assert.Nil(t, err)
 
 				// Should have validation errors in data field
-				assert.Contains(t, bodyStr, "bmcMacAddress")
-				assert.Contains(t, bodyStr, "duplicate BMC MAC address")
 				assert.Contains(t, bodyStr, "chassisSerialNumber")
 				assert.Contains(t, bodyStr, "duplicate chassis serial number")
 
 				// The error should be about validation, not about machines being found
 				// since the duplicate check happens before the DB query for non-existent machines
-				// This test verifies case-insensitive comparison (ff:ff vs FF:FF and Duplicate vs DUPLICATE)
+				// This test verifies case-insensitive serial comparison.
 				assert.Contains(t, bodyStr, "Failed to validate Expected Machine update data")
 			},
 		},
@@ -2636,5 +3223,182 @@ func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
 				tt.validateResp(t, rec.Body.Bytes())
 			}
 		})
+	}
+
+	mockTemporalClient.AssertNumberOfCalls(t, "ExecuteWorkflow", 2)
+	storedEM1, err := emDAO.Get(ctx, nil, testEM1.ID, nil, false)
+	require.NoError(t, err)
+	storedEM2, err := emDAO.Get(ctx, nil, testEM2.ID, nil, false)
+	require.NoError(t, err)
+	assert.Equal(t, testEM1.BmcMacAddress, storedEM1.BmcMacAddress)
+	assert.Equal(t, testEM2.BmcMacAddress, storedEM2.BmcMacAddress)
+}
+
+func TestUpdateExpectedMachinesHandler_BmcIpAddressPatchSemantics(t *testing.T) {
+	e := echo.New()
+	dbSession := testExpectedMachineInitDB(t)
+	defer dbSession.Close()
+
+	cfg := common.GetTestConfig()
+	tcfg, _ := cfg.GetTemporalConfig()
+	scp := sc.NewClientPool(tcfg)
+	org := "test-org"
+	_, site := testExpectedMachineSetupTestData(t, dbSession, org)
+	ctx := context.Background()
+	emDAO := cdbm.NewExpectedMachineDAO(dbSession)
+
+	createExpectedMachine := func(mac, serial string, bmcIP, name *string) *cdbm.ExpectedMachine {
+		em, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+			ExpectedMachineID:   uuid.New(),
+			SiteID:              site.ID,
+			BmcMacAddress:       mac,
+			ChassisSerialNumber: serial,
+			BmcIpAddress:        bmcIP,
+			Name:                name,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, em)
+		return em
+	}
+
+	clearedIP := "192.0.2.41"
+	updatedIP := "192.0.2.42"
+	preservedIP := "192.0.2.43"
+	nullPreservedIP := "192.0.2.44"
+	clearedName := "cleared-machine"
+	updatedName := "updated-machine"
+	preservedName := "preserved-machine"
+	nullPreservedName := "null-preserved-machine"
+	emCleared := createExpectedMachine("00:11:22:33:44:D2", "BMC-IP-BATCH-002", &clearedIP, &clearedName)
+	emUpdated := createExpectedMachine("00:11:22:33:44:D3", "BMC-IP-BATCH-003", nil, &updatedName)
+	emPreserved := createExpectedMachine("00:11:22:33:44:D4", "BMC-IP-BATCH-004", &preservedIP, &preservedName)
+	emNullPreserved := createExpectedMachine("00:11:22:33:44:D5", "BMC-IP-BATCH-005", &nullPreservedIP, &nullPreservedName)
+	emptyIP := ""
+	tests := []struct {
+		name           string
+		machine        *cdbm.ExpectedMachine
+		request        map[string]interface{}
+		wantIP         *string
+		wantWorkflowIP *string
+		wantName       *string
+	}{
+		{
+			name:           "empty string clears address",
+			machine:        emCleared,
+			request:        map[string]interface{}{"bmcIpAddress": ""},
+			wantWorkflowIP: &emptyIP,
+			wantName:       &clearedName,
+		},
+		{
+			name:           "address sets value",
+			machine:        emUpdated,
+			request:        map[string]interface{}{"bmcIpAddress": updatedIP},
+			wantIP:         &updatedIP,
+			wantWorkflowIP: &updatedIP,
+			wantName:       &updatedName,
+		},
+		{
+			name:     "omission preserves REST address and omits workflow address",
+			machine:  emPreserved,
+			request:  map[string]interface{}{},
+			wantIP:   &preservedIP,
+			wantName: &preservedName,
+		},
+		{
+			name:     "null preserves REST address and omits workflow address",
+			machine:  emNullPreserved,
+			request:  map[string]interface{}{"bmcIpAddress": nil},
+			wantIP:   &nullPreservedIP,
+			wantName: &nullPreservedName,
+		},
+	}
+
+	var capturedRequest *corev1.BatchExpectedMachineOperationRequest
+	mockTemporalClient := &tmocks.Client{}
+	mockWorkflowRun := &tmocks.WorkflowRun{}
+	mockWorkflowRun.On("GetID").Return("test-workflow-id")
+	mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "UpdateExpectedMachines", mock.Anything).
+		Run(func(args mock.Arguments) {
+			capturedRequest, _ = args.Get(3).(*corev1.BatchExpectedMachineOperationRequest)
+		}).
+		Return(mockWorkflowRun, nil)
+	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			response, ok := args.Get(1).(*corev1.BatchExpectedMachineOperationResponse)
+			if !ok || capturedRequest == nil || capturedRequest.ExpectedMachines == nil {
+				return
+			}
+			for _, machine := range capturedRequest.ExpectedMachines.ExpectedMachines {
+				response.Results = append(response.Results, &corev1.ExpectedMachineOperationResult{
+					Id:      machine.Id,
+					Success: true,
+				})
+			}
+		}).
+		Return(nil)
+	scp.IDClientMap[site.ID.String()] = mockTemporalClient
+
+	requestBody := make([]map[string]interface{}, 0, len(tests))
+	wantByID := make(map[uuid.UUID]*string, len(tests))
+	wantWorkflowIPByID := make(map[uuid.UUID]*string, len(tests))
+	wantNameByID := make(map[uuid.UUID]*string, len(tests))
+	scenarioByID := make(map[uuid.UUID]string, len(tests))
+	for _, test := range tests {
+		test.request["id"] = test.machine.ID.String()
+		requestBody = append(requestBody, test.request)
+		wantByID[test.machine.ID] = test.wantIP
+		wantWorkflowIPByID[test.machine.ID] = test.wantWorkflowIP
+		wantNameByID[test.machine.ID] = test.wantName
+		scenarioByID[test.machine.ID] = test.name
+	}
+
+	body, err := json.Marshal(requestBody)
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPatch, "/v2/org/"+org+"/nico/expected-machine/batch", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set("user", &cdbm.User{
+		StarfleetID: cutil.GetPtr("test-user"),
+		OrgData: cdbm.OrgData{
+			org: cdbm.Org{
+				ID:          123,
+				Name:        org,
+				DisplayName: org,
+				OrgType:     "ENTERPRISE",
+				Roles:       []string{authz.ProviderAdminRole},
+			},
+		},
+	})
+	c.SetParamNames("orgName")
+	c.SetParamValues(org)
+
+	handler := NewUpdateExpectedMachinesHandler(dbSession, scp, cfg)
+	err = handler.Handle(c)
+	assert.NoError(t, err)
+	assert.Equal(t, http.StatusOK, rec.Code, "Response: %s", rec.Body.String())
+
+	var response []model.APIExpectedMachine
+	assert.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	assert.Len(t, response, len(wantByID))
+	for _, machine := range response {
+		assert.Equal(t, wantByID[machine.ID], machine.BmcIpAddress, scenarioByID[machine.ID])
+		assert.Equal(t, wantNameByID[machine.ID], machine.Name, scenarioByID[machine.ID])
+	}
+	for id, wantIP := range wantByID {
+		stored, err := emDAO.Get(ctx, nil, id, nil, false)
+		assert.NoError(t, err, scenarioByID[id])
+		assert.Equal(t, wantIP, stored.BmcIpAddress, scenarioByID[id])
+		assert.Equal(t, wantNameByID[id], stored.Name, scenarioByID[id])
+	}
+
+	if assert.NotNil(t, capturedRequest) && assert.NotNil(t, capturedRequest.ExpectedMachines) {
+		assert.Len(t, capturedRequest.ExpectedMachines.ExpectedMachines, len(wantByID))
+		for _, machine := range capturedRequest.ExpectedMachines.ExpectedMachines {
+			id, err := uuid.Parse(machine.Id.Value)
+			assert.NoError(t, err)
+			assert.Equal(t, wantWorkflowIPByID[id], machine.BmcIpAddress, scenarioByID[id])
+			assert.Equal(t, wantNameByID[id], machine.Name, scenarioByID[id])
+		}
 	}
 }

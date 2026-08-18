@@ -19,7 +19,9 @@ use std::ops::DerefMut;
 use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::vpc::VpcId;
 use config_version::ConfigVersion;
-use model::vpc::{NewVpc, UpdateVpc, UpdateVpcVirtualization, Vpc, VpcStatus};
+use model::vpc::{
+    NewVpc, PowerResourceGroupUpdate, UpdateVpc, UpdateVpcVirtualization, Vpc, VpcStatus,
+};
 use sqlx::{PgConnection, PgTransaction};
 
 use super::{ColumnInfo, FilterableQueryBuilder, ObjectColumnFilter, network_segment, vpc};
@@ -67,7 +69,8 @@ pub async fn persist(
     let query =
                 "INSERT INTO vpcs (id, name, organization_id, network_security_group_id, version, network_virtualization_type,
                 description,
-                labels, routing_profile_type, vni, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *";
+                labels, routing_profile_type, routing_profile_overrides, vni, status, power_resource_group)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *";
     sqlx::query_as(query)
         .bind(value.id)
         .bind(&value.metadata.name)
@@ -78,8 +81,10 @@ pub async fn persist(
         .bind(&value.metadata.description)
         .bind(sqlx::types::Json(&value.metadata.labels))
         .bind(value.routing_profile_type)
+        .bind(value.routing_profile_overrides.map(sqlx::types::Json))
         .bind(value.vni)
         .bind(sqlx::types::Json(&status))
+        .bind(value.power_resource_group)
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))
@@ -240,7 +245,7 @@ pub async fn find_by_name(txn: impl DbReader<'_>, name: &str) -> Result<Vec<Vpc>
 pub async fn find_by_segment(
     txn: impl DbReader<'_>,
     segment_id: NetworkSegmentId,
-) -> Result<Vpc, DatabaseError> {
+) -> Result<Option<Vpc>, DatabaseError> {
     let mut query = FilterableQueryBuilder::new(
         "SELECT v.* from vpcs v INNER JOIN network_segments s ON v.id = s.vpc_id",
     )
@@ -252,7 +257,7 @@ pub async fn find_by_segment(
 
     query
         .build_query_as()
-        .fetch_one(txn)
+        .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::query(query.sql(), e))
 }
@@ -272,7 +277,7 @@ pub async fn try_delete(txn: &mut PgConnection, id: VpcId) -> Result<Option<Vpc>
     let vpc_prefix_count_query = "SELECT count(*) FROM network_vpc_prefixes
         WHERE vpc_id=$1
         AND EXISTS (SELECT 1 FROM vpcs WHERE id=$1 AND deleted IS NULL)";
-    let (vpc_prefix_count,): (i64,) = sqlx::query_as(vpc_prefix_count_query)
+    let vpc_prefix_count: i64 = sqlx::query_scalar(vpc_prefix_count_query)
         .bind(id)
         .fetch_one(&mut *txn)
         .await
@@ -280,6 +285,21 @@ pub async fn try_delete(txn: &mut PgConnection, id: VpcId) -> Result<Option<Vpc>
     if vpc_prefix_count > 0 {
         return Err(DatabaseError::FailedPrecondition(format!(
             "VPC {id} cannot be deleted while {vpc_prefix_count} VPC prefixes still exist or are pending deletion"
+        )));
+    }
+
+    // No need to check "deleted IS NULL" because there are no "legacy" cases (this field was
+    // introduced at the same time as this check: deleted will not be set unless there are no
+    // instance_addresses in the first place.)
+    let instance_address_count_query = "SELECT count(*) FROM instance_addresses WHERE vpc_id=$1";
+    let instance_address_count: i64 = sqlx::query_scalar(instance_address_count_query)
+        .bind(id)
+        .fetch_one(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(instance_address_count_query, e))?;
+    if instance_address_count > 0 {
+        return Err(DatabaseError::FailedPrecondition(format!(
+            "VPC {id} cannot be deleted while {instance_address_count} instance addresses still reference it"
         )));
     }
 
@@ -309,18 +329,42 @@ pub async fn update(value: &UpdateVpc, txn: &mut PgConnection) -> DatabaseResult
     };
     let next_version = current_version.increment();
 
+    // An omitted override preserves the current definition. A present message
+    // replaces it so its unset properties inherit from the named base profile.
+    // An omitted power resource group operation preserves the current value.
+    // Set replaces it and clear stores NULL.
     // network_virtualization_type cannot be changed currently
     // TODO check number of changed rows
     let query = "UPDATE vpcs
-            SET name=$1, version=$2, description=$3, network_security_group_id=$4, labels=$5::json, updated=NOW()
-            WHERE id=$6 AND version=$7 AND deleted is null
+            SET name=$1, version=$2, description=$3, network_security_group_id=$4,
+                labels=$5::json,
+                routing_profile_overrides=COALESCE($6::jsonb, routing_profile_overrides),
+                power_resource_group=CASE WHEN $7 THEN $8 ELSE power_resource_group END,
+                updated=NOW()
+            WHERE id=$9 AND version=$10 AND deleted is null
             RETURNING *";
+    let (update_power_resource_group, power_resource_group) =
+        match value.power_resource_group.as_ref() {
+            Some(PowerResourceGroupUpdate::Set(resource_group)) => {
+                (true, Some(resource_group.as_str()))
+            }
+            Some(PowerResourceGroupUpdate::Clear) => (true, None),
+            None => (false, None),
+        };
     let query_result = sqlx::query_as(query)
         .bind(&value.metadata.name)
         .bind(next_version)
         .bind(&value.metadata.description)
         .bind(&value.network_security_group_id)
         .bind(sqlx::types::Json(&value.metadata.labels))
+        .bind(
+            value
+                .routing_profile_overrides
+                .as_ref()
+                .map(sqlx::types::Json),
+        )
+        .bind(update_power_resource_group)
+        .bind(power_resource_group)
         .bind(value.id)
         .bind(current_version)
         .fetch_one(txn)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun/extra/bundebug"
 
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
@@ -28,7 +29,7 @@ import (
 
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	cwutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 // testTemporalSiteClientPool Building site client pool
@@ -135,11 +136,11 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 	}
 
 	expectedMachinesToUpdate := []*cdbm.ExpectedMachine{}
-	pagedCtrlExpectedMachines := []*cwssaws.ExpectedMachine{}
+	pagedCtrlExpectedMachines := []*corev1.ExpectedMachine{}
 
 	for i := 0; i < 34; i++ {
-		ctrlExpectedMachine := &cwssaws.ExpectedMachine{
-			Id:                       &cwssaws.UUID{Value: pagedExpectedMachines[i].ID.String()},
+		ctrlExpectedMachine := &corev1.ExpectedMachine{
+			Id:                       &corev1.UUID{Value: pagedExpectedMachines[i].ID.String()},
 			BmcMacAddress:            pagedExpectedMachines[i].BmcMacAddress,
 			ChassisSerialNumber:      pagedExpectedMachines[i].ChassisSerialNumber,
 			SkuId:                    pagedExpectedMachines[i].SkuID,
@@ -148,8 +149,8 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 
 		// Add labels to controller expected machines
 		if i%5 == 0 {
-			ctrlExpectedMachine.Metadata = &cwssaws.Metadata{
-				Labels: []*cwssaws.Label{
+			ctrlExpectedMachine.Metadata = &corev1.Metadata{
+				Labels: []*corev1.Label{
 					{Key: "rack", Value: cutil.GetPtr(fmt.Sprintf("rack-%d", i/5))},
 					{Key: "position", Value: cutil.GetPtr(fmt.Sprintf("pos-%d", i))},
 				},
@@ -167,16 +168,16 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 		// Test label updates: add/modify labels for some machines
 		if i == 1 {
 			// Add labels to a machine that didn't have them before
-			ctrlExpectedMachine.Metadata = &cwssaws.Metadata{
-				Labels: []*cwssaws.Label{
+			ctrlExpectedMachine.Metadata = &corev1.Metadata{
+				Labels: []*corev1.Label{
 					{Key: "new-label", Value: cutil.GetPtr("new-value")},
 				},
 			}
 			expectedMachinesToUpdate = append(expectedMachinesToUpdate, pagedExpectedMachines[i])
 		} else if i == 5 {
 			// Modify existing labels
-			ctrlExpectedMachine.Metadata = &cwssaws.Metadata{
-				Labels: []*cwssaws.Label{
+			ctrlExpectedMachine.Metadata = &corev1.Metadata{
+				Labels: []*corev1.Label{
 					{Key: "rack", Value: cutil.GetPtr(fmt.Sprintf("rack-updated-%d", i/5))},
 					{Key: "position", Value: cutil.GetPtr(fmt.Sprintf("pos-%d", i))},
 					{Key: "status", Value: cutil.GetPtr("active")},
@@ -185,8 +186,8 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			expectedMachinesToUpdate = append(expectedMachinesToUpdate, pagedExpectedMachines[i])
 		} else if i == 10 {
 			// Remove labels (set to empty labels array)
-			ctrlExpectedMachine.Metadata = &cwssaws.Metadata{
-				Labels: []*cwssaws.Label{},
+			ctrlExpectedMachine.Metadata = &corev1.Metadata{
+				Labels: []*corev1.Label{},
 			}
 			expectedMachinesToUpdate = append(expectedMachinesToUpdate, pagedExpectedMachines[i])
 		} else if i == 15 {
@@ -215,7 +216,7 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 	type args struct {
 		ctx                      context.Context
 		siteID                   uuid.UUID
-		expectedMachineInventory *cwssaws.ExpectedMachineInventory
+		expectedMachineInventory *corev1.ExpectedMachineInventory
 	}
 
 	tests := []struct {
@@ -250,8 +251,8 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			args: args{
 				ctx:    ctx,
 				siteID: uuid.New(),
-				expectedMachineInventory: &cwssaws.ExpectedMachineInventory{
-					ExpectedMachines: []*cwssaws.ExpectedMachine{},
+				expectedMachineInventory: &corev1.ExpectedMachineInventory{
+					ExpectedMachines: []*corev1.ExpectedMachine{},
 				},
 			},
 			wantErr: true,
@@ -266,10 +267,10 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			args: args{
 				ctx:    ctx,
 				siteID: st.ID,
-				expectedMachineInventory: &cwssaws.ExpectedMachineInventory{
-					ExpectedMachines: []*cwssaws.ExpectedMachine{},
+				expectedMachineInventory: &corev1.ExpectedMachineInventory{
+					ExpectedMachines: []*corev1.ExpectedMachine{},
 					Timestamp:        timestamppb.Now(),
-					InventoryStatus:  cwssaws.InventoryStatus_INVENTORY_STATUS_FAILED,
+					InventoryStatus:  corev1.InventoryStatus_INVENTORY_STATUS_FAILED,
 				},
 			},
 			wantErr: false,
@@ -284,11 +285,11 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			args: args{
 				ctx:    ctx,
 				siteID: st2.ID,
-				expectedMachineInventory: &cwssaws.ExpectedMachineInventory{
-					ExpectedMachines: []*cwssaws.ExpectedMachine{},
+				expectedMachineInventory: &corev1.ExpectedMachineInventory{
+					ExpectedMachines: []*corev1.ExpectedMachine{},
 					Timestamp:        timestamppb.Now(),
-					InventoryStatus:  cwssaws.InventoryStatus_INVENTORY_STATUS_SUCCESS,
-					InventoryPage: &cwssaws.InventoryPage{
+					InventoryStatus:  corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+					InventoryPage: &corev1.InventoryPage{
 						CurrentPage: 1,
 						TotalPages:  0,
 						PageSize:    25,
@@ -308,11 +309,11 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			args: args{
 				ctx:    ctx,
 				siteID: st.ID,
-				expectedMachineInventory: &cwssaws.ExpectedMachineInventory{
+				expectedMachineInventory: &corev1.ExpectedMachineInventory{
 					ExpectedMachines: pagedCtrlExpectedMachines[0:20],
 					Timestamp:        timestamppb.Now(),
-					InventoryStatus:  cwssaws.InventoryStatus_INVENTORY_STATUS_SUCCESS,
-					InventoryPage: &cwssaws.InventoryPage{
+					InventoryStatus:  corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+					InventoryPage: &corev1.InventoryPage{
 						CurrentPage: 1,
 						TotalPages:  2,
 						PageSize:    20,
@@ -334,11 +335,11 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			args: args{
 				ctx:    ctx,
 				siteID: st.ID,
-				expectedMachineInventory: &cwssaws.ExpectedMachineInventory{
+				expectedMachineInventory: &corev1.ExpectedMachineInventory{
 					ExpectedMachines: pagedCtrlExpectedMachines[20:34],
 					Timestamp:        timestamppb.Now(),
-					InventoryStatus:  cwssaws.InventoryStatus_INVENTORY_STATUS_SUCCESS,
-					InventoryPage: &cwssaws.InventoryPage{
+					InventoryStatus:  corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+					InventoryPage: &corev1.InventoryPage{
 						CurrentPage: 2,
 						TotalPages:  2,
 						PageSize:    20,
@@ -360,15 +361,15 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			args: args{
 				ctx:    ctx,
 				siteID: st3.ID,
-				expectedMachineInventory: &cwssaws.ExpectedMachineInventory{
-					ExpectedMachines: []*cwssaws.ExpectedMachine{
+				expectedMachineInventory: &corev1.ExpectedMachineInventory{
+					ExpectedMachines: []*corev1.ExpectedMachine{
 						{
-							Id:                  &cwssaws.UUID{Value: uuid.New().String()},
+							Id:                  &corev1.UUID{Value: uuid.New().String()},
 							BmcMacAddress:       "00:11:22:33:44:FF",
 							ChassisSerialNumber: "SN-NEW-1",
 							SkuId:               nil,
-							Metadata: &cwssaws.Metadata{
-								Labels: []*cwssaws.Label{
+							Metadata: &corev1.Metadata{
+								Labels: []*corev1.Label{
 									{Key: "environment", Value: cutil.GetPtr("test")},
 									{Key: "datacenter", Value: cutil.GetPtr("dc1")},
 								},
@@ -376,7 +377,7 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 						},
 					},
 					Timestamp:       timestamppb.Now(),
-					InventoryStatus: cwssaws.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+					InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
 				},
 			},
 			expectedMachinesToUpdate: []*cdbm.ExpectedMachine{},
@@ -414,7 +415,7 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 				updated := machinesByID[em.ID]
 				assert.NotNil(t, updated, fmt.Sprintf("ExpectedMachine %v should exist", em.ID))
 				// Find the corresponding controller machine
-				var ctrlEM *cwssaws.ExpectedMachine
+				var ctrlEM *corev1.ExpectedMachine
 				for _, cem := range tt.args.expectedMachineInventory.ExpectedMachines {
 					if cem.Id.Value == em.ID.String() {
 						ctrlEM = cem
@@ -465,6 +466,139 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 	}
 }
 
+func TestManageExpectedMachine_UpdateExpectedMachinesInDB_BmcIpAddress(t *testing.T) {
+	ctx := context.Background()
+
+	dbSession := testExpectedMachineInitDB(t)
+	defer dbSession.Close()
+
+	testExpectedMachineSetupSchema(t, dbSession)
+
+	ipOrg := "test-provider-org"
+	ipRoles := []string{"FORGE_PROVIDER_ADMIN"}
+	ipu := cwu.TestBuildUser(t, dbSession, uuid.NewString(), []string{ipOrg}, ipRoles)
+	ip := cwu.TestBuildInfrastructureProvider(t, dbSession, "test-provider", ipOrg, ipu)
+	st := cwu.TestBuildSite(t, dbSession, ip, "test-site-bmc-ip", cdbm.SiteStatusRegistered, nil, ipu)
+
+	type existingMachineCase struct {
+		name          string
+		initialBmcIP  *string
+		reportedBmcIP *string
+	}
+
+	tests := []existingMachineCase{
+		{
+			name:          "set previously unset BMC IP address",
+			initialBmcIP:  nil,
+			reportedBmcIP: cutil.GetPtr("192.0.2.10"),
+		},
+		{
+			name:          "change existing BMC IP address",
+			initialBmcIP:  cutil.GetPtr("192.0.2.20"),
+			reportedBmcIP: cutil.GetPtr("192.0.2.21"),
+		},
+		{
+			name:          "clear existing BMC IP address",
+			initialBmcIP:  cutil.GetPtr("192.0.2.30"),
+			reportedBmcIP: nil,
+		},
+	}
+
+	emDAO := cdbm.NewExpectedMachineDAO(dbSession)
+	existingIDs := make([]uuid.UUID, len(tests))
+	reportedMachines := make([]*corev1.ExpectedMachine, 0, len(tests)+1)
+	preservedName := "preserve-this-name"
+	for i, tt := range tests {
+		emID := uuid.New()
+		existingIDs[i] = emID
+		bmcMAC := fmt.Sprintf("00:11:22:33:66:%02d", i)
+		chassisSerialNumber := fmt.Sprintf("BMC-IP-SN-%d", i)
+		_, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+			ExpectedMachineID:   emID,
+			SiteID:              st.ID,
+			BmcMacAddress:       bmcMAC,
+			ChassisSerialNumber: chassisSerialNumber,
+			BmcIpAddress:        tt.initialBmcIP,
+			Name:                &preservedName,
+			CreatedBy:           ipu.ID,
+		})
+		require.NoError(t, err)
+
+		reportedMachines = append(reportedMachines, &corev1.ExpectedMachine{
+			Id:                  &corev1.UUID{Value: emID.String()},
+			BmcMacAddress:       bmcMAC,
+			ChassisSerialNumber: chassisSerialNumber,
+			BmcIpAddress:        tt.reportedBmcIP,
+		})
+	}
+
+	createdID := uuid.New()
+	createdBmcIP := "192.0.2.40"
+	reportedMachines = append(reportedMachines, &corev1.ExpectedMachine{
+		Id:                  &corev1.UUID{Value: createdID.String()},
+		BmcMacAddress:       "00:11:22:33:66:03",
+		ChassisSerialNumber: "BMC-IP-SN-3",
+		BmcIpAddress:        &createdBmcIP,
+	})
+
+	mei := ManageExpectedMachine{dbSession: dbSession}
+	err := mei.UpdateExpectedMachinesInDB(ctx, st.ID, &corev1.ExpectedMachineInventory{
+		ExpectedMachines: reportedMachines,
+		Timestamp:        timestamppb.Now(),
+		InventoryStatus:  corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+	})
+	require.NoError(t, err)
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			updated, err := emDAO.Get(ctx, nil, existingIDs[i], nil, false)
+			require.NoError(t, err)
+			assert.Equal(t, tt.reportedBmcIP, updated.BmcIpAddress)
+			assert.Equal(t, &preservedName, updated.Name, "reconciling the BMC IP must preserve unrelated fields")
+		})
+	}
+
+	created, err := emDAO.Get(ctx, nil, createdID, nil, false)
+	require.NoError(t, err)
+	assert.Equal(t, &createdBmcIP, created.BmcIpAddress)
+
+	t.Run("rolls back a clear when the accompanying update fails", func(t *testing.T) {
+		emID := uuid.New()
+		originalBmcIP := "192.0.2.50"
+		_, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+			ExpectedMachineID:   emID,
+			SiteID:              st.ID,
+			BmcMacAddress:       "00:11:22:33:66:04",
+			ChassisSerialNumber: "BMC-IP-SN-4",
+			BmcIpAddress:        &originalBmcIP,
+			Name:                &preservedName,
+			CreatedBy:           ipu.ID,
+		})
+		require.NoError(t, err)
+
+		nonexistentSkuID := "nonexistent-sku"
+		err = mei.UpdateExpectedMachinesInDB(ctx, st.ID, &corev1.ExpectedMachineInventory{
+			ExpectedMachines: []*corev1.ExpectedMachine{
+				{
+					Id:                  &corev1.UUID{Value: emID.String()},
+					BmcMacAddress:       "00:11:22:33:66:04",
+					ChassisSerialNumber: "BMC-IP-SN-4",
+					BmcIpAddress:        nil,
+					SkuId:               &nonexistentSkuID,
+				},
+			},
+			Timestamp:       timestamppb.Now(),
+			InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+		})
+		require.NoError(t, err, "per-record reconciliation errors remain best effort")
+
+		unchanged, err := emDAO.Get(ctx, nil, emID, nil, false)
+		require.NoError(t, err)
+		assert.Equal(t, &originalBmcIP, unchanged.BmcIpAddress)
+		assert.Equal(t, &preservedName, unchanged.Name)
+	})
+}
+
 func TestManageExpectedMachine_UpdateExpectedMachinesInDB_RaceCondition(t *testing.T) {
 	ctx := context.Background()
 
@@ -499,10 +633,10 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB_RaceCondition(t *testi
 	}
 
 	// Send inventory without this machine - it should NOT be deleted due to race condition
-	inventory := &cwssaws.ExpectedMachineInventory{
-		ExpectedMachines: []*cwssaws.ExpectedMachine{},
+	inventory := &corev1.ExpectedMachineInventory{
+		ExpectedMachines: []*corev1.ExpectedMachine{},
 		Timestamp:        timestamppb.Now(),
-		InventoryStatus:  cwssaws.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+		InventoryStatus:  corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
 	}
 
 	err = mei.UpdateExpectedMachinesInDB(ctx, st.ID, inventory)

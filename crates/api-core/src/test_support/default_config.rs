@@ -22,6 +22,7 @@ use std::default::Default;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use carbide_host_support::bootstrap_ca::BootstrapCaSource;
 use carbide_ib_fabric::config::IbFabricDefinition;
 use carbide_machine_controller::config::{
     BomValidationConfig, FirmwareGlobal, MachineStateControllerConfig, MachineValidationConfig,
@@ -38,21 +39,122 @@ use model::resource_pool::{self};
 use regex::Regex;
 
 use crate::cfg::file::{
-    CarbideConfig, DpaConfig, DpaInterfaceStateControllerConfig, DpuConfig as InitialDpuConfig,
-    IbPartitionStateControllerConfig, ListenMode, MachineUpdater,
+    AuthConfig, CarbideConfig, DpaConfig, DpaInterfaceStateControllerConfig,
+    DpuConfig as InitialDpuConfig, DsxExchangeEventBusConfig, FnnConfig,
+    IbPartitionStateControllerConfig, KmsConfig, ListenMode, MachineUpdater,
     MeasuredBootMetricsCollectorConfig, MqttAuthConfig, NetworkSecurityGroupConfig,
-    NetworkSegmentStateControllerConfig, PowerShelfStateControllerConfig,
-    RackStateControllerConfig, SpdmConfig, SpdmStateControllerConfig, SwitchStateControllerConfig,
-    TracingConfig, VmaasConfig, VpcPeeringPolicy, VpcPrefixStateControllerConfig,
-    default_bmc_session_lockout_threshold, default_max_find_by_ids,
+    NetworkSegmentStateControllerConfig, NodeAuthConfig, PowerShelfStateControllerConfig,
+    RackStateControllerConfig, SecretsConfig, SpdmConfig, SpdmStateControllerConfig,
+    SwitchStateControllerConfig, TracingConfig, VmaasConfig, VpcPeeringPolicy,
+    VpcPrefixStateControllerConfig, default_bmc_session_lockout_threshold,
+    default_database_pool_acquire_timeout, default_database_pool_idle_timeout,
+    default_database_pool_max_lifetime, default_max_find_by_ids,
+    default_max_site_prefixes_per_tenant, default_pxe_public_base_url,
 };
+#[cfg(test)]
+use crate::cfg::file::{
+    DpfInterfaceIdentity, HostInterceptBridging, HostRepresentorBridgingConfig,
+};
+
+/// Returns the default configuration with one selected PF and the requested sparse DPF VFs.
+#[cfg(test)]
+pub(crate) fn with_dpf_intercept_topology(selected_vfs: &[u8]) -> CarbideConfig {
+    let mut config = get();
+    config.dpf.enabled = true;
+
+    let mut interfaces = HashMap::from([(
+        "selected-pf".to_string(),
+        HostInterceptBridging {
+            bridge: "br-pf".to_string(),
+            patch_port: "p-pf".to_string(),
+            skip_create: false,
+            dpf_interface: Some(DpfInterfaceIdentity {
+                controller_id: 1,
+                pf_id: 0,
+                vf_id: None,
+            }),
+        },
+    )]);
+    interfaces.extend(selected_vfs.iter().map(|vf_id| {
+        (
+            format!("selected-vf{vf_id}"),
+            HostInterceptBridging {
+                bridge: format!("br-vf{vf_id}"),
+                patch_port: format!("p-vf{vf_id}"),
+                skip_create: false,
+                dpf_interface: Some(DpfInterfaceIdentity {
+                    controller_id: 1,
+                    pf_id: 0,
+                    vf_id: Some(*vf_id),
+                }),
+            },
+        )
+    }));
+    config.vmaas_config = Some(VmaasConfig {
+        allow_instance_vf: true,
+        hbn_reps: None,
+        bridging: Some(HostRepresentorBridgingConfig {
+            hbn_bridge: "br-hbn".to_string(),
+            host_representor_intercept_bridging: interfaces,
+        }),
+    });
+    config
+}
+
+/// [`get`] with every `Option` config section populated. Used by tests that
+/// walk the *serialized* config shape — e.g. the admin-UI documentation
+/// guards, which can only verify sections and fields that actually serialize.
+/// When a new `Option` section is added to [`CarbideConfig`] (the compiler
+/// forces it into [`get`]), populate it here too. The
+/// `fmds_use_node_tokens` inner `Option` below is populated so its documented
+/// row is covered. New `skip_serializing_if` fields need the same explicit
+/// treatment when they should be checked; this is not compiler-enforced.
+/// `mlxconfig_profiles` is intentionally exempted by `SKIP_SERIALIZING` in
+/// `crates/api-web/src/configuration.rs`.
+pub fn fully_populated() -> CarbideConfig {
+    CarbideConfig {
+        auth: Some(AuthConfig {
+            permissive_mode: true,
+            casbin_policy_file: None,
+            cli_certs: None,
+            trust: None,
+        }),
+        ib_config: Some(carbide_ib_fabric::config::IBFabricConfig::default()),
+        fnn: Some(FnnConfig {
+            admin_vpc: None,
+            common_internal_route_target: None,
+            additional_route_target_imports: vec![],
+            routing_profiles: HashMap::new(),
+            use_vpc_vrf_loopback: false,
+        }),
+        dsx_exchange_event_bus: Some(DsxExchangeEventBusConfig::default()),
+        secrets: Some(SecretsConfig {
+            kms: KmsConfig {
+                active: "local".to_string(),
+                providers: HashMap::new(),
+            },
+            routing: HashMap::from([("/".to_string(), "kek".to_string())]),
+            backends: vec![],
+            writer: Default::default(),
+            import_from: None,
+            import_approach: Default::default(),
+        }),
+        node_auth: NodeAuthConfig {
+            fmds_use_node_tokens: Some(false),
+            ..Default::default()
+        },
+        ..get()
+    }
+}
 
 pub fn get() -> CarbideConfig {
     CarbideConfig {
         default_tenant_routing_profile_type: "EXTERNAL".to_string(),
         enable_admin_ui: true,
         web_ui_sidebar_tools: vec![],
+        web_ui_logs_link_template: String::new(),
         log_history: Default::default(),
+        node_auth: Default::default(),
         observability: Default::default(),
         bgp_leaf_session_password: None,
         rack_validation_config: RackValidationConfig {
@@ -65,6 +167,11 @@ pub fn get() -> CarbideConfig {
         alt_metric_prefix: None,
         database_url: "pgsql:://localhost".to_string(),
         max_database_connections: 1000,
+        deny_unknown_fields: false,
+        database_pool_acquire_timeout: default_database_pool_acquire_timeout(),
+        database_pool_idle_timeout: default_database_pool_idle_timeout(),
+        database_pool_max_lifetime: default_database_pool_max_lifetime(),
+        api_admission_control: Default::default(),
         compute_allocation_enforcement: Default::default(),
         asn: 0,
         datacenter_asn: 0,
@@ -73,6 +180,7 @@ pub fn get() -> CarbideConfig {
         enable_route_servers: false,
         deny_prefixes: vec![],
         site_fabric_prefixes: vec![],
+        max_site_prefixes_per_tenant: default_max_site_prefixes_per_tenant(),
         anycast_site_prefixes: vec![],
         common_tenant_host_asn: None,
         vpc_isolation_behavior: <_ as Default>::default(),
@@ -91,6 +199,7 @@ pub fn get() -> CarbideConfig {
         dpu_ipmi_reboot_attempts: Some(0),
         bmc_session_lockout_threshold: default_bmc_session_lockout_threshold(),
         allow_bmc_basic_auth_fallback: false,
+        allow_insecure_discovery: true,
         initial_domain_name: Some("test.com".to_string()),
         sitename: Some("testsite".to_string()),
         initial_dpu_agent_upgrade_policy: None,
@@ -103,12 +212,15 @@ pub fn get() -> CarbideConfig {
             concurrent_explorations: 0,
             explorations_per_run: 0,
             create_machines: Arc::new(false.into()),
-            allocate_secondary_vtep_ip: true,
             ..Default::default()
         },
+        deprecated_force_dpu_nic_mode: None,
         vpc_peering_policy: Some(VpcPeeringPolicy::Exclusive),
         vpc_peering_policy_on_existing: None,
         attestation_enabled: false,
+        bmc_rotation_enabled: false,
+        uefi_rotation_enabled: false,
+        bmc_factory_reset_on_instance_termination_enabled: false,
         tpm_required: true,
         ib_config: None,
         ib_fabrics: [(
@@ -141,21 +253,26 @@ pub fn get() -> CarbideConfig {
             controller: StateControllerConfig::default(),
         },
         power_shelf_state_controller: PowerShelfStateControllerConfig {
+            rack_firmware_reprovisioning_enabled: false,
             controller: StateControllerConfig::default(),
         },
         rack_state_controller: RackStateControllerConfig {
             controller: StateControllerConfig::default(),
+            nmx_cluster_switch_mtls_services: vec![],
         },
         switch_state_controller: SwitchStateControllerConfig {
             controller: StateControllerConfig::default(),
+            switch_mtls_services: vec![],
         },
         dpu_config: InitialDpuConfig {
+            bootstrap_ca_source: BootstrapCaSource::LegacyDownload,
             dpu_nic_firmware_initial_update_enabled: true,
             dpu_nic_firmware_reprovision_update_enabled: true,
             dpu_models: dpu_fw_example(),
             dpu_nic_firmware_update_versions: vec!["24.42.1000".to_string()],
             dpu_enable_secure_boot: true,
             num_of_vfs: crate::cfg::file::DEFAULT_DPU_NUM_OF_VFS,
+            restart_ovs_on_use_admin_network_change: false,
         },
         host_models: host_firmware_example(),
         firmware_global: FirmwareGlobal::test_default(),
@@ -205,11 +322,7 @@ pub fn get() -> CarbideConfig {
         vmaas_config: Some(VmaasConfig {
             allow_instance_vf: true,
             hbn_reps: None,
-            hbn_sfs: None,
-            secondary_overlay_support: true,
             bridging: None,
-            public_prefixes: vec![],
-            secondary_vtep_aggregate_prefixes: vec![],
         }),
         mlxconfig_profiles: None,
         rack_management_enabled: false,
@@ -231,6 +344,7 @@ pub fn get() -> CarbideConfig {
         dpf: crate::cfg::file::DpfConfig::default(),
         x86_pxe_boot_url_override: None,
         arm_pxe_boot_url_override: None,
+        pxe_public_base_url: default_pxe_public_base_url(),
         set_http_boot_uri_for_vendors: vec![],
         external_api_url: None,
         external_pxe_url: None,
@@ -241,6 +355,9 @@ pub fn get() -> CarbideConfig {
         config_ctx: None,
         tracing: TracingConfig::default(),
         ntp_servers: vec![],
+        secrets: None,
+        dhcp_lease_expiry_handling: false,
+        certificates: Default::default(),
     }
 }
 

@@ -15,21 +15,43 @@
  * limitations under the License.
  */
 
-use std::net::SocketAddr;
-
 use ::rpc::forge as rpc;
-use carbide_redfish::boot_interface::BootInterfaceTarget;
 use carbide_uuid::machine::{MachineId, MachineInterfaceId};
-use model::machine::LoadSnapshotOptions;
+use model::machine::ManagedHostState;
 use model::machine::machine_search_config::MachineSearchConfig;
-use model::machine_boot_interface::MachineBootInterface;
+use model::machine_boot_interface::{
+    MachineBootInterface, MachineBootInterfaceTarget, canonical_redfish_boot_interface_id,
+};
 use model::network_segment::NetworkSegmentType;
 use tonic::{Request, Response, Status};
 
 use crate::CarbideError;
 use crate::api::{Api, log_machine_id, log_request_data};
 use crate::auth::AuthContext;
-use crate::handlers::utils::convert_and_log_machine_id;
+use crate::handlers::utils::{convert_and_log_machine_id, enqueue_boot_interface_reconciliation};
+
+fn boot_target_for_interface(
+    mac_address: mac_address::MacAddress,
+    interface_id: Option<String>,
+) -> MachineBootInterfaceTarget {
+    match interface_id
+        .as_deref()
+        .and_then(canonical_redfish_boot_interface_id)
+    {
+        Some(interface_id) => MachineBootInterfaceTarget::Pair(MachineBootInterface {
+            mac_address,
+            interface_id: interface_id.to_string(),
+        }),
+        None => MachineBootInterfaceTarget::MacOnly(mac_address),
+    }
+}
+
+/// Identifies the row directly or through the DPU attached to it.
+#[derive(Clone, Copy)]
+enum PrimaryInterfaceSelector {
+    Interface(MachineInterfaceId),
+    Dpu(MachineId),
+}
 
 pub(crate) async fn set_primary_dpu(
     api: &Api,
@@ -40,57 +62,21 @@ pub(crate) async fn set_primary_dpu(
     let request = request.into_inner();
     let host_machine_id = request
         .host_machine_id
-        .ok_or_else(|| CarbideError::InvalidArgument("Host Machine ID is required".to_string()))?;
+        .ok_or_else(|| CarbideError::InvalidArgument("host machine ID is required".to_string()))?;
     let dpu_machine_id = request
         .dpu_machine_id
-        .ok_or_else(|| CarbideError::InvalidArgument("DPU Machine ID is required".to_string()))?;
+        .ok_or_else(|| CarbideError::InvalidArgument("DPU machine ID is required".to_string()))?;
+    // `reboot` is only a compatibility alias for `force_reconcile`.
+    #[allow(deprecated)]
+    let force_reconcile = request.force_reconcile || request.reboot;
 
     log_machine_id(&host_machine_id);
-
-    // `set-primary-dpu` is the DPU-only alias for `set-primary-interface`: it
-    // keeps the zero-DPU guard and resolves the DPU to its host interface, then
-    // defers to the generic core that does the actual work.
-    let mut txn = api.txn_begin().await?;
-
-    // Reject early on a zero-DPU host to provide a better error, otherwise we'd
-    // fail later looking for the DPU's interface, which is more confusing.
-    let snapshot =
-        db::managed_host::load_snapshot(&mut txn, &host_machine_id, LoadSnapshotOptions::default())
-            .await?
-            .ok_or_else(|| CarbideError::NotFoundError {
-                kind: "Machine",
-                id: host_machine_id.to_string(),
-            })?;
-    if !snapshot.has_managed_dpus() {
-        return Err(CarbideError::FailedPrecondition(format!(
-            "Host {host_machine_id} has no DPUs; set-primary-dpu does not apply to zero-DPU hosts."
-        ))
-        .into());
-    }
-
-    let interface_map =
-        db::machine_interface::find_by_machine_ids(&mut txn, &[host_machine_id]).await?;
-    let new_primary_interface_id = interface_map
-        .get(&host_machine_id)
-        .ok_or_else(|| CarbideError::NotFoundError {
-            kind: "Machine",
-            id: host_machine_id.to_string(),
-        })?
-        .iter()
-        .find(|interface| interface.attached_dpu_machine_id == Some(dpu_machine_id))
-        .map(|interface| interface.id)
-        .ok_or_else(|| {
-            CarbideError::InvalidArgument(format!(
-                "DPU {dpu_machine_id} has no interface on host {host_machine_id}"
-            ))
-        })?;
-    txn.rollback().await?;
 
     set_primary_interface_core(
         api,
         host_machine_id,
-        new_primary_interface_id,
-        request.reboot,
+        PrimaryInterfaceSelector::Dpu(dpu_machine_id),
+        force_reconcile,
     )
     .await
 }
@@ -107,88 +93,114 @@ pub(crate) async fn set_primary_interface(
     let request = request.into_inner();
     let host_machine_id = request
         .host_machine_id
-        .ok_or_else(|| CarbideError::InvalidArgument("Host Machine ID is required".to_string()))?;
+        .ok_or_else(|| CarbideError::InvalidArgument("host machine ID is required".to_string()))?;
     let interface_id = request
         .interface_id
-        .ok_or_else(|| CarbideError::InvalidArgument("Interface ID is required".to_string()))?;
+        .ok_or_else(|| CarbideError::InvalidArgument("interface ID is required".to_string()))?;
+    // `reboot` is only a compatibility alias for `force_reconcile`.
+    #[allow(deprecated)]
+    let force_reconcile = request.force_reconcile || request.reboot;
 
     log_machine_id(&host_machine_id);
 
-    set_primary_interface_core(api, host_machine_id, interface_id, request.reboot).await
+    set_primary_interface_core(
+        api,
+        host_machine_id,
+        PrimaryInterfaceSelector::Interface(interface_id),
+        force_reconcile,
+    )
+    .await
 }
 
-// Move the primary (boot) interface flag to `new_primary_interface_id` and point
-// the host's boot device at it. Shared by `set_primary_dpu` and
-// `set_primary_interface`.
-//
-// Originally a work-around for FORGE-7085: a host BMC can report the primary DPU
-// as something other than the lowest-slot DPU, and because the host names
-// interfaces by PCI address the behavior differs between identical machines.
-//
-// Broken into the following parts:
-// 1. collect interface and bmc information
-// 2. set the boot device
-// 3. update the primary interface and network config versions.
-// 4. reboot the host if requested.
-//
-// No transaction should be held during 2 or 4 since they are requests to the host bmc.
+/// Moves the database primary to the selected interface and records that exact
+/// row as the host's desired boot target.
+///
+/// The transaction locks admin segments, host interfaces, and then the host
+/// machine in the same order as Site Explorer. Once it commits, the machine
+/// controller owns the Redfish write and any reboot needed to converge it.
 async fn set_primary_interface_core(
     api: &Api,
     host_machine_id: MachineId,
-    new_primary_interface_id: MachineInterfaceId,
-    reboot: bool,
+    selector: PrimaryInterfaceSelector,
+    force_reconcile: bool,
 ) -> Result<Response<()>, Status> {
-    // `host_machine_id` must be a host machine. Reject DPU (or other non-host) ids
-    // up front -- before any DB load or BMC side effect -- so callers get a clear
-    // InvalidArgument instead of a confusing failure deeper in interface/BMC lookup.
-    // `set_primary_dpu` resolves its DPU to the host's interface and also passes a
-    // host id here, so this guards both entry points.
     if !host_machine_id.machine_type().is_host() {
         return Err(CarbideError::InvalidArgument(format!(
-            "Machine {host_machine_id} is not a host machine; set-primary-interface can \
+            "machine {host_machine_id} is not a host machine; set-primary-interface can \
              only promote an interface on a host"
         ))
         .into());
     }
 
+    // Admission permit BEFORE the transaction: waiters on the admin-segment
+    // advisory lock must queue in memory, not on open pool connections.
+    let _admin_admission = db::machine_interface::admin_lock_admission().await;
     let mut txn = api.txn_begin().await?;
 
-    let interface_map =
-        db::machine_interface::find_by_machine_ids(&mut txn, &[host_machine_id]).await?;
+    // Site Explorer takes these locks before it changes interface ownership.
+    // Matching that order keeps an operator write from deadlocking discovery.
+    db::machine_interface::lock_all_admin_segments(&mut txn).await?;
     let interface_snapshots =
-        interface_map
-            .get(&host_machine_id)
-            .ok_or_else(|| CarbideError::NotFoundError {
-                kind: "Machine",
-                id: host_machine_id.to_string(),
-            })?;
+        db::machine_interface::find_by_machine_id_for_update(&mut txn, &host_machine_id).await?;
+    let machine = db::machine::find_one(
+        &mut txn,
+        &host_machine_id,
+        MachineSearchConfig {
+            for_update: true,
+            ..Default::default()
+        },
+    )
+    .await?
+    .ok_or_else(|| CarbideError::NotFoundError {
+        kind: "Machine",
+        id: host_machine_id.to_string(),
+    })?;
 
-    // Find the current primary and the requested new primary before the db
-    // update, since the "only one primary" constraint will fail if the new
-    // interface is set before the old one is cleared.
-    let mut current_primary_interface = None;
-    let mut new_primary_interface = None;
-    for interface_snapshot in interface_snapshots {
-        if interface_snapshot.id == new_primary_interface_id {
-            new_primary_interface = Some(interface_snapshot);
-        } else if interface_snapshot.primary_interface {
-            current_primary_interface = Some(interface_snapshot);
+    let new_primary_interface_id = match selector {
+        PrimaryInterfaceSelector::Interface(interface_id) => interface_id,
+        PrimaryInterfaceSelector::Dpu(dpu_machine_id) => {
+            if !interface_snapshots.iter().any(|interface| {
+                interface
+                    .attached_dpu_machine_id
+                    .is_some_and(|machine_id| machine_id.machine_type().is_dpu())
+            }) {
+                return Err(CarbideError::FailedPrecondition(format!(
+                    "host {host_machine_id} has no DPUs; set-primary-dpu does not apply to zero-DPU hosts"
+                ))
+                .into());
+            }
+
+            interface_snapshots
+                .iter()
+                .find(|interface| interface.attached_dpu_machine_id == Some(dpu_machine_id))
+                .map(|interface| interface.id)
+                .ok_or_else(|| {
+                    CarbideError::InvalidArgument(format!(
+                        "DPU {dpu_machine_id} has no interface on host {host_machine_id}"
+                    ))
+                })?
         }
-    }
+    };
+
+    let current_primary_interface = interface_snapshots
+        .iter()
+        .find(|interface| interface.primary_interface);
     let current_primary_interface_id = current_primary_interface.map(|interface| interface.id);
-    // Whether the host currently has an Admin-segment primary. Drives whether the
-    // pre-move admin reconciliation below is needed (see its comment).
     let current_primary_is_admin = current_primary_interface
         .is_some_and(|interface| interface.network_segment_type == Some(NetworkSegmentType::Admin));
 
-    let new_primary_interface = new_primary_interface.ok_or_else(|| {
-        CarbideError::InvalidArgument(format!(
-            "Interface {new_primary_interface_id} not found on host {host_machine_id}"
-        ))
-    })?;
-    if new_primary_interface.primary_interface {
+    let new_primary_interface = interface_snapshots
+        .iter()
+        .find(|interface| interface.id == new_primary_interface_id)
+        .ok_or_else(|| {
+            CarbideError::InvalidArgument(format!(
+                "interface {new_primary_interface_id} not found on host {host_machine_id}"
+            ))
+        })?;
+    let primary_is_unchanged = new_primary_interface.primary_interface;
+    if primary_is_unchanged && !force_reconcile {
         return Err(CarbideError::InvalidArgument(
-            "Requested interface is already primary".to_string(),
+            "requested interface is already primary".to_string(),
         )
         .into());
     }
@@ -203,141 +215,90 @@ async fn set_primary_interface_core(
     let host_has_dpu_backed_admin_interface = interface_snapshots.iter().any(|interface| {
         interface
             .attached_dpu_machine_id
-            .is_some_and(|dpu| dpu != host_machine_id)
+            .is_some_and(|machine_id| machine_id.machine_type().is_dpu())
             && interface.network_segment_type == Some(NetworkSegmentType::Admin)
     });
     if host_has_dpu_backed_admin_interface
         && new_primary_interface.network_segment_type != Some(NetworkSegmentType::Admin)
     {
         return Err(CarbideError::InvalidArgument(format!(
-            "Interface {new_primary_interface_id} is not on the Admin segment; a \
-             DPU-managed host's primary interface must be an Admin interface"
+            "interface {new_primary_interface_id} is not on the admin segment; a \
+             DPU-managed host's primary interface must be an admin interface"
         ))
         .into());
     }
 
     let primary_interface_mac_address = new_primary_interface.mac_address;
     let boot_interface_id = new_primary_interface.boot_interface_id.clone();
+    let boot_target = boot_target_for_interface(primary_interface_mac_address, boot_interface_id);
+    let instance = db::instance::find_by_machine_id(&mut txn, &host_machine_id).await?;
+    let should_enqueue =
+        matches!(machine.current_state(), ManagedHostState::Ready) && instance.is_none();
 
-    tracing::info!(
-        host = %host_machine_id,
-        new_primary = %new_primary_interface_id,
-        previous_primary = ?current_primary_interface_id,
-        "moving the host's primary (boot) interface",
-    );
+    if !primary_is_unchanged {
+        tracing::info!(
+            machine_id = %host_machine_id,
+            new_primary_interface_id = %new_primary_interface_id,
+            previous_primary_interface_id = ?current_primary_interface_id,
+            "Moving host primary interface",
+        );
 
-    // we need to set the boot device or the host will no longer be able to boot.  we need BMC info.
-    // the same BMC info is used if a reboot was requested.
-    let machine = db::machine::find_one(&mut txn, &host_machine_id, MachineSearchConfig::default())
-        .await?
-        .ok_or_else(|| CarbideError::NotFoundError {
-            kind: "Machine",
-            id: host_machine_id.to_string(),
-        })?;
+        // Preserve the active admin address before moving the primary flag. A
+        // host with no current admin primary skips this pass so the write can
+        // repair that broken state in the post-move reconciliation below.
+        if current_primary_is_admin {
+            db::machine_interface::reconcile_admin_addresses_for_host(&mut txn, &host_machine_id)
+                .await?;
+        }
 
-    let bmc_addr = machine
-        .bmc_info
-        .ip
-        .ok_or_else(|| CarbideError::NotFoundError {
-            kind: "BMC IP",
-            id: host_machine_id.to_string(),
-        })?;
-
-    let bmc_socket_addr = SocketAddr::new(bmc_addr, 443);
-
-    let bmc_interface = db::machine_interface::find_by_ip(&mut txn, bmc_addr)
-        .await?
-        .ok_or_else(|| CarbideError::NotFoundError {
-            kind: "BMC Interface",
-            id: bmc_addr.to_string(),
-        })?;
-
-    txn.rollback().await?;
-
-    // Set the boot device. The new primary interface row already stores its
-    // Redfish interface id, so send the complete (MAC + id) pair when present,
-    // allowing for interface ID fallback (and target the MAC alone otherwise).
-    let boot_target = match boot_interface_id {
-        Some(interface_id) => BootInterfaceTarget::Pair(MachineBootInterface {
-            mac_address: primary_interface_mac_address,
-            interface_id,
-        }),
-        None => BootInterfaceTarget::MacOnly(primary_interface_mac_address),
-    };
-    api.endpoint_explorer
-        .set_boot_order_dpu_first(bmc_socket_addr, &bmc_interface, &boot_target)
-        .await
-        .map_err(|e| CarbideError::internal(e.to_string()))?;
-
-    let mut txn = api.txn_begin().await?;
-
-    // Normalize the current admin primary's address before moving the flag, so the
-    // active DHCP address is one reconciliation can move onto the new primary --
-    // but only when there IS a current admin primary to preserve. If the host has
-    // no admin primary (e.g. a DPU-backed host whose primary was cleared or sits
-    // off the Admin segment -- an off-happy-path state), this pre-move pass would
-    // error on that broken state *after* the BMC boot order was already changed,
-    // leaving the BMC and database disagreeing. Skipping it lets set_primary_interface
-    // repair such a host; the post-move pass below sets the new primary's admin
-    // ownership from scratch.
-    if current_primary_is_admin {
+        if let Some(current_primary_interface_id) = current_primary_interface_id {
+            db::machine_interface::set_primary_interface(
+                &current_primary_interface_id,
+                false,
+                &mut txn,
+            )
+            .await?;
+        }
+        db::machine_interface::set_primary_interface(&new_primary_interface_id, true, &mut txn)
+            .await?;
         db::machine_interface::reconcile_admin_addresses_for_host(&mut txn, &host_machine_id)
             .await?;
-    }
 
-    // update the primary interface: clear the old primary (if any), then set the new.
-    if let Some(current_primary_interface_id) = current_primary_interface_id {
-        db::machine_interface::set_primary_interface(
-            &current_primary_interface_id,
-            false,
+        let (network_config, network_config_version) =
+            db::machine::get_network_config(txn.as_pgconn(), &host_machine_id)
+                .await?
+                .take();
+        db::machine::try_update_network_config(
             &mut txn,
+            &host_machine_id,
+            network_config_version,
+            &network_config,
         )
         .await?;
+
+        if let Some(instance) = &instance {
+            db::instance::update_network_config(
+                &mut txn,
+                instance.id,
+                instance.network_config_version,
+                &instance.config.network,
+                true,
+            )
+            .await?;
+        }
     }
-    db::machine_interface::set_primary_interface(&new_primary_interface_id, true, &mut txn).await?;
 
-    // Reconcile admin address ownership after the primary flag moves.
-    db::machine_interface::reconcile_admin_addresses_for_host(&mut txn, &host_machine_id).await?;
-
-    let (network_config, network_config_version) =
-        db::machine::get_network_config(txn.as_pgconn(), &host_machine_id)
-            .await?
-            .take();
-    db::machine::try_update_network_config(
-        &mut txn,
-        &host_machine_id,
-        network_config_version,
-        &network_config,
-    )
-    .await?;
-
-    // if there is an instance, update the instances network config version so the DPUs pick up the new config
-    if let Some(instance) = db::instance::find_by_machine_id(&mut txn, &host_machine_id).await? {
-        db::instance::update_network_config(
-            &mut txn,
-            instance.id,
-            instance.network_config_version,
-            &instance.config.network,
-            true,
-        )
-        .await?;
+    if force_reconcile {
+        db::machine_desired_boot_interface::force_set(&mut txn, &host_machine_id, &boot_target)
+            .await?;
+    } else {
+        db::machine_desired_boot_interface::set(&mut txn, &host_machine_id, &boot_target).await?;
     }
 
     txn.commit().await?;
 
-    // optionally reboot the host.  if there is an instance, this is probably a required step,
-    // but an operator will need to make that call.  The scout image handles this pretty well,
-    // albeit with a leftover IP on the unused interface
-    if reboot {
-        api.endpoint_explorer
-            .redfish_power_control(
-                bmc_socket_addr,
-                &bmc_interface,
-                libredfish::SystemPowerControl::ForceRestart,
-            )
-            .await
-            .map_err(|e| CarbideError::internal(e.to_string()))?;
-    }
+    enqueue_boot_interface_reconciliation(api, host_machine_id, should_enqueue).await;
+
     Ok(Response::new(()))
 }
 
@@ -366,7 +327,7 @@ pub(crate) async fn set_maintenance(
         .await?;
     if host_machine.is_dpu() {
         return Err(CarbideError::InvalidArgument(
-            "DPU ID provided. Need managed host.".to_string(),
+            "DPU ID provided. need managed host".to_string(),
         )
         .into());
     }
@@ -378,14 +339,14 @@ pub(crate) async fn set_maintenance(
         rpc::MaintenanceOperation::Enable => {
             let Some(reference) = req.reference else {
                 return Err(
-                    CarbideError::InvalidArgument("Missing reference url".to_string()).into(),
+                    CarbideError::InvalidArgument("missing reference url".to_string()).into(),
                 );
             };
 
             let reference = reference.trim().to_string();
             if reference.len() < 5 {
                 return Err(CarbideError::InvalidArgument(
-                    "Provide some valid reference. Minimum expected length is 5.".into(),
+                    "provide some valid reference. minimum expected length is 5".into(),
                 )
                 .into());
             }
@@ -425,8 +386,8 @@ pub(crate) async fn set_maintenance(
             for dpu_machine in dpu_machines.iter() {
                 if dpu_machine.reprovision_requested.is_some() {
                     return Err(CarbideError::InvalidArgument(format!(
-                        "Reprovisioning request is set on DPU: {}. Clear it first.",
-                        &dpu_machine.id
+                        "reprovisioning request is set on DPU: {}. clear it first",
+                        dpu_machine.id
                     ))
                     .into());
                 }
@@ -449,4 +410,44 @@ pub(crate) async fn set_maintenance(
     };
 
     Ok(Response::new(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+
+    use super::*;
+
+    #[test]
+    fn boot_target_normalizes_interface_ids() {
+        let mac_address = "00:00:5e:00:53:02".parse().unwrap();
+
+        value_scenarios!(run = |interface_id| {
+            boot_target_for_interface(mac_address, interface_id)
+        };
+            "complete id" {
+                Some("NIC.Slot.7-1-1".to_string()) =>
+                    MachineBootInterfaceTarget::Pair(MachineBootInterface {
+                        mac_address,
+                        interface_id: "NIC.Slot.7-1-1".to_string(),
+                    }),
+            }
+
+            "padded id" {
+                Some(" \tNIC.Slot.7-1-1\n ".to_string()) =>
+                    MachineBootInterfaceTarget::Pair(MachineBootInterface {
+                        mac_address,
+                        interface_id: "NIC.Slot.7-1-1".to_string(),
+                    }),
+            }
+
+            "blank id" {
+                Some("\t\n".to_string()) => MachineBootInterfaceTarget::MacOnly(mac_address),
+            }
+
+            "missing id" {
+                None => MachineBootInterfaceTarget::MacOnly(mac_address),
+            }
+        );
+    }
 }

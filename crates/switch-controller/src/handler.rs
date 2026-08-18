@@ -30,10 +30,12 @@ use crate::context::SwitchStateHandlerContextObjects;
 use crate::created::handle_created;
 use crate::deleting::handle_deleting;
 use crate::error_state::handle_error;
+use crate::fetch_info::handle_fetch_info;
 use crate::initializing::handle_initializing;
 use crate::maintenance::handle_maintenance;
 use crate::ready::handle_ready;
 use crate::reprovisioning::handle_reprovisioning;
+use crate::rotating_bmc::handle_rotating_bmc;
 use crate::validating::handle_validating;
 
 /// The actual Switch State handler (structure mirrors MachineStateHandler).
@@ -77,6 +79,7 @@ impl SwitchStateHandler {
             SwitchControllerState::Configuring { .. } => {
                 handle_configuring(switch_id, state, ctx).await
             }
+            SwitchControllerState::FetchInfo => handle_fetch_info(switch_id, state, ctx).await,
             SwitchControllerState::Validating { .. } => {
                 handle_validating(switch_id, state, ctx).await
             }
@@ -90,6 +93,9 @@ impl SwitchStateHandler {
                 handle_maintenance(switch_id, state, ctx).await
             }
             SwitchControllerState::Ready => handle_ready(switch_id, state, ctx).await,
+            SwitchControllerState::RotatingBmc { retry_count } => {
+                handle_rotating_bmc(switch_id, state, *retry_count, ctx).await
+            }
             SwitchControllerState::Deleting => handle_deleting(switch_id, state, ctx).await,
             SwitchControllerState::Error { .. } => handle_error(switch_id, state, ctx).await,
         }

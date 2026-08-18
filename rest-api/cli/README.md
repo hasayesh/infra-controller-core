@@ -9,7 +9,7 @@ Command-line client for the NVIDIA Infrastructure Controller (NICo) REST API. Co
 
 ## Prerequisites
 
-- Go 1.25.4 or later
+- Go 1.26.4 or later
 - Access to a running NVIDIA Infrastructure Controller (NICo) REST API instance (local via `make kind-reset` or remote)
 
 ## Installation
@@ -209,6 +209,26 @@ Output formatting and pagination flags live on individual commands, not on the r
 
 Run `nicocli <command> --help` for the full per-command flag list, including spec-derived query parameters and body fields.
 
+### Bootstrap site prerequisites from a manifest
+
+`nicocli site bootstrap` creates or verifies the REST resources needed to use a Site. It initializes the calling organization, requires the Site to already exist, then processes its auto-created Site IP Blocks, Instance Types, Allocations, VPCs, VPC Prefixes, and optional Instances in dependency order. It never creates a Site.
+
+Start from the [example manifest](examples/site-prerequisites.yaml), replace the organization and resource values, and run:
+
+```bash
+nicocli site bootstrap \
+  --file cli/examples/site-prerequisites.yaml \
+  --output-file site-prerequisites.resolved.yaml
+```
+
+The manifest uses `${...}` references so later requests can consume IDs returned by earlier requests. For example, `${site.id}` resolves to the existing Site ID, `${siteIpBlocks.id}` resolves to a Site IP Block selected from the fabric-prefix inventory, and `${allocations.network.allocationConstraints.0.derivedResourceId}` resolves to the Tenant IP Block created by the network Allocation.
+
+Site IP Blocks are not created by this command. NICo automatically creates them from fabric prefixes reported by the Site; the manifest's `siteIpBlocks` entries are read-only selectors for those existing resources. If the Site inventory has not arrived yet, bootstrap stops with a rerun message instead of posting a Provider-owned IP Block.
+
+For managed resources, the command looks up a recorded ID first, then uses exact name and scope. Matching resources are reused, while a matching resource whose returned configuration differs from the request stops the workflow with a drift error. The output file preserves the requests, selectors, and resolved resource IDs so it can be replayed after an interrupted run or against a replacement installation. All requests use operation paths and methods resolved from the same embedded OpenAPI model that builds the regular CLI commands.
+
+Bootstrap first calls the Service Account endpoint for `provider.org`. In Service Account mode that single call initializes and returns both identities, and the Provider and Tenant organization names must match; otherwise bootstrap falls back to the Provider and Tenant current endpoints. Separate Provider and Tenant organizations use the same token, so it must have the required role in both organizations. `provider.org` may be omitted when the Provider organization already comes from `--org`, `NICO_ORG`, or the selected CLI config. Site registration, fabric-prefix inventory, and machine readiness are external asynchronous steps; if a dependency is not ready yet, complete that step and rerun the same manifest.
+
 ## Authentication
 
 ```bash
@@ -354,7 +374,7 @@ Install the binaries with `make nico-cli` and `make nico-mcp`, run from the `res
 - **Read-only.** Only `GET` operations are exposed. Mutating routes (`POST`, `PATCH`, `PUT`, `DELETE`) are intentionally excluded.
 - **Tool naming.** Tools are named `nico_<snake_case(operationId)>` (e.g. `nico_get_all_site`, `nico_validate_rack`).
 - **Stateless and request/response only.** The server sets `Stateless: true` and `JSONResponse: true` on the MCP streamable-HTTP handler -- responses are always `Content-Type: application/json`, never `text/event-stream`, and the server retains no per-session state.
-- **JWT passthrough.** The `Authorization: Bearer <jwt>` header on the inbound MCP request is forwarded unchanged to NICo REST. NICo REST validates the JWT, resolves the caller org, and enforces role-based authorization. The MCP layer never makes the authz decision itself.
+- **JWT passthrough.** The `Authorization: Bearer <jwt>` header on the inbound MCP request is forwarded unchanged only to the server's configured NICo REST base URL. NICo REST validates the JWT, resolves the caller org, and enforces role-based authorization. The MCP layer never makes the authz decision itself.
 
 ### Flags
 
@@ -364,11 +384,11 @@ Install the binaries with `make nico-cli` and `make nico-mcp`, run from the `res
 | `--path` | `NICO_MCP_PATH` | HTTP path the MCP handler is mounted at (default `/mcp`) |
 | `--shutdown-timeout` | `NICO_MCP_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout (default `10s`) |
 
-`--base-url`, `--org`, `--api-name`, and `--token` are accepted directly by `nico-mcp` and provide optional server-side defaults; each also reads its `NICO_*` environment variable. The MCP server does **not** read `~/.nico/config.yaml`: it is stateless and entirely parameter-driven, so it starts cleanly with no config file present and every connection detail is supplied per tool call (see below), falling back to these flags only when an argument is omitted.
+`--base-url`, `--org`, `--api-name`, and `--token` are accepted directly by `nico-mcp`; each also reads its `NICO_*` environment variable. `--base-url` pins the trusted NICo REST destination, so a per-call `base_url` must match it when configured. Without `--base-url`, a tool call may select its destination and proceed without credentials or with an explicit per-call token; only inherited credentials from the inbound Authorization header or server default token are rejected rather than forwarded. The MCP server does **not** read `~/.nico/config.yaml` and starts cleanly with no config file present.
 
-### Per-call config overrides
+### Per-call config
 
-Every typical config value can also be passed as an argument on each MCP tool call, layered on top of the server defaults:
+Connection values can be passed on each MCP tool call. `org`, `api_name`, and `token` override server defaults; `base_url` supplies the destination only when no server base URL is configured and otherwise must match it:
 
 | Tool arg | Equivalent flag | Config field |
 |----------|-----------------|--------------|
@@ -377,7 +397,7 @@ Every typical config value can also be passed as an argument on each MCP tool ca
 | `api_name` | `--api-name` | `api.name` |
 | `token` | `--token` | `auth.token` |
 
-Precedence per tool call (first non-empty wins): tool argument -> inbound `Authorization` header (token only) -> server startup flag/env. The MCP server does not read the on-disk config file. OIDC credentials and NGC api_key settings are NOT exposed as tool arguments -- they are login-flow inputs configured server-side via flags/env.
+Token precedence per tool call is: tool argument -> inbound `Authorization` header -> server startup flag/env. Inbound and startup tokens are eligible only when a server base URL is configured; a caller-selected destination can use an explicit per-call token or no token. The MCP server does not read the on-disk config file or resolve OIDC and NGC credentials; clients or an upstream gateway must supply the resolved bearer through the per-call `token` argument or inbound `Authorization` header.
 
 ### Probing the server
 

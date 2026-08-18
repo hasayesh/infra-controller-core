@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pub mod tests {
+pub(in crate::tests) mod tests {
     use std::time::Duration;
 
     use carbide_uuid::machine::MachineId;
@@ -110,7 +110,7 @@ pub mod tests {
     //
     // ================================================================================
 
-    pub const FULL_SKU_DATA: &str = r#"
+    pub(in crate::tests) const FULL_SKU_DATA: &str = r#"
     {
         "id": "sku id",
         "description": "PowerEdge R760; 2xCPU; 8xGPU; 256 GiB",
@@ -150,7 +150,10 @@ pub mod tests {
           "storage": [
             {
               "model": "Dell Ent NVMe CM6 RI 1.92TB",
-              "count": 1
+              "count": 1,
+              "min_size_mb": 1800000,
+              "max_size_mb": 2000000,
+              "pci_patterns": ["/devices/pci0000:00/0000:64:00.0/nvme/nvme0/nvme0n1"]
             }
           ],
           "tpm":
@@ -161,7 +164,7 @@ pub mod tests {
               "version": "2.0"
             }
         },
-        "schema_version": 4
+        "schema_version": 5
     }"#;
 
     const SKU_DATA: &str = r#"
@@ -210,7 +213,10 @@ pub mod tests {
     "storage": [
       {
         "model": "Dell Ent NVMe CM6 RI 1.92TB",
-        "count": 1
+        "count": 1,
+        "min_size_mb": 1831420,
+        "max_size_mb": 1831420,
+        "pci_patterns": ["/devices/pci0000:00/0000:64:00.0/0000:65:00.0/nvme/nvme0/nvme0n1"]
       }
     ],
     "memory": [
@@ -228,15 +234,22 @@ pub mod tests {
         "version": "2.0"
       }
   },
-  "schema_version": 4
+  "schema_version": 5
 }"#;
 
-    pub async fn handle_inventory_update(pool: &sqlx::PgPool, env: &TestEnv, mh: &TestManagedHost) {
+    pub(in crate::tests) async fn handle_inventory_update(
+        pool: &sqlx::PgPool,
+        env: &TestEnv,
+        mh: &TestManagedHost,
+    ) {
         env.run_machine_state_controller_iteration_until_state_condition(
             &mh.host().id,
             3,
             |machine| {
-                tracing::info!("waiting for inventory update: {}", machine.current_state());
+                tracing::info!(
+                    machine_state = %machine.current_state(),
+                    "waiting for inventory update",
+                );
                 matches!(
                     machine.current_state(),
                     ManagedHostState::BomValidating {
@@ -321,12 +334,12 @@ pub mod tests {
         )
         .await?
         .pop()
-        .ok_or_else(|| eyre::eyre!("Machine not found: {}", machine_id))
+        .ok_or_else(|| eyre::eyre!("machine not found: {}", machine_id))
     }
 
     /// Helper: Clear the SKU status/timestamp on a machine to allow re-matching
     /// Used in tests to reset the SKU matching state and test re-match behavior
-    pub async fn clear_sku_status(
+    pub(in crate::tests) async fn clear_sku_status(
         txn: &mut PgConnection,
         machine_id: &MachineId,
     ) -> Result<(), DatabaseError> {
@@ -361,9 +374,9 @@ pub mod tests {
         .unwrap();
 
         assert_eq!(machine.current_state(), &ManagedHostState::Ready);
-        assert!(machine.hw_sku.is_some());
+        assert!(machine.config.hw_sku.is_some());
 
-        let new_sku = db::sku::find(&mut txn, &[machine.hw_sku.unwrap()])
+        let new_sku = db::sku::find(&mut txn, &[machine.config.hw_sku.unwrap()])
             .await?
             .pop()
             .unwrap();
@@ -395,7 +408,7 @@ pub mod tests {
     // ==================== Core SKU Validation Tests ====================
 
     #[crate::sqlx_test]
-    pub async fn test_sku_create(pool: sqlx::PgPool) -> Result<(), eyre::Error> {
+    pub(in crate::tests) async fn test_sku_create(pool: sqlx::PgPool) -> Result<(), eyre::Error> {
         let mut txn = pool.begin().await?;
         let rpc_sku: rpc::forge::Sku = serde_json::de::from_str(FULL_SKU_DATA)?;
         let expected_sku: Sku = rpc_sku.into();
@@ -420,7 +433,7 @@ pub mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "Argument is invalid: Specified SKU matches SKU with ID: {}",
+                "argument is invalid: Specified SKU matches SKU with ID: {}",
                 expected_sku.id
             )
         );
@@ -428,7 +441,40 @@ pub mod tests {
     }
 
     #[crate::sqlx_test]
-    pub async fn test_sku_create_rejects_empty_id(pool: sqlx::PgPool) -> Result<(), eyre::Error> {
+    pub(in crate::tests) async fn test_sku_create_duplicate_id_returns_already_exists(
+        pool: sqlx::PgPool,
+    ) -> Result<(), eyre::Error> {
+        use rpc::forge::SkuList;
+        use rpc::forge::forge_server::Forge;
+
+        let env = create_test_env(pool).await;
+        let sku: rpc::forge::Sku = serde_json::de::from_str(FULL_SKU_DATA)?;
+        let sku_id = sku.id.clone();
+        let mut conflicting_sku = sku.clone();
+        conflicting_sku.components.as_mut().unwrap().cpus[0].thread_count *= 2;
+
+        env.api
+            .create_sku(tonic::Request::new(SkuList { skus: vec![sku] }))
+            .await?;
+
+        let error = env
+            .api
+            .create_sku(tonic::Request::new(SkuList {
+                skus: vec![conflicting_sku],
+            }))
+            .await
+            .expect_err("Creating a SKU with a duplicate ID should fail");
+
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        assert_eq!(error.message(), format!("SKU already exists: {sku_id}"));
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    pub(in crate::tests) async fn test_sku_create_rejects_empty_id(
+        pool: sqlx::PgPool,
+    ) -> Result<(), eyre::Error> {
         let mut txn = pool.begin().await?;
         let rpc_sku: rpc::forge::Sku = serde_json::de::from_str(FULL_SKU_DATA)?;
         let mut sku: Sku = rpc_sku.into();
@@ -440,13 +486,13 @@ pub mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Argument is invalid: SKU ID must not be empty"
+            "argument is invalid: SKU ID must not be empty"
         );
         Ok(())
     }
 
     #[crate::sqlx_test]
-    pub async fn test_sku_delete(pool: sqlx::PgPool) -> Result<(), eyre::Error> {
+    pub(in crate::tests) async fn test_sku_delete(pool: sqlx::PgPool) -> Result<(), eyre::Error> {
         let mut txn = pool.begin().await?;
         let rpc_sku: rpc::forge::Sku = serde_json::de::from_str(FULL_SKU_DATA)?;
         let expected_sku: Sku = rpc_sku.into();
@@ -484,9 +530,15 @@ pub mod tests {
         actual_sku.created = expected_sku.created;
 
         let actual_sku_json: String = serde_json::ser::to_string_pretty(&actual_sku)?;
-        tracing::info!("actual_sku_json: {}", actual_sku_json);
+        tracing::info!(
+            actual_sku_json = %actual_sku_json,
+            "Serialized actual SKU",
+        );
         let expected_sku_json = serde_json::ser::to_string_pretty(&expected_sku)?;
-        tracing::info!("expected_sku_json: {}", expected_sku_json);
+        tracing::info!(
+            expected_sku_json = %expected_sku_json,
+            "Serialized expected SKU",
+        );
 
         assert_eq!(actual_sku_json, expected_sku_json);
 
@@ -513,7 +565,7 @@ pub mod tests {
         .await?
         .pop()
         .unwrap();
-        assert_eq!(machine.hw_sku.unwrap(), actual_sku.id);
+        assert_eq!(machine.config.hw_sku.unwrap(), actual_sku.id);
 
         db::machine::unassign_sku(&mut txn, &machine_id).await?;
 
@@ -526,7 +578,7 @@ pub mod tests {
         .pop()
         .unwrap();
 
-        assert!(machine.hw_sku.is_none());
+        assert!(machine.config.hw_sku.is_none());
 
         let sku_id = actual_sku.id.clone();
         db::sku::delete(&mut txn, &actual_sku.id).await?;
@@ -572,7 +624,7 @@ pub mod tests {
 
         // Machine should reach Ready state (test fixture generates and assigns SKU)
         assert_eq!(machine.current_state(), &ManagedHostState::Ready);
-        assert!(machine.hw_sku.is_some());
+        assert!(machine.config.hw_sku.is_some());
 
         Ok(())
     }
@@ -612,7 +664,7 @@ pub mod tests {
                 bom_validating_state: BomValidating::WaitingForSkuAssignment(_)
             }
         ));
-        assert!(machine.hw_sku.is_none());
+        assert!(machine.config.hw_sku.is_none());
 
         Ok(())
     }
@@ -746,7 +798,7 @@ pub mod tests {
             ),
             "Machine should be stuck in WaitingForSkuAssignment"
         );
-        assert!(machine.hw_sku.is_none());
+        assert!(machine.config.hw_sku.is_none());
         txn.commit().await?;
 
         Ok(())
@@ -817,12 +869,13 @@ pub mod tests {
                     metadata: Metadata::new_with_default_name(),
                     sku_id: Some("no-sku".to_string()),
                     default_pause_ingestion_and_poweron: None,
-                    host_nics: vec![],
+                    interfaces: vec![],
                     rack_id: None,
                     dpf_enabled: Some(true),
                     bmc_ip_address: None,
                     bmc_retain_credentials: None,
-                    dpu_mode: Default::default(),
+                    dpu_policy: Default::default(),
+                    bmc_ip_allocation: Default::default(),
                     host_lifecycle_profile: Default::default(),
                 },
             },
@@ -912,12 +965,13 @@ pub mod tests {
                     metadata: Metadata::new_with_default_name(),
                     sku_id: Some("no-sku-missing".to_string()),
                     default_pause_ingestion_and_poweron: None,
-                    host_nics: vec![],
+                    interfaces: vec![],
                     rack_id: None,
                     dpf_enabled: Some(true),
                     bmc_ip_address: None,
                     bmc_retain_credentials: None,
-                    dpu_mode: Default::default(),
+                    dpu_policy: Default::default(),
+                    bmc_ip_allocation: Default::default(),
                     host_lifecycle_profile: Default::default(),
                 },
             },
@@ -982,12 +1036,13 @@ pub mod tests {
                     metadata: Metadata::new_with_default_name(),
                     sku_id: Some("no-sku".to_string()),
                     default_pause_ingestion_and_poweron: None,
-                    host_nics: vec![],
+                    interfaces: vec![],
                     rack_id: None,
                     dpf_enabled: Some(true),
                     bmc_ip_address: None,
                     bmc_retain_credentials: None,
-                    dpu_mode: Default::default(),
+                    dpu_policy: Default::default(),
+                    bmc_ip_allocation: Default::default(),
                     host_lifecycle_profile: Default::default(),
                 },
             },
@@ -1069,12 +1124,13 @@ pub mod tests {
                     metadata: Metadata::new_with_default_name(),
                     sku_id: Some("non-existent-sku".to_string()),
                     default_pause_ingestion_and_poweron: None,
-                    host_nics: vec![],
+                    interfaces: vec![],
                     rack_id: None,
                     dpf_enabled: Some(true),
                     bmc_ip_address: None,
                     bmc_retain_credentials: None,
-                    dpu_mode: Default::default(),
+                    dpu_policy: Default::default(),
+                    bmc_ip_allocation: Default::default(),
                     host_lifecycle_profile: Default::default(),
                 },
             },
@@ -1279,12 +1335,15 @@ pub mod tests {
         let machine = mh.host().db_machine(&mut txn).await;
         let machine_id = mh.host().id;
 
-        let original_sku = db::sku::find(&mut txn, &[machine.hw_sku.clone().unwrap()])
+        let original_sku = db::sku::find(&mut txn, &[machine.config.hw_sku.clone().unwrap()])
             .await?
             .pop()
             .unwrap();
 
-        tracing::info!("SKU1: {:?}", original_sku);
+        tracing::info!(
+            original_sku = ?original_sku,
+            "Original SKU before mismatch",
+        );
 
         let mut broken_sku = original_sku.clone();
         broken_sku.id = "Broken SKU".to_string();
@@ -1292,7 +1351,10 @@ pub mod tests {
 
         db::sku::create(&mut txn, &broken_sku).await?;
 
-        tracing::info!("SKU2: {:?}", broken_sku);
+        tracing::info!(
+            broken_sku = ?broken_sku,
+            "Broken SKU after mismatch",
+        );
 
         db::machine::unassign_sku(&mut txn, &machine_id).await?;
         db::machine::assign_sku(&mut txn, &machine_id, &broken_sku.id).await?;
@@ -1399,7 +1461,7 @@ pub mod tests {
 
         let mut txn = pool.begin().await?;
         let machine = mh.host().db_machine(&mut txn).await;
-        let current_sku_id = machine.hw_sku.clone().unwrap();
+        let current_sku_id = machine.config.hw_sku.clone().unwrap();
 
         // Assign a mismatched SKU
         assign_mismatched_sku(&mut txn, &machine_id, &current_sku_id).await?;
@@ -1447,7 +1509,7 @@ pub mod tests {
 
         let mut txn = pool.begin().await?;
         let machine = mh.host().db_machine(&mut txn).await;
-        let current_sku_id = machine.hw_sku.clone().unwrap();
+        let current_sku_id = machine.config.hw_sku.clone().unwrap();
 
         // Assign a mismatched SKU
         assign_mismatched_sku(&mut txn, &machine_id, &current_sku_id).await?;
@@ -1507,12 +1569,13 @@ pub mod tests {
                     metadata: Metadata::new_with_default_name(),
                     sku_id: Some(mismatched_sku.id.clone()),
                     default_pause_ingestion_and_poweron: None,
-                    host_nics: vec![],
+                    interfaces: vec![],
                     rack_id: None,
                     dpf_enabled: Some(true),
                     bmc_ip_address: None,
                     bmc_retain_credentials: None,
-                    dpu_mode: Default::default(),
+                    dpu_policy: Default::default(),
+                    bmc_ip_allocation: Default::default(),
                     host_lifecycle_profile: Default::default(),
                 },
             },
@@ -1578,7 +1641,7 @@ pub mod tests {
             }
         ));
 
-        let expected_sku_id = machine.hw_sku.unwrap();
+        let expected_sku_id = machine.config.hw_sku.unwrap();
 
         // A new machine with the same hardware is automatically assigned the above
         // sku and moves on.
@@ -1587,7 +1650,7 @@ pub mod tests {
 
         let machine2 = mh2.host().db_machine(&mut txn).await;
 
-        assert_eq!(machine2.hw_sku, Some(expected_sku_id));
+        assert_eq!(machine2.config.hw_sku, Some(expected_sku_id));
 
         Ok(())
     }
@@ -1616,6 +1679,7 @@ pub mod tests {
         .unwrap();
 
         let sku_id = machine
+            .config
             .hw_sku
             .clone()
             .expect("SKU should have been assigned");
@@ -1624,8 +1688,8 @@ pub mod tests {
             .pop()
             .expect("SKU should exist");
 
-        let original_verify_time = machine.hw_sku_status.map(|s| s.verify_request_time);
-        assert_eq!(machine.hw_sku.unwrap(), actual_sku.id);
+        let original_verify_time = machine.status.hw_sku.map(|s| s.verify_request_time);
+        assert_eq!(machine.config.hw_sku.unwrap(), actual_sku.id);
 
         txn.commit().await?;
         let mut txn = pool.begin().await?;
@@ -1644,7 +1708,7 @@ pub mod tests {
         .pop()
         .unwrap();
 
-        let replace_verify_time = machine.hw_sku_status.map(|s| s.verify_request_time);
+        let replace_verify_time = machine.status.hw_sku.map(|s| s.verify_request_time);
 
         assert_ne!(original_verify_time, replace_verify_time);
 
@@ -1703,6 +1767,7 @@ pub mod tests {
 
         // The SKU should have been auto-created by create_managed_host when BOM validation is enabled
         let expected_sku_id = machine
+            .config
             .hw_sku
             .clone()
             .expect("SKU should have been assigned");
@@ -1729,7 +1794,7 @@ pub mod tests {
         .pop()
         .unwrap();
 
-        assert_eq!(machine.hw_sku, Some(expected_sku.id.clone()));
+        assert_eq!(machine.config.hw_sku, Some(expected_sku.id.clone()));
         assert_eq!(machine.current_state(), &ManagedHostState::Ready);
 
         clear_sku_status(&mut txn, &machine_id).await?;
@@ -1779,7 +1844,7 @@ pub mod tests {
         .pop()
         .unwrap();
 
-        assert_eq!(machine.hw_sku, Some(expected_sku.id));
+        assert_eq!(machine.config.hw_sku, Some(expected_sku.id));
         assert_eq!(machine.current_state(), &ManagedHostState::Ready);
 
         Ok(())
@@ -1833,7 +1898,7 @@ pub mod tests {
         .await?
         .pop()
         .unwrap();
-        let assigned_sku_id = machine.hw_sku.unwrap();
+        let assigned_sku_id = machine.config.hw_sku.unwrap();
         // Make a new sku, using the assigned sku as a base and renaming it "unassigned-sku" (and
         // bump its cpu count.)
         let unassigned_sku = pool
@@ -1872,7 +1937,9 @@ pub mod tests {
     }
 
     #[crate::sqlx_test(fixtures("create_sku"))]
-    pub fn test_sku_metadata_update(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    pub(in crate::tests) fn test_sku_metadata_update(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
 
         db::sku::update_metadata(
@@ -1895,7 +1962,7 @@ pub mod tests {
     }
 
     #[crate::sqlx_test(fixtures("create_sku"))]
-    pub fn test_sku_metadata_update_description(
+    pub(in crate::tests) fn test_sku_metadata_update_description(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
@@ -1944,7 +2011,7 @@ pub mod tests {
     }
 
     #[crate::sqlx_test(fixtures("create_sku"))]
-    pub fn test_sku_metadata_update_device_type(
+    pub(in crate::tests) fn test_sku_metadata_update_device_type(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
@@ -1969,7 +2036,7 @@ pub mod tests {
     }
 
     #[crate::sqlx_test(fixtures("create_sku"))]
-    pub fn test_sku_metadata_update_invalid(
+    pub(in crate::tests) fn test_sku_metadata_update_invalid(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
@@ -1981,7 +2048,9 @@ pub mod tests {
     }
 
     #[crate::sqlx_test(fixtures("create_sku"))]
-    pub fn test_sku_replace(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    pub(in crate::tests) fn test_sku_replace(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let sku_id = "sku1".to_string();
         let original_sku = db::sku::find(&mut txn, std::slice::from_ref(&sku_id))

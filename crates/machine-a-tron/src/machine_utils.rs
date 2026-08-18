@@ -24,9 +24,9 @@ use rpc::forge::{ForgeAgentControlResponse, MachineArchitecture};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use crate::DeviceHandle;
 use crate::api_client::ClientApiError;
 use crate::config::MachineATronContext;
-use crate::host_machine::HostMachineHandle;
 use crate::machine_state_machine::AddressConfigError;
 
 lazy_static! {
@@ -37,23 +37,23 @@ lazy_static! {
 }
 
 #[derive(Debug, Clone)]
-pub enum PxeResponse {
+pub(super) enum PxeResponse {
     Exit,
     Scout,    // PXE script is booting scout.efi
     DpuAgent, // PXE script is booting carbide.efi
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum PxeError {
-    #[error("API Client error running PXE request: {0}")]
+pub(super) enum PxeError {
+    #[error("API client error running PXE request: {0}")]
     ClientApi(#[from] ClientApiError),
-    #[error("PXE Request failed with status: {0}")]
+    #[error("PXE request failed with status: {0}")]
     PxeRequest(#[from] tonic::Status),
-    #[error("Error sending PXE request: {0}")]
+    #[error("error sending PXE request: {0}")]
     Reqwest(#[from] reqwest::Error),
 }
 
-pub async fn forge_agent_control(
+pub(super) async fn forge_agent_control(
     app_context: &MachineATronContext,
     machine_id: MachineId,
 ) -> Option<ForgeAgentControlResponse> {
@@ -67,13 +67,18 @@ pub async fn forge_agent_control(
             if e.code() == tonic::Code::NotFound {
                 return None;
             }
-            tracing::warn!("Error getting control action: {e}");
+            tracing::warn!(
+                error = %e,
+                "Error getting control action",
+            );
             Some(ForgeAgentControlResponse::noop())
         }
     }
 }
 
-pub fn get_validation_id(response: &ForgeAgentControlResponse) -> Option<MachineValidationId> {
+pub(super) fn get_validation_id(
+    response: &ForgeAgentControlResponse,
+) -> Option<MachineValidationId> {
     if let Some(rpc::forge::forge_agent_control_response::Action::MachineValidation(
         machine_validation,
     )) = &response.action
@@ -84,7 +89,7 @@ pub fn get_validation_id(response: &ForgeAgentControlResponse) -> Option<Machine
     }
 }
 
-pub async fn send_pxe_boot_request(
+pub(super) async fn send_pxe_boot_request(
     app_context: &MachineATronContext,
     arch: MachineArchitecture,
     client_ip: std::net::IpAddr,
@@ -116,15 +121,15 @@ pub async fn send_pxe_boot_request(
             PxeResponse::Scout
         } else {
             tracing::error!(
-                "Could not determine what to do with kernel URL returned by PXE script, will treat as 'exit': {}",
-                pxe_script
+                pxe_script = %pxe_script,
+                "Could not determine what to do with kernel URL returned by PXE script, will treat as 'exit'",
             );
             PxeResponse::Exit
         }
     } else {
         tracing::error!(
-            "Could not determine what to do with PXE script (no kernel line, no exit line), will treat as 'exit': {}",
-            pxe_script
+            pxe_script = %pxe_script,
+            "Could not determine what to do with PXE script (no kernel line, no exit line), will treat as 'exit'",
         );
         PxeResponse::Exit
     };
@@ -132,11 +137,11 @@ pub async fn send_pxe_boot_request(
     Ok(response)
 }
 
-pub async fn get_next_free_machine(
-    machine_handles: &Vec<HostMachineHandle>,
+pub(super) async fn get_next_free_machine(
+    provisionable_handles: &Vec<DeviceHandle>,
     assigned_mat_ids: &HashSet<Uuid>,
-) -> Option<HostMachineHandle> {
-    for machine in machine_handles {
+) -> Option<DeviceHandle> {
+    for machine in provisionable_handles {
         if assigned_mat_ids.contains(&machine.mat_id()) {
             continue;
         }
@@ -148,20 +153,24 @@ pub async fn get_next_free_machine(
     None
 }
 
-pub async fn add_address_to_interface(
+pub(super) async fn add_address_to_interface(
     address: &str,
     interface: &str,
 ) -> Result<(), AddressConfigError> {
     if interface_has_address(interface, address).await? {
         tracing::info!(
-            "Skipping adding address {} to interface {}, as it is already configured.",
-            address,
-            interface
+            ip_address = %address,
+            interface_name = %interface,
+            "Skipping address addition; already configured",
         );
         return Ok(());
     }
 
-    tracing::info!("Adding address {} to interface {}", address, interface);
+    tracing::info!(
+        ip_address = %address,
+        interface_name = %interface,
+        "Adding address",
+    );
     let wrapper_cmd = find_sudo_command();
     let mut cmd = tokio::process::Command::new(wrapper_cmd);
     #[cfg(not(target_os = "macos"))]

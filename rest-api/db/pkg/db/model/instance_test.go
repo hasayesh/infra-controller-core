@@ -19,7 +19,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/util"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/extra/bundebug"
@@ -185,9 +185,9 @@ func testInstanceBuildNetworkSecurityGroup(t *testing.T, dbSession *db.Session, 
 		Status:    InstanceTypeStatusReady,
 		Rules: []*NetworkSecurityGroupRule{
 			&NetworkSecurityGroupRule{
-				&cwssaws.NetworkSecurityGroupRuleAttributes{
+				&corev1.NetworkSecurityGroupRuleAttributes{
 					Id:     cutil.GetPtr(uuid.NewString()),
-					Action: cwssaws.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
+					Action: corev1.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
 				},
 			},
 		},
@@ -279,7 +279,7 @@ func TestInstanceSQLDAO_Create(t *testing.T) {
 					InstanceTypeID:           &instanceType.ID,
 					NetworkSecurityGroupID:   &networkSecurityGroup.ID,
 					NetworkSecurityGroupPropagationDetails: &NetworkSecurityGroupPropagationDetails{
-						NetworkSecurityGroupPropagationObjectStatus: &cwssaws.NetworkSecurityGroupPropagationObjectStatus{
+						NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{
 							Id:                      "",
 							RelatedInstanceIds:      []string{},
 							UnpropagatedInstanceIds: []string{},
@@ -1012,6 +1012,7 @@ func TestInstanceSQLDAO_GetAll(t *testing.T) {
 	tenant2 := testInstanceBuildTenant(t, dbSession, "testTenant2")
 	vpc := testInstanceBuildVpc(t, dbSession, ip, site, tenant, "testVpc")
 	vpc2 := testInstanceBuildVpc(t, dbSession, ip, site2, tenant2, "testVpc2")
+	vpcSelection := testInstanceBuildVpc(t, dbSession, ip, site, tenant, "testVpcSelection")
 	allocation := testInstanceBuildAllocation(t, dbSession, ip, tenant, site, "testAllocation")
 	allocation2 := testInstanceBuildAllocation(t, dbSession, ip, tenant2, site2, "testAllocation2")
 	instanceType := testInstanceBuildInstanceType(t, dbSession, ip, "testInstanceType")
@@ -1180,6 +1181,15 @@ func TestInstanceSQLDAO_GetAll(t *testing.T) {
 		CreatedBy:   user.ID,
 	})
 	assert.NoError(t, err)
+	_, err = ifcd.Create(ctx, nil, InterfaceCreateInput{
+		InstanceID:      instanceGroup1[1].ID,
+		VpcID:           &vpcSelection.ID,
+		VpcIPFamilyMode: cutil.GetPtr(InterfaceVpcIPFamilyModeIPv4Only),
+		Status:          InterfaceStatusPending,
+		IsPhysical:      true,
+		CreatedBy:       user.ID,
+	})
+	assert.NoError(t, err)
 
 	// OTEL Spanner configuration
 	_, _, ctx = testCommonTraceProviderSetup(t, ctx)
@@ -1334,6 +1344,14 @@ func TestInstanceSQLDAO_GetAll(t *testing.T) {
 				Limit: cutil.GetPtr(totalCount),
 			},
 			expectedCount: totalCount/2 + 1,
+			expectedError: false,
+		},
+		{
+			desc: "VPC filter includes an unresolved directly selected secondary VPC",
+			filter: InstanceFilterInput{
+				VpcIDs: []uuid.UUID{vpcSelection.ID},
+			},
+			expectedCount: 1,
 			expectedError: false,
 		},
 		{
@@ -1895,6 +1913,7 @@ func TestInstanceSQLDAO_GetCount(t *testing.T) {
 	tenant2 := testInstanceBuildTenant(t, dbSession, "testTenant2")
 	vpc := testInstanceBuildVpc(t, dbSession, ip, site, tenant, "testVpc")
 	vpc2 := testInstanceBuildVpc(t, dbSession, ip, site2, tenant2, "testVpc2")
+	vpcSelection := testInstanceBuildVpc(t, dbSession, ip, site, tenant, "testVpcSelection")
 	allocation := testInstanceBuildAllocation(t, dbSession, ip, tenant, site, "testAllocation")
 	allocation2 := testInstanceBuildAllocation(t, dbSession, ip, tenant2, site2, "testAllocation2")
 	instanceType := testInstanceBuildInstanceType(t, dbSession, ip, "testInstanceType")
@@ -2056,6 +2075,15 @@ func TestInstanceSQLDAO_GetCount(t *testing.T) {
 		CreatedBy:   user.ID,
 	})
 	assert.NoError(t, err)
+	_, err = ifcd.Create(ctx, nil, InterfaceCreateInput{
+		InstanceID:      instanceGroup1[1].ID,
+		VpcID:           &vpcSelection.ID,
+		VpcIPFamilyMode: cutil.GetPtr(InterfaceVpcIPFamilyModeIPv4Only),
+		Status:          InterfaceStatusPending,
+		IsPhysical:      true,
+		CreatedBy:       user.ID,
+	})
+	assert.NoError(t, err)
 
 	// OTEL Spanner configuration
 	_, _, ctx = testCommonTraceProviderSetup(t, ctx)
@@ -2160,6 +2188,14 @@ func TestInstanceSQLDAO_GetCount(t *testing.T) {
 				VpcIDs: []uuid.UUID{vpc2.ID},
 			},
 			expectedCount: totalCount/2 + 1,
+			expectedError: false,
+		},
+		{
+			desc: "VPC filter count includes an unresolved directly selected secondary VPC",
+			filter: InstanceFilterInput{
+				VpcIDs: []uuid.UUID{vpcSelection.ID},
+			},
+			expectedCount: 1,
 			expectedError: false,
 		},
 		{
@@ -2516,7 +2552,7 @@ func TestInstanceSQLDAO_Update(t *testing.T) {
 			paramControlledInstanceID:     &dummyUUID,
 			paramHostname:                 nil,
 			paramOperatingSystemID:        &operatingSystem2.ID,
-			paramNetworkSecurityGroupPropagationDetails: &NetworkSecurityGroupPropagationDetails{NetworkSecurityGroupPropagationObjectStatus: &cwssaws.NetworkSecurityGroupPropagationObjectStatus{}},
+			paramNetworkSecurityGroupPropagationDetails: &NetworkSecurityGroupPropagationDetails{NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{}},
 			paramAlwaysBootWithCustomIpxe:               cutil.GetPtr(true),
 			paramEnablePhoneHome:                        cutil.GetPtr(true),
 			paramIsUpdatePending:                        cutil.GetPtr(true),
@@ -2540,7 +2576,7 @@ func TestInstanceSQLDAO_Update(t *testing.T) {
 			expectedControllerInstanceID:                   &dummyUUID,
 			expectedHostname:                               cutil.GetPtr("updated.com"),
 			expectedOperatingSystemID:                      &operatingSystem2.ID,
-			expectedNetworkSecurityGroupPropagationDetails: &NetworkSecurityGroupPropagationDetails{NetworkSecurityGroupPropagationObjectStatus: &cwssaws.NetworkSecurityGroupPropagationObjectStatus{}},
+			expectedNetworkSecurityGroupPropagationDetails: &NetworkSecurityGroupPropagationDetails{NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{}},
 			expectedIpxeScript:                             cutil.GetPtr("updatedIpxe"),
 			expectAlwaysBootWithCustomIpxe:                 cutil.GetPtr(true),
 			expectEnablePhoneHome:                          cutil.GetPtr(true),
@@ -2801,7 +2837,7 @@ func TestInstanceSQLDAO_Clear(t *testing.T) {
 			Status:                   InstanceStatusPending,
 			CreatedBy:                user.ID,
 			NetworkSecurityGroupPropagationDetails: &NetworkSecurityGroupPropagationDetails{
-				NetworkSecurityGroupPropagationObjectStatus: &cwssaws.NetworkSecurityGroupPropagationObjectStatus{},
+				NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{},
 			},
 		},
 	)
@@ -2862,7 +2898,7 @@ func TestInstanceSQLDAO_Clear(t *testing.T) {
 		expectedSiteID                                 *uuid.UUID
 		expectedInstanceTypeID                         *uuid.UUID
 		expectedNetworkSecurityGroupID                 *string
-		expectednetworkSecurityGroupPropagationDetails *cwssaws.NetworkSecurityGroupPropagationObjectStatus
+		expectednetworkSecurityGroupPropagationDetails *corev1.NetworkSecurityGroupPropagationObjectStatus
 		expectedVpcID                                  *uuid.UUID
 		expectedMachineID                              *string
 		expectedControllerInstanceID                   *uuid.UUID

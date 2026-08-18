@@ -23,7 +23,7 @@ import (
 	"github.com/uptrace/bun"
 
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 const (
@@ -119,55 +119,77 @@ func (s *Subnet) GetSiteID() *uuid.UUID {
 	return &s.ID
 }
 
+func (s *Subnet) toMetadataProto() *corev1.Metadata {
+	md := &corev1.Metadata{
+		Name:        s.Name,
+		Description: "",
+	}
+	if s.Description != nil {
+		md.Description = *s.Description
+	}
+	return md
+}
+
 // ToProto converts this Subnet into its workflow proto representation.
 // Used as the canonical entity-to-proto conversion; request-shape protos
 // (create) are produced by `ToProto` methods on the corresponding API
 // request types in api/pkg/api/model/subnet.go.
+//
+// Desired configuration is emitted via the structured `config` field and
+// identity metadata via `metadata`. The deprecated flat mirror fields are
+// no longer populated.
 //
 // `Prefixes` is built from `IPv4Prefix` + `PrefixLength` when
 // `IPv4Prefix` is set; otherwise the field is left nil. The Site-facing
 // `ReserveFirst` count is a deployment policy that does not live on the
 // entity, so this method emits prefixes with a zero `ReserveFirst` and
 // the request-shape `ToProto` overlays the policy value.
-func (s *Subnet) ToProto() *cwssaws.NetworkSegment {
-	proto := &cwssaws.NetworkSegment{
-		Id:    &cwssaws.NetworkSegmentId{Value: s.GetSiteID().String()},
-		VpcId: &cwssaws.VpcId{Value: s.VpcID.String()},
-		Name:  s.Name,
+func (s *Subnet) ToProto() *corev1.NetworkSegment {
+	config := &corev1.NetworkSegmentConfig{
+		VpcId: &corev1.VpcId{Value: s.VpcID.String()},
 	}
 	if s.DomainID != nil {
-		proto.SubdomainId = &cwssaws.DomainId{Value: s.DomainID.String()}
+		config.SubdomainId = &corev1.DomainId{Value: s.DomainID.String()}
 	}
 	if s.MTU != nil {
 		mtu := int32(*s.MTU)
-		proto.Mtu = &mtu
+		config.Mtu = &mtu
 	}
 	if s.IPv4Prefix != nil {
-		proto.Prefixes = []*cwssaws.NetworkPrefix{
+		config.Prefixes = []*corev1.NetworkPrefix{
 			{
 				Gateway: s.IPv4Gateway,
 				Prefix:  fmt.Sprintf("%s/%d", *s.IPv4Prefix, s.PrefixLength),
 			},
 		}
 	}
-	return proto
+
+	return &corev1.NetworkSegment{
+		Id:       &corev1.NetworkSegmentId{Value: s.GetSiteID().String()},
+		Metadata: s.toMetadataProto(),
+		Config:   config,
+	}
 }
 
 // FromProto populates this Subnet from its workflow proto representation.
 // A nil proto is a no-op. This is the inverse of `ToProto` and exists
 // for convention symmetry — currently no code path on the cloud side
-// reconstructs a full Subnet entity from a `cwssaws.NetworkSegment` (the
+// reconstructs a full Subnet entity from a `corev1.NetworkSegment` (the
 // site is the destination, not the source), but the method is provided
 // so future reconciliation flows have a single canonical entry point.
 //
 // Field-level contract:
 //   - `s.ID` is preserved on a missing or unparseable `proto.Id`,
 //     because callers pre-validate the UUID before calling.
+//   - `Name` is sourced from the structured `proto.Metadata.Name`.
+//   - Desired-configuration fields (VpcID, DomainID, MTU, prefixes) are
+//     read from the structured `config` only. Deprecated flat mirrors are
+//     not consulted during entity reconstruction.
 //   - Optional pointer fields (DomainID, MTU, IPv4Prefix, IPv4Gateway)
 //     are cleared when the proto omits them OR when the proto value is
 //     invalid (e.g. an unparseable UUID, an unparseable prefix). This
 //     makes `FromProto` a clean reset rather than a partial merge.
-func (s *Subnet) FromProto(proto *cwssaws.NetworkSegment) {
+func (s *Subnet) FromProto(proto *corev1.NetworkSegment) {
 	if proto == nil {
 		return
 	}
@@ -176,38 +198,49 @@ func (s *Subnet) FromProto(proto *cwssaws.NetworkSegment) {
 			s.ID = id
 		}
 	}
-	if proto.VpcId != nil {
-		if id, err := uuid.Parse(proto.VpcId.Value); err == nil {
+	s.Name = ""
+	s.Description = nil
+	if proto.Metadata != nil {
+		if proto.Metadata.Name != "" {
+			s.Name = proto.Metadata.Name
+		}
+		if proto.Metadata.Description != "" {
+			s.Description = &proto.Metadata.Description
+		}
+	}
+
+	cfg := proto.Config
+	if cfg == nil {
+		cfg = &corev1.NetworkSegmentConfig{}
+	}
+	if cfg.VpcId != nil {
+		if id, err := uuid.Parse(cfg.VpcId.Value); err == nil {
 			s.VpcID = id
 		}
 	}
-	s.Name = proto.Name
-	if proto.SubdomainId != nil {
-		if id, err := uuid.Parse(proto.SubdomainId.Value); err == nil {
+	s.DomainID = nil
+	if cfg.SubdomainId != nil {
+		if id, err := uuid.Parse(cfg.SubdomainId.Value); err == nil {
 			s.DomainID = &id
-		} else {
-			s.DomainID = nil
 		}
-	} else {
-		s.DomainID = nil
 	}
-	if proto.Mtu != nil {
-		m := int(*proto.Mtu)
+	s.MTU = nil
+	if cfg.Mtu != nil {
+		m := int(*cfg.Mtu)
 		s.MTU = &m
-	} else {
-		s.MTU = nil
 	}
 	s.IPv4Prefix = nil
 	s.IPv4Gateway = nil
-	if len(proto.Prefixes) > 0 && proto.Prefixes[0] != nil {
+	s.PrefixLength = 0
+	if len(cfg.Prefixes) > 0 && cfg.Prefixes[0] != nil {
 		// The proto carries `<prefix>/<length>` as a single string; split
 		// it back into the entity's two fields. A malformed value clears
 		// both rather than leaving the receiver in a partial state.
-		prefix, length, ok := splitNetworkPrefix(proto.Prefixes[0].Prefix)
+		prefix, length, ok := splitNetworkPrefix(cfg.Prefixes[0].Prefix)
 		if ok {
 			s.IPv4Prefix = &prefix
 			s.PrefixLength = length
-			s.IPv4Gateway = proto.Prefixes[0].Gateway
+			s.IPv4Gateway = cfg.Prefixes[0].Gateway
 		}
 	}
 }

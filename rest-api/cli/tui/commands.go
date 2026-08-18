@@ -21,12 +21,13 @@ import (
 type Command struct {
 	Name        string
 	Description string
+	Sensitive   bool
 	Run         func(s *Session, args []string) error
 }
 
 // AllCommands returns all available commands.
 func AllCommands() []Command {
-	return []Command{
+	commands := []Command{
 		{Name: "site list", Description: "List all sites", Run: cmdSiteList},
 		{Name: "site get", Description: "Get site details", Run: cmdSiteGet},
 		{Name: "site create", Description: "Create a site", Run: cmdSiteCreate},
@@ -58,6 +59,7 @@ func AllCommands() []Command {
 
 		{Name: "machine list", Description: "List machines", Run: cmdMachineList},
 		{Name: "machine get", Description: "Get machine details", Run: cmdMachineGet},
+		{Name: "machine dpu get", Description: "Get DPU machines attached to a host machine", Run: cmdMachineDpuGet},
 
 		{Name: "operating-system list", Description: "List operating systems", Run: cmdOSList},
 		{Name: "operating-system get", Description: "Get operating system details", Run: cmdOSGet},
@@ -172,6 +174,7 @@ func AllCommands() []Command {
 		{Name: "env", Description: "Show NICO_* environment variables in use", Run: cmdEnv},
 		{Name: "help", Description: "Show available commands", Run: cmdHelp},
 	}
+	return appendGeneratedCommands(commands)
 }
 
 // LogCmd prints the equivalent cli one-liner for reference.
@@ -1095,10 +1098,6 @@ func cmdOSCreate(s *Session, _ []string) error {
 	if err != nil {
 		return err
 	}
-	isCloudInit, err := PromptConfirm("Cloud-init enabled?")
-	if err != nil {
-		return err
-	}
 	allowOverride, err := PromptConfirm("Allow override at instance creation?")
 	if err != nil {
 		return err
@@ -1111,7 +1110,6 @@ func cmdOSCreate(s *Session, _ []string) error {
 		"name":             name,
 		"tenantId":         tenantID,
 		"ipxeScript":       ipxeScript,
-		"isCloudInit":      isCloudInit,
 		"allowOverride":    allowOverride,
 		"phoneHomeEnabled": phoneHomeEnabled,
 	}
@@ -3053,6 +3051,24 @@ func cmdMachineGet(s *Session, args []string) error {
 	return printDetailJSON(os.Stdout, body)
 }
 
+// cmdMachineDpuGet prints the DPU machines attached to a host machine.
+func cmdMachineDpuGet(s *Session, args []string) error {
+	item, err := s.Resolver.ResolveWithArgs(context.Background(), "machine", "Machine", args)
+	if err != nil {
+		return err
+	}
+	LogCmd(s, "machine", "dpu get", item.ID)
+	body, _, err := s.Client.Do("GET", apiPath(s, "machine/{id}/dpu"), map[string]string{"id": item.ID}, nil, nil)
+	if err != nil {
+		return err
+	}
+	var dpus []json.RawMessage
+	if err := json.Unmarshal(body, &dpus); err == nil {
+		fmt.Fprintf(os.Stdout, "%d DPU(s) attached\n", len(dpus))
+	}
+	return printDetailJSON(os.Stdout, body)
+}
+
 // printMachineHealthSummary prints a human-readable summary of blocking
 // health alerts and tenant-usability state above the verbose JSON. Operators
 // triaging an Error-state machine should not have to scan multi-page JSON to
@@ -3804,7 +3820,7 @@ func cmdTenantIdentityTokenDelegationUpdate(s *Session, args []string) error {
 		if err != nil {
 			return err
 		}
-		sec, err := PromptText("clientSecretBasic.clientSecret (required, write-only)", true)
+		sec, err := PromptSecret("clientSecretBasic.clientSecret (required, write-only)", true)
 		if err != nil {
 			return err
 		}

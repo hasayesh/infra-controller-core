@@ -195,13 +195,13 @@ func (csh CreateSiteHandler) Handle(c echo.Context) error {
 		st = createdSite
 
 		// Create status detail
-		createdSSD, derr := sdDAO.CreateFromParams(ctx, tx, st.ID.String(), *cutil.GetPtr(cdbm.SiteStatusPending),
-			cutil.GetPtr("received site creation request, pending pairing"))
+		createdSSD, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: st.ID.String(), Status: *cutil.GetPtr(cdbm.SiteStatusPending), Message: cutil.GetPtr("received site creation request, pending pairing")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
+			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for Site", nil)
 		}
 		if createdSSD == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for Site", nil)
 		}
 		ssd = createdSSD
@@ -324,7 +324,7 @@ func (ush UpdateSiteHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve current user", nil)
 	}
 
-	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, ush.dbSession, org, dbUser, false, false)
+	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, ush.dbSession, org, dbUser, false, nil)
 	if apiErr != nil {
 		return c.JSON(apiErr.Code, apiErr)
 	}
@@ -522,15 +522,16 @@ func (ush UpdateSiteHandler) Handle(c echo.Context) error {
 
 		// Add Status Detail record if needed
 		if status != nil {
-			_, derr := sdDAO.CreateFromParams(ctx, tx, siteID.String(), *status, statusMessage)
+			_, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: siteID.String(), Status: *status, Message: statusMessage})
 			if derr != nil {
 				logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
+				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for Site", nil)
 			}
 		}
 
 		// Get status details (inside the tx for read-your-writes consistency
 		// with the StatusDetail created above)
-		details, _, derr := sdDAO.GetAllByEntityID(ctx, tx, siteID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+		details, _, derr := sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{siteID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Status Details for Site from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Status Details for Site", nil)
@@ -592,7 +593,7 @@ func (gsh GetSiteHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve current user", nil)
 	}
 
-	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, gsh.dbSession, org, dbUser, true, false)
+	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, gsh.dbSession, org, dbUser, true, nil)
 	if apiErr != nil {
 		return c.JSON(apiErr.Code, apiErr)
 	}
@@ -650,21 +651,12 @@ func (gsh GetSiteHandler) Handle(c echo.Context) error {
 		}
 
 		if !isAssociated {
-			// Check if Tenant is privileged
-			if tenant.Config != nil && tenant.Config.TargetedInstanceCreation {
-				taDAO := cdbm.NewTenantAccountDAO(gsh.dbSession)
-				tas, _, serr := taDAO.GetAll(ctx, nil, cdbm.TenantAccountFilterInput{
-					InfrastructureProviderID: &st.InfrastructureProviderID,
-					TenantIDs:                []uuid.UUID{tenant.ID},
-					Statuses:                 []string{cdbm.TenantAccountStatusReady},
-				}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
-				if serr != nil {
-					logger.Error().Err(serr).Msg("error retrieving Tenant Accounts for privileged Tenant")
-					return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant Accounts to determine access to Site, DB error", nil)
-				}
-
-				isAssociated = len(tas) > 0
+			enabled, serr := common.TenantHasTargetedInstanceCreation(ctx, nil, gsh.dbSession, tenant, &common.TenantPrivilegeScope{SiteID: &st.ID})
+			if serr != nil {
+				logger.Error().Err(serr).Msg("error resolving TargetedInstanceCreation for Tenant/Site")
+				return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to resolve Tenant capability for Site, DB error", nil)
 			}
+			isAssociated = enabled
 		}
 	}
 
@@ -756,7 +748,7 @@ func (gash GetAllSiteHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, errMsg, nil)
 	}
 
-	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, gash.dbSession, org, dbUser, true, false)
+	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, gash.dbSession, org, dbUser, true, nil)
 	if apiErr != nil {
 		return c.JSON(apiErr.Code, apiErr)
 	}
@@ -785,80 +777,72 @@ func (gash GetAllSiteHandler) Handle(c echo.Context) error {
 		}
 	}
 
-	// Check `includeMachineStats` in query
-	includeMachineStats := false
-	qims := c.QueryParam("includeMachineStats")
-	if qims != "" {
-		includeMachineStats, err = strconv.ParseBool(qims)
-		if err != nil {
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `includeMachineStats` query param", nil)
-		}
+	// Check `includeMachineStats` in query (absent is treated as false)
+	includeMachineStatsPtr, err := common.ParseOptionalBoolQueryParam(c, "includeMachineStats")
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `includeMachineStats` query param", nil)
 	}
+	includeMachineStats := includeMachineStatsPtr != nil && *includeMachineStatsPtr
 
+	// Check `includeGpuStats` in query (absent is treated as false)
+	includeGpuStatsPtr, err := common.ParseOptionalBoolQueryParam(c, "includeGpuStats")
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `includeGpuStats` query param", nil)
+	}
+	includeGpuStats := includeGpuStatsPtr != nil && *includeGpuStatsPtr
+
+	// Optional boolean site-config filters. A nil pointer means "not provided"
+	// (no filter); an explicit true/false filters on that value.
 	configFilter := cdbm.SiteConfigFilterInput{}
-	hasConfigFilter := false
 
-	// Check `isNativeNetworkingEnabled` in query
-	qinne := c.QueryParam("isNativeNetworkingEnabled")
-	if qinne != "" {
-		isnnEnabled, err := strconv.ParseBool(qinne)
-		if err != nil {
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isNativeNetworkingEnabled` query param", nil)
-		}
-		configFilter.NativeNetworking = &isnnEnabled
-		hasConfigFilter = true
+	configFilter.NativeNetworking, err = common.ParseOptionalBoolQueryParam(c, "isNativeNetworkingEnabled")
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isNativeNetworkingEnabled` query param", nil)
 	}
 
-	// Check `isNetworkSecurityGroupEnabled` in query
-	qie := c.QueryParam("isNetworkSecurityGroupEnabled")
-	if qie != "" {
-		isEnabled, err := strconv.ParseBool(qie)
-		if err != nil {
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isNativeNetworkingEnabled` query param", nil)
-		}
-		configFilter.NetworkSecurityGroup = &isEnabled
-		hasConfigFilter = true
+	configFilter.NetworkSecurityGroup, err = common.ParseOptionalBoolQueryParam(c, "isNetworkSecurityGroupEnabled")
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isNetworkSecurityGroupEnabled` query param", nil)
 	}
 
-	// Check `isNVLinkPartitionEnabled` in query
-	qinlpe := c.QueryParam("isNVLinkPartitionEnabled")
-	if qinlpe != "" {
-		isEnabled, err := strconv.ParseBool(qinlpe)
-		if err != nil {
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isNVLinkPartitionEnabled` query param", nil)
-		}
-		configFilter.NVLinkPartition = &isEnabled
-		hasConfigFilter = true
+	configFilter.NVLinkPartition, err = common.ParseOptionalBoolQueryParam(c, "isNVLinkPartitionEnabled")
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isNVLinkPartitionEnabled` query param", nil)
 	}
 
-	// Check `isFlowEnabled` in query
-	qirlae := c.QueryParam("isFlowEnabled")
-	if qirlae != "" {
-		isEnabled, err := strconv.ParseBool(qirlae)
-		if err != nil {
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isFlowEnabled` query param", nil)
-		}
-		configFilter.Flow = &isEnabled
-		hasConfigFilter = true
+	configFilter.Flow, err = common.ParseOptionalBoolQueryParam(c, "isFlowEnabled")
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid value specified for `isFlowEnabled` query param", nil)
 	}
 
-	if hasConfigFilter {
+	if configFilter.NativeNetworking != nil || configFilter.NetworkSecurityGroup != nil ||
+		configFilter.NVLinkPartition != nil || configFilter.Flow != nil {
 		filter.Config = &configFilter
+	}
+
+	// Machine and GPU stats are Provider-only; gate once if either is requested.
+	if (includeMachineStats || includeGpuStats) && provider == nil {
+		logger.Warn().Msg("`includeMachineStats`/`includeGpuStats` are only permitted with Provider Admin role")
+		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "User must have Provider Admin role to request `includeMachineStats` or `includeGpuStats`", nil)
 	}
 
 	// Get machine stats if requested
 	var machineStats map[uuid.UUID]*model.APISiteMachineStats
-
 	if includeMachineStats {
-		if provider == nil {
-			logger.Warn().Msg("`includeMachineStats` is only permitted with Provider Admin role")
-			return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "User must have Provider Admin role to request `includeMachineStats`", nil)
-		}
-
 		machineStats, err = common.GetSiteMachineCountStats(ctx, nil, gash.dbSession, logger, &provider.ID, nil)
 		if err != nil {
 			logger.Error().Err(err).Msg("unable to request Machine stats for Site")
 			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Unable to request Machine stats for Site", nil)
+		}
+	}
+
+	// Get GPU stats if requested
+	var gpuStats map[uuid.UUID][]model.APIMachineGPUStats
+	if includeGpuStats {
+		gpuStats, err = common.GetSiteGPUStats(ctx, nil, gash.dbSession, logger, &provider.ID, nil)
+		if err != nil {
+			logger.Error().Err(err).Msg("error retrieving GPU stats by site")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Error retrieving GPU stats by site", nil)
 		}
 	}
 
@@ -894,34 +878,15 @@ func (gash GetAllSiteHandler) Handle(c echo.Context) error {
 			tsMap[ts.SiteID] = &ts
 		}
 
-		// If Tenant is privileged (has TargetedInstanceCreation capability),
-		// also retrieve all Sites from Providers they have a Tenant Account with
-		if tenant.Config != nil && tenant.Config.TargetedInstanceCreation {
-			taDAO := cdbm.NewTenantAccountDAO(gash.dbSession)
-			tas, _, serr := taDAO.GetAll(ctx, nil, cdbm.TenantAccountFilterInput{
-				TenantIDs: []uuid.UUID{tenant.ID},
-				Statuses:  []string{cdbm.TenantAccountStatusReady},
-			}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
-			if serr != nil {
-				logger.Error().Err(serr).Msg("error retrieving Tenant Accounts for privileged Tenant")
-				return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant Accounts", nil)
-			}
-
-			if len(tas) > 0 {
-				providerIDs := make([]uuid.UUID, 0, len(tas))
-				for _, ta := range tas {
-					providerIDs = append(providerIDs, ta.InfrastructureProviderID)
-				}
-
-				providerSites, _, serr := stDAO.GetAll(ctx, nil, cdbm.SiteFilterInput{InfrastructureProviderIDs: providerIDs}, paginator.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
-				if serr != nil {
-					logger.Error().Err(serr).Msg("error retrieving Sites for Providers from Tenant Accounts")
-					return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Sites for one or more Providers", nil)
-				}
-				for _, site := range providerSites {
-					siteIDs.Add(site.ID)
-				}
-			}
+		// Add the Sites where the Tenant has effective TargetedInstanceCreation,
+		// honoring per-site TenantSite.config overrides.
+		privilegedSiteIDs, serr := common.GetPrivilegedAccessSiteIDsForTenant(ctx, nil, gash.dbSession, tenant)
+		if serr != nil {
+			logger.Error().Err(serr).Msg("error resolving privileged Site access for Tenant")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to resolve Tenant capability, DB error", nil)
+		}
+		for _, siteID := range privilegedSiteIDs {
+			siteIDs.Add(siteID)
 		}
 	}
 
@@ -960,6 +925,15 @@ func (gash GetAllSiteHandler) Handle(c echo.Context) error {
 		apiSite := model.NewAPISite(site, ssdMap[site.ID.String()], tsMap[site.ID])
 		// Attach machine stats for the site if they exist.
 		apiSite.MachineStats = machineStats[site.ID]
+		// Attach GPU stats when requested. Sites with no GPUs get an empty
+		// array (not null), matching the single-site GPU stats endpoint.
+		if includeGpuStats {
+			siteGpuStats := gpuStats[site.ID]
+			if siteGpuStats == nil {
+				siteGpuStats = []model.APIMachineGPUStats{}
+			}
+			apiSite.GpuStats = &siteGpuStats
+		}
 		apiSites = append(apiSites, apiSite)
 	}
 
@@ -1144,7 +1118,7 @@ func (dsh DeleteSiteHandler) Handle(c echo.Context) error {
 	// Create response
 	logger.Info().Msg("finishing API handler")
 
-	return c.String(http.StatusAccepted, "Deletion request was accepted")
+	return c.JSON(http.StatusAccepted, model.NewAPIDeletionAcceptedResponse())
 }
 
 // GetSiteStatusDetailsHandler is the API Handler for getting Site StatusDetail records
@@ -1181,7 +1155,7 @@ func (gssdh GetSiteStatusDetailsHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve current user", nil)
 	}
 
-	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, gssdh.dbSession, org, dbUser, true, false)
+	provider, tenant, apiErr := common.IsProviderOrTenant(ctx, logger, gssdh.dbSession, org, dbUser, true, nil)
 	if apiErr != nil {
 		return c.JSON(apiErr.Code, apiErr)
 	}
@@ -1225,21 +1199,12 @@ func (gssdh GetSiteStatusDetailsHandler) Handle(c echo.Context) error {
 		}
 
 		if !isAssociated {
-			// Check if Tenant is privileged
-			if tenant.Config != nil && tenant.Config.TargetedInstanceCreation {
-				taDAO := cdbm.NewTenantAccountDAO(gssdh.dbSession)
-				tas, _, serr := taDAO.GetAll(ctx, nil, cdbm.TenantAccountFilterInput{
-					InfrastructureProviderID: &st.InfrastructureProviderID,
-					TenantIDs:                []uuid.UUID{tenant.ID},
-					Statuses:                 []string{cdbm.TenantAccountStatusReady},
-				}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
-				if serr != nil {
-					logger.Error().Err(serr).Msg("error retrieving Tenant Accounts for privileged Tenant")
-					return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant Accounts to determine access to Site, DB error", nil)
-				}
-
-				isAssociated = len(tas) > 0
+			enabled, serr := common.TenantHasTargetedInstanceCreation(ctx, nil, gssdh.dbSession, tenant, &common.TenantPrivilegeScope{SiteID: &st.ID})
+			if serr != nil {
+				logger.Error().Err(serr).Msg("error resolving TargetedInstanceCreation for Tenant/Site")
+				return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to resolve Tenant capability for Site, DB error", nil)
 			}
+			isAssociated = enabled
 		}
 	}
 

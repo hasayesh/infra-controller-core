@@ -17,8 +17,9 @@
 
 use std::time::Duration;
 
+use tokio_stream::StreamExt;
 use tonic::metadata::MetadataMap;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Extensions, Request};
 
 use super::proto::g_nmi_client::GNmiClient as TonicGnmiClient;
@@ -28,10 +29,10 @@ use super::proto::{
     SubscriptionMode,
 };
 use crate::HealthError;
-use crate::config::NvueGnmiPaths;
+use crate::config::{MtlsProfileConfig, NvueGnmiPaths};
 
-pub fn nvue_subscribe_paths(paths_config: &NvueGnmiPaths) -> Vec<Path> {
-    let mut paths = Vec::with_capacity(2);
+pub(super) fn nvue_subscribe_paths(paths_config: &NvueGnmiPaths) -> Vec<Path> {
+    let mut paths = Vec::with_capacity(4);
     if paths_config.components_enabled {
         paths.push(Path {
             elem: vec![
@@ -62,35 +63,123 @@ pub fn nvue_subscribe_paths(paths_config: &NvueGnmiPaths) -> Vec<Path> {
             ..Default::default()
         });
     }
+    if paths_config.platform_general_enabled {
+        // `/platform-general/state` carries the memory and disk
+        // utilization leaves
+        paths.push(Path {
+            elem: vec![
+                PathElem {
+                    name: "platform-general".into(),
+                    key: Default::default(),
+                },
+                PathElem {
+                    name: "state".into(),
+                    key: Default::default(),
+                },
+            ],
+            ..Default::default()
+        });
+        // `/platform-general/versions` carries the OS/BMC/EROT
+        // firmware version leaves
+        paths.push(Path {
+            elem: vec![
+                PathElem {
+                    name: "platform-general".into(),
+                    key: Default::default(),
+                },
+                PathElem {
+                    name: "versions".into(),
+                    key: Default::default(),
+                },
+            ],
+            ..Default::default()
+        });
+    }
     paths
 }
 
 #[derive(Clone)]
-pub struct GnmiClient {
+pub(super) struct GnmiClient {
     switch_id: String,
     host: String,
     port: u16,
     username: Option<String>,
     password: Option<String>,
     request_timeout: Duration,
+    dangerously_skip_tls_verification: bool,
+    tls_config: Option<MtlsProfileConfig>,
+}
+
+/// Configuration used to build one gNMI client instance.
+pub(super) struct GnmiClientConfig {
+    /// Switch identifier used in logs and error messages.
+    pub switch_id: String,
+
+    /// Switch host or IP address used for the gNMI channel.
+    pub host: String,
+
+    /// gNMI TCP port on the switch host.
+    pub port: u16,
+
+    /// Optional username sent as gNMI `username` metadata.
+    pub username: Option<String>,
+
+    /// Optional password sent as gNMI `password` metadata.
+    pub password: Option<String>,
+
+    /// Timeout applied to gNMI connection and RPC operations.
+    pub request_timeout: Duration,
+
+    /// Whether legacy non-mTLS connections accept invalid switch certificates.
+    pub dangerously_skip_tls_verification: bool,
+
+    /// mTLS profile used when opening the gNMI channel.
+    pub tls_config: Option<MtlsProfileConfig>,
+}
+
+async fn configure_tls_endpoint(
+    endpoint: Endpoint,
+    switch_id: &str,
+    dangerously_skip_tls_verification: bool,
+    tls_config: Option<&MtlsProfileConfig>,
+) -> Result<Endpoint, HealthError> {
+    if let Some(config) = tls_config {
+        // mTLS config supplies both trust roots and client identity. Use it as
+        // the complete TLS policy for this channel.
+        let tls_config = crate::tls::tonic_tls_config(config).await?;
+
+        return endpoint.tls_config(tls_config).map_err(|e| {
+            HealthError::GnmiError(format!("switch {switch_id}: invalid gNMI TLS config: {e}"))
+        });
+    }
+
+    if !dangerously_skip_tls_verification {
+        return Ok(endpoint);
+    }
+
+    // Use tonic's verifier hook (https endpoints get a strict verifier
+    // otherwise). No roots on ClientTlsConfig — roots + verifier is an error.
+    endpoint
+        .tls_config_with_verifier(
+            ClientTlsConfig::new(),
+            crate::collectors::nvue::tls::accept_any_cert_verifier(),
+        )
+        .map_err(|e| {
+            HealthError::GnmiError(format!("switch {switch_id}: invalid gNMI TLS config: {e}"))
+        })
 }
 
 impl GnmiClient {
-    pub fn new(
-        switch_id: String,
-        host: &str,
-        port: u16,
-        username: Option<String>,
-        password: Option<String>,
-        request_timeout: Duration,
-    ) -> Self {
+    pub(super) fn new(config: GnmiClientConfig) -> Self {
         Self {
-            switch_id,
-            host: host.to_string(),
-            port,
-            username,
-            password,
-            request_timeout,
+            switch_id: config.switch_id,
+            host: config.host,
+            port: config.port,
+            username: config.username,
+            password: config.password,
+            request_timeout: config.request_timeout,
+            dangerously_skip_tls_verification: config.dangerously_skip_tls_verification,
+            tls_config: config.tls_config,
         }
     }
 
@@ -109,38 +198,42 @@ impl GnmiClient {
                 ))
             })?;
 
-        let endpoint = Endpoint::from(uri)
-            .connect_timeout(self.request_timeout)
-            .timeout(self.request_timeout);
+        let endpoint = configure_tls_endpoint(
+            Endpoint::from(uri),
+            &self.switch_id,
+            self.dangerously_skip_tls_verification,
+            self.tls_config.as_ref(),
+        )
+        .await?
+        .connect_timeout(self.request_timeout)
+        .timeout(self.request_timeout);
 
-        let tls_config = crate::collectors::nvue::tls::self_signed_tls_config();
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_only()
-            .enable_http2()
-            .build();
+        let channel = endpoint.connect().await.map_err(|e| {
+            HealthError::GnmiError(format!(
+                "switch {}: connection failed to {target}: {e}",
+                self.switch_id
+            ))
+        })?;
 
-        let channel = endpoint
-            .connect_with_connector(connector)
-            .await
-            .map_err(|e| {
-                HealthError::GnmiError(format!(
-                    "switch {}: connection failed to {target}: {e}",
-                    self.switch_id
-                ))
-            })?;
-
-        tracing::debug!(
-            switch_id = %self.switch_id,
-            target = %target,
-            "gNMI TLS channel established (skip-verify)"
-        );
+        if self.dangerously_skip_tls_verification {
+            tracing::debug!(
+                switch_id = %self.switch_id,
+                target = %target,
+                "gNMI TLS channel established with certificate verification disabled"
+            );
+        } else {
+            tracing::debug!(
+                switch_id = %self.switch_id,
+                target = %target,
+                "gNMI TLS channel established"
+            );
+        }
 
         Ok(TonicGnmiClient::new(channel))
     }
 
     /// open a gNMI SAMPLE streaming subscription
-    pub async fn subscribe_sample(
+    pub(super) async fn subscribe_sample(
         &self,
         paths: &[Path],
         sample_interval_nanos: u64,
@@ -150,7 +243,9 @@ impl GnmiClient {
         let subscribe_request = build_sample_subscribe_request(paths, sample_interval_nanos);
 
         let auth = build_auth_metadata(&self.username, &self.password)?;
-        let stream = tokio_stream::once(subscribe_request);
+
+        let stream = tokio_stream::once(subscribe_request).chain(tokio_stream::pending());
+
         let request = Request::from_parts(auth, Extensions::default(), stream);
 
         let response = client
@@ -160,7 +255,7 @@ impl GnmiClient {
 
         tracing::debug!(
             switch_id = %self.switch_id,
-            sample_interval_nanos,
+            sample_interval_nanoseconds = sample_interval_nanos,
             "gNMI SAMPLE stream opened"
         );
 
@@ -168,7 +263,7 @@ impl GnmiClient {
     }
 
     /// open a gNMI ON_CHANGE streaming subscription
-    pub async fn subscribe_on_change(
+    pub(super) async fn subscribe_on_change(
         &self,
         prefix: &Path,
         paths: &[Path],
@@ -178,7 +273,9 @@ impl GnmiClient {
         let subscribe_request = build_on_change_subscribe_request(prefix, paths);
 
         let auth = build_auth_metadata(&self.username, &self.password)?;
-        let stream = tokio_stream::once(subscribe_request);
+
+        let stream = tokio_stream::once(subscribe_request).chain(tokio_stream::pending());
+
         let request = Request::from_parts(auth, Extensions::default(), stream);
 
         let response = client
@@ -288,7 +385,7 @@ fn build_auth_metadata(
 /// Extract a string from a `TypedValue`, handling JSON-encoded bytes as well
 /// as native string values.
 #[allow(deprecated)]
-pub fn typed_value_to_string(val: &proto::TypedValue) -> Option<String> {
+pub(super) fn typed_value_to_string(val: &proto::TypedValue) -> Option<String> {
     use proto::typed_value::Value;
     match &val.value {
         Some(Value::StringVal(s)) => Some(s.clone()),
@@ -310,7 +407,7 @@ pub fn typed_value_to_string(val: &proto::TypedValue) -> Option<String> {
 /// Extract a float from a `TypedValue`, handling JSON-encoded bytes, native
 /// numeric values, and string representations.
 #[allow(deprecated)]
-pub fn typed_value_to_f64(val: &proto::TypedValue) -> Option<f64> {
+pub(super) fn typed_value_to_f64(val: &proto::TypedValue) -> Option<f64> {
     use proto::typed_value::Value;
     match &val.value {
         Some(Value::DoubleVal(v)) => Some(*v),
@@ -328,149 +425,387 @@ pub fn typed_value_to_f64(val: &proto::TypedValue) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::{Check, check_values};
+
     use super::*;
 
-    #[test]
-    fn test_typed_value_to_string_string_val() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::StringVal("healthy".to_string())),
-        };
-        assert_eq!(typed_value_to_string(&val), Some("healthy".to_string()));
+    #[derive(Debug, PartialEq)]
+    enum AuthProjection {
+        Metadata {
+            username: Option<String>,
+            password: Option<String>,
+        },
+        InvalidUsername,
+        InvalidPassword,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ValueProjection {
+        as_string: Option<String>,
+        as_f64: Option<f64>,
+    }
+
+    struct AuthInput {
+        username: Option<String>,
+        password: Option<String>,
     }
 
     #[test]
-    fn test_typed_value_to_string_json_val() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::JsonVal(b"\"degraded\"".to_vec())),
-        };
-        assert_eq!(typed_value_to_string(&val), Some("degraded".to_string()));
+    #[allow(deprecated)]
+    fn typed_value_projection_cases() {
+        use proto::typed_value::Value;
+
+        check_values(
+            [
+                Check {
+                    scenario: "absent value",
+                    input: proto::TypedValue { value: None },
+                    expect: ValueProjection {
+                        as_string: None,
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "native non-numeric string",
+                    input: proto::TypedValue {
+                        value: Some(Value::StringVal("healthy".to_string())),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("healthy".to_string()),
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "native numeric string",
+                    input: proto::TypedValue {
+                        value: Some(Value::StringVal("1.23".to_string())),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("1.23".to_string()),
+                        as_f64: Some(1.23),
+                    },
+                },
+                Check {
+                    scenario: "quoted non-numeric JSON",
+                    input: proto::TypedValue {
+                        value: Some(Value::JsonVal(b"\"degraded\"".to_vec())),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("degraded".to_string()),
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "quoted numeric JSON",
+                    input: proto::TypedValue {
+                        value: Some(Value::JsonVal(b"\"1.5e-3\"".to_vec())),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("1.5e-3".to_string()),
+                        as_f64: Some(0.0015),
+                    },
+                },
+                Check {
+                    scenario: "unquoted numeric JSON",
+                    input: proto::TypedValue {
+                        value: Some(Value::JsonVal(b"99.9".to_vec())),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("99.9".to_string()),
+                        as_f64: Some(99.9),
+                    },
+                },
+                Check {
+                    scenario: "IETF JSON",
+                    input: proto::TypedValue {
+                        value: Some(Value::JsonIetfVal(b"6.25".to_vec())),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("6.25".to_string()),
+                        as_f64: Some(6.25),
+                    },
+                },
+                Check {
+                    scenario: "ASCII",
+                    input: proto::TypedValue {
+                        value: Some(Value::AsciiVal("port-up".to_string())),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("port-up".to_string()),
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "signed integer",
+                    input: proto::TypedValue {
+                        value: Some(Value::IntVal(-5)),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("-5".to_string()),
+                        as_f64: Some(-5.0),
+                    },
+                },
+                Check {
+                    scenario: "unsigned integer",
+                    input: proto::TypedValue {
+                        value: Some(Value::UintVal(100)),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("100".to_string()),
+                        as_f64: Some(100.0),
+                    },
+                },
+                Check {
+                    scenario: "Boolean",
+                    input: proto::TypedValue {
+                        value: Some(Value::BoolVal(true)),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("true".to_string()),
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "float",
+                    input: proto::TypedValue {
+                        value: Some(Value::FloatVal(1.25)),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("1.25".to_string()),
+                        as_f64: Some(1.25),
+                    },
+                },
+                Check {
+                    scenario: "double",
+                    input: proto::TypedValue {
+                        value: Some(Value::DoubleVal(42.5)),
+                    },
+                    expect: ValueProjection {
+                        as_string: Some("42.5".to_string()),
+                        as_f64: Some(42.5),
+                    },
+                },
+                Check {
+                    scenario: "unsupported bytes",
+                    input: proto::TypedValue {
+                        value: Some(Value::BytesVal(vec![0, 1])),
+                    },
+                    expect: ValueProjection {
+                        as_string: None,
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "unsupported decimal",
+                    input: proto::TypedValue {
+                        value: Some(Value::DecimalVal(proto::Decimal64 {
+                            digits: 125,
+                            precision: 2,
+                        })),
+                    },
+                    expect: ValueProjection {
+                        as_string: None,
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "unsupported leaf list",
+                    input: proto::TypedValue {
+                        value: Some(Value::LeaflistVal(proto::ScalarArray {
+                            element: Vec::new(),
+                        })),
+                    },
+                    expect: ValueProjection {
+                        as_string: None,
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "unsupported arbitrary protobuf",
+                    input: proto::TypedValue {
+                        value: Some(Value::AnyVal(prost_types::Any {
+                            type_url: "type.googleapis.com/example.Value".to_string(),
+                            value: vec![0, 1],
+                        })),
+                    },
+                    expect: ValueProjection {
+                        as_string: None,
+                        as_f64: None,
+                    },
+                },
+                Check {
+                    scenario: "unsupported protobuf bytes",
+                    input: proto::TypedValue {
+                        value: Some(Value::ProtoBytes(vec![0, 1])),
+                    },
+                    expect: ValueProjection {
+                        as_string: None,
+                        as_f64: None,
+                    },
+                },
+            ],
+            |value| ValueProjection {
+                as_string: typed_value_to_string(&value),
+                as_f64: typed_value_to_f64(&value),
+            },
+        );
     }
 
     #[test]
-    fn test_typed_value_to_string_json_unquoted() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::JsonVal(b"42".to_vec())),
-        };
-        assert_eq!(typed_value_to_string(&val), Some("42".to_string()));
+    fn auth_metadata_cases() {
+        check_values(
+            [
+                Check {
+                    scenario: "no credentials",
+                    input: AuthInput {
+                        username: None,
+                        password: None,
+                    },
+                    expect: AuthProjection::Metadata {
+                        username: None,
+                        password: None,
+                    },
+                },
+                Check {
+                    scenario: "username only",
+                    input: AuthInput {
+                        username: Some("admin".to_string()),
+                        password: None,
+                    },
+                    expect: AuthProjection::Metadata {
+                        username: Some("admin".to_string()),
+                        password: None,
+                    },
+                },
+                Check {
+                    scenario: "password only",
+                    input: AuthInput {
+                        username: None,
+                        password: Some("secret".to_string()),
+                    },
+                    expect: AuthProjection::Metadata {
+                        username: None,
+                        password: Some("secret".to_string()),
+                    },
+                },
+                Check {
+                    scenario: "username and password",
+                    input: AuthInput {
+                        username: Some("admin".to_string()),
+                        password: Some("secret".to_string()),
+                    },
+                    expect: AuthProjection::Metadata {
+                        username: Some("admin".to_string()),
+                        password: Some("secret".to_string()),
+                    },
+                },
+                Check {
+                    scenario: "invalid username",
+                    input: AuthInput {
+                        username: Some("bad\nusername".to_string()),
+                        password: Some("secret".to_string()),
+                    },
+                    expect: AuthProjection::InvalidUsername,
+                },
+                Check {
+                    scenario: "invalid password is redacted",
+                    input: AuthInput {
+                        username: Some("admin".to_string()),
+                        password: Some("bad\npassword".to_string()),
+                    },
+                    expect: AuthProjection::InvalidPassword,
+                },
+            ],
+            |AuthInput { username, password }| match build_auth_metadata(&username, &password) {
+                Ok(metadata) => {
+                    let get = |key| {
+                        metadata.get(key).map(|value| {
+                            value
+                                .to_str()
+                                .expect("test metadata should be visible ASCII")
+                                .to_string()
+                        })
+                    };
+                    AuthProjection::Metadata {
+                        username: get("username"),
+                        password: get("password"),
+                    }
+                }
+                Err(HealthError::GnmiError(message))
+                    if message.starts_with("invalid username for gRPC metadata:") =>
+                {
+                    AuthProjection::InvalidUsername
+                }
+                Err(HealthError::GnmiError(message))
+                    if message == "invalid password for gRPC metadata" =>
+                {
+                    AuthProjection::InvalidPassword
+                }
+                Err(error) => panic!("unexpected authentication metadata error: {error}"),
+            },
+        );
     }
 
     #[test]
-    fn test_typed_value_to_string_int() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::IntVal(-5)),
-        };
-        assert_eq!(typed_value_to_string(&val), Some("-5".to_string()));
-    }
-
-    #[test]
-    fn test_typed_value_to_string_uint() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::UintVal(100)),
-        };
-        assert_eq!(typed_value_to_string(&val), Some("100".to_string()));
-    }
-
-    #[test]
-    fn test_typed_value_to_string_bool() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::BoolVal(true)),
-        };
-        assert_eq!(typed_value_to_string(&val), Some("true".to_string()));
-    }
-
-    #[test]
-    fn test_typed_value_to_string_none() {
-        let val = proto::TypedValue { value: None };
-        assert_eq!(typed_value_to_string(&val), None);
-    }
-
-    #[test]
-    fn test_typed_value_to_f64_double() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::DoubleVal(42.5)),
-        };
-        assert_eq!(typed_value_to_f64(&val), Some(42.5));
-    }
-
-    #[test]
-    fn test_typed_value_to_f64_int() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::IntVal(42)),
-        };
-        assert_eq!(typed_value_to_f64(&val), Some(42.0));
-    }
-
-    #[test]
-    fn test_typed_value_to_f64_json_string() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::JsonVal(b"\"1.5e-3\"".to_vec())),
-        };
-        assert_eq!(typed_value_to_f64(&val), Some(0.0015));
-    }
-
-    #[test]
-    fn test_typed_value_to_f64_json_number() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::JsonVal(b"99.9".to_vec())),
-        };
-        assert_eq!(typed_value_to_f64(&val), Some(99.9));
-    }
-
-    #[test]
-    fn test_typed_value_to_f64_string() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::StringVal("1.23".to_string())),
-        };
-        assert_eq!(typed_value_to_f64(&val), Some(1.23));
-    }
-
-    #[test]
-    fn test_typed_value_to_f64_non_numeric_string() {
-        let val = proto::TypedValue {
-            value: Some(proto::typed_value::Value::StringVal("hello".to_string())),
-        };
-        assert_eq!(typed_value_to_f64(&val), None);
-    }
-
-    #[test]
-    fn test_typed_value_to_f64_none() {
-        let val = proto::TypedValue { value: None };
-        assert_eq!(typed_value_to_f64(&val), None);
-    }
-
-    #[test]
-    fn test_nvue_subscribe_paths_all_enabled() {
-        let paths = nvue_subscribe_paths(&NvueGnmiPaths::default());
-        assert_eq!(paths.len(), 2);
-
-        assert_eq!(paths[0].elem.len(), 2);
-        assert_eq!(paths[0].elem[0].name, "components");
-        assert_eq!(paths[0].elem[1].name, "component");
-
-        assert_eq!(paths[1].elem.len(), 2);
-        assert_eq!(paths[1].elem[0].name, "interfaces");
-        assert_eq!(paths[1].elem[1].name, "interface");
-    }
-
-    #[test]
-    fn test_nvue_subscribe_paths_selective() {
-        let paths = nvue_subscribe_paths(&NvueGnmiPaths {
-            components_enabled: false,
-            interfaces_enabled: true,
-        });
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].elem.len(), 2);
-        assert_eq!(paths[0].elem[0].name, "interfaces");
-        assert_eq!(paths[0].elem[1].name, "interface");
-    }
-
-    #[test]
-    fn test_nvue_subscribe_paths_none_enabled() {
-        let paths = nvue_subscribe_paths(&NvueGnmiPaths {
-            components_enabled: false,
-            interfaces_enabled: false,
-        });
-        assert!(paths.is_empty());
+    fn nvue_subscribe_path_cases() {
+        check_values(
+            [
+                Check {
+                    scenario: "all path groups",
+                    input: NvueGnmiPaths::default(),
+                    expect: "components/component,interfaces/interface,platform-general/state,platform-general/versions".to_string(),
+                },
+                Check {
+                    scenario: "components only",
+                    input: NvueGnmiPaths {
+                        components_enabled: true,
+                        interfaces_enabled: false,
+                        platform_general_enabled: false,
+                    },
+                    expect: "components/component".to_string(),
+                },
+                Check {
+                    scenario: "interfaces only",
+                    input: NvueGnmiPaths {
+                        components_enabled: false,
+                        interfaces_enabled: true,
+                        platform_general_enabled: false,
+                    },
+                    expect: "interfaces/interface".to_string(),
+                },
+                Check {
+                    scenario: "platform general only",
+                    input: NvueGnmiPaths {
+                        components_enabled: false,
+                        interfaces_enabled: false,
+                        platform_general_enabled: true,
+                    },
+                    expect: "platform-general/state,platform-general/versions".to_string(),
+                },
+                Check {
+                    scenario: "no path groups",
+                    input: NvueGnmiPaths {
+                        components_enabled: false,
+                        interfaces_enabled: false,
+                        platform_general_enabled: false,
+                    },
+                    expect: String::new(),
+                },
+            ],
+            |config| {
+                nvue_subscribe_paths(&config)
+                    .into_iter()
+                    .map(|path| {
+                        path.elem
+                            .into_iter()
+                            .map(|elem| elem.name)
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
+        );
     }
 
     #[test]
@@ -499,7 +834,7 @@ mod tests {
         let prefix = sub_list.prefix.expect("prefix must be set");
         assert_eq!(prefix.target, "nvos", "target must be nvos");
 
-        assert_eq!(sub_list.subscription.len(), 2);
+        assert_eq!(sub_list.subscription.len(), 4);
         for sub in &sub_list.subscription {
             assert_eq!(
                 sub.mode,
@@ -512,24 +847,6 @@ mod tests {
             );
             assert!(sub.path.is_some(), "each subscription must have a path");
         }
-    }
-
-    #[test]
-    fn test_system_events_prefix() {
-        let prefix = system_events_prefix();
-        assert_eq!(prefix.target, "nvos");
-        assert_eq!(prefix.elem.len(), 1);
-        assert_eq!(prefix.elem[0].name, "system-events");
-    }
-
-    #[test]
-    fn test_system_events_subscribe_path() {
-        let paths = system_events_subscribe_path();
-        assert_eq!(paths.len(), 1);
-        assert!(
-            paths[0].elem.is_empty(),
-            "empty path subscribes to all events under prefix"
-        );
     }
 
     #[test]
@@ -566,6 +883,13 @@ mod tests {
             sub_list.subscription[0].mode,
             i32::from(SubscriptionMode::OnChange),
             "subscription must use OnChange mode"
+        );
+        assert!(
+            sub_list.subscription[0]
+                .path
+                .as_ref()
+                .is_some_and(|path| path.elem.is_empty()),
+            "empty path subscribes to all events under prefix"
         );
     }
 }

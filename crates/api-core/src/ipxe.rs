@@ -33,20 +33,20 @@ use sqlx::PgConnection;
 
 use crate::CarbideError;
 
-pub struct PxeInstructionRequest {
-    pub arch: rpc::MachineArchitecture,
-    pub product: Option<String>,
-    pub client_ip: IpAddr,
+pub(crate) struct PxeInstructionRequest {
+    pub(crate) arch: rpc::MachineArchitecture,
+    pub(crate) product: Option<String>,
+    pub(crate) client_ip: IpAddr,
 }
 
 /// Input provided to `PxeInstructions::get_pxe_instructions`.
 /// The PxeInstructionsRequest model contains the client_ip
 /// as determined by carbide-pxe, whereas PxeInstructionsInput
 /// contains the resolved machine_interface_id.
-pub struct PxeInstructionsInput {
-    pub interface_id: MachineInterfaceId,
-    pub arch: rpc::MachineArchitecture,
-    pub product: Option<String>,
+pub(crate) struct PxeInstructionsInput {
+    pub(crate) interface_id: MachineInterfaceId,
+    pub(crate) arch: rpc::MachineArchitecture,
+    pub(crate) product: Option<String>,
 }
 
 impl TryFrom<rpc::PxeInstructionRequest> for PxeInstructionRequest {
@@ -148,17 +148,17 @@ fn operating_system_row_to_ipxe_script(
         name: row.name.clone(),
         description: row.description.clone(),
         hash: row.ipxe_definition_hash.clone().unwrap_or_default(),
-        tenant_id: Some(row.org.clone()),
+        tenant_id: row.org.clone(),
         ipxe_template_id,
         parameters,
         artifacts,
     })
 }
 
-pub struct PxeInstructions;
+pub(crate) struct PxeInstructions;
 
 #[derive(serde::Serialize)]
-pub struct InstructionGenerator {
+struct InstructionGenerator {
     kernel: String,
     command_line: String,
     initrd: Option<String>,
@@ -200,7 +200,10 @@ impl PxeInstructions {
         machine_type: MachineType,
     ) -> String {
         tracing::info!(
-            "machine_type: {machine_type}; machine interface ID: {machine_interface_id}; mac address: {mac_address}"
+            machine_type = %machine_type,
+            machine_interface_id = %machine_interface_id,
+            mac_address = %mac_address,
+            "machine network boot parameters",
         );
         match arch {
             rpc::MachineArchitecture::Arm => {
@@ -266,10 +269,10 @@ impl PxeInstructions {
 
         renderer
             .render(ipxeos, &reserved_params)
-            .map_err(|e| CarbideError::internal(format!("Failed to render iPXE script: {}", e)))
+            .map_err(|e| CarbideError::internal(format!("failed to render iPXE script: {}", e)))
     }
 
-    pub async fn get_pxe_instructions(
+    pub(crate) async fn get_pxe_instructions(
         txn: &mut PgConnection,
         target: PxeInstructionsInput,
     ) -> Result<String, CarbideError> {
@@ -342,9 +345,9 @@ exit ||
                     ));
                 } else {
                     tracing::warn!(
-                        "Unsupported DPU type. Product is '{}', but architecture is {:?}",
-                        product,
-                        target.arch,
+                        product = %product,
+                        arch = ?target.arch,
+                        "Unsupported DPU type",
                     )
                 }
             };
@@ -353,8 +356,7 @@ exit ||
             // use:
             // - If we don't have an exploration report for this MAC address, don't PXE boot at all
             // - If it's X86 and we have an exploration report, assume it's a Host.
-            // - If it's ARM and we have an exploration report, check if the report is a bluefield
-            //   model.
+            // - If it's ARM, only treat it as a DPU when the explored endpoint is itself a DPU BMC.
             let Some(endpoint) =
                 db::explored_endpoints::find_by_mac_address(&mut *txn, interface.mac_address)
                     .await?
@@ -363,14 +365,14 @@ exit ||
             else {
                 // This only happens if someone powered on a host manually before we ingested it,
                 // which is unlikely but possible.
-                tracing::info!(interface = ?interface, "Request for PXE instructions for unknown interface, skipping PXE boot");
+                tracing::info!(machine_interface = ?interface, "Request for PXE instructions for unknown interface, skipping PXE boot");
                 return Ok(UNKNOWN_HOST_INSTRUCTIONS.to_string());
             };
 
             let (machine_type, console) = match target.arch {
                 rpc::MachineArchitecture::X86 => (MachineType::PredictedHost, console),
                 rpc::MachineArchitecture::Arm => {
-                    if endpoint.is_bluefield_model() {
+                    if endpoint.report.is_dpu() {
                         (MachineType::Dpu, console)
                     } else {
                         (MachineType::PredictedHost, "ttyAMA0")
@@ -389,12 +391,12 @@ exit ||
 
         let machine = db::machine::find_one(&mut *txn, &machine_id, MachineSearchConfig::default())
             .await
-            .map_err(|e| CarbideError::InvalidArgument(format!("Get machine failed, Error: {e}")))?
+            .map_err(|e| CarbideError::InvalidArgument(format!("get machine failed, error: {e}")))?
             .ok_or(CarbideError::InvalidArgument(
-                "Invalid machine id. Not found in db.".to_string(),
+                "invalid machine id. not found in db".to_string(),
             ))?;
 
-        tracing::info!(machine_id = %machine.id, interface_id = %target.interface_id, state=%machine.current_state(), "Found existing machine for pxe instructions");
+        tracing::info!(machine_id = %machine.id, machine_interface_id = %target.interface_id, machine_state = %machine.current_state(), "Found existing machine for pxe instructions");
         // DPUs need to boot twice during initial discovery. Both reboots require
         // that the DPU gets pxe instructions.
         //
@@ -457,7 +459,7 @@ exit ||
         if target.arch == rpc::MachineArchitecture::Arm {
             console = "ttyAMA0";
             qcow_imager_url = "chain ${base-url}/internal/aarch64/qcow-imager.efi loglevel=7 console=tty0 pci=realloc=off ";
-        } else if let Some(hardware_info) = machine.hardware_info.as_ref()
+        } else if let Some(hardware_info) = machine.status.hardware_info.as_ref()
             && let Some(dmi_info) = hardware_info.dmi_data.as_ref()
             && (dmi_info.sys_vendor == "Lenovo" || dmi_info.sys_vendor == "Supermicro")
         {
@@ -467,6 +469,7 @@ exit ||
         let pxe_script = match &machine.current_state() {
             ManagedHostState::Ready
             | ManagedHostState::HostInit { .. }
+            | ManagedHostState::BootConfiguring { .. }
             | ManagedHostState::BomValidating { .. }
             | ManagedHostState::Measuring {
                 measuring_state: MeasuringState::WaitingForMeasurements,

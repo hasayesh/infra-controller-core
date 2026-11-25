@@ -83,13 +83,15 @@ enum IbPartitionPkeyMissing {
         cause: String,
     },
 }
+const MISSING_READY_PKEY: &str = "The pkey is None when IBPartition is ready";
+
 fn missing_pkey_transition(
     partition_id: IBPartitionId,
     controller_state: MissingPkeyControllerState,
     instrumentation: &carbide_instrument::Instrumentation,
 ) -> StateHandlerOutcome<IBPartitionControllerState> {
     let cause = match controller_state {
-        MissingPkeyControllerState::Ready => "The pkey is None when IBPartition is ready",
+        MissingPkeyControllerState::Ready => MISSING_READY_PKEY,
         MissingPkeyControllerState::Deleting => "The pkey is None when deleting an IBPartition.",
     }
     .to_string();
@@ -328,15 +330,21 @@ impl StateHandler for IBPartitionStateHandler {
                 }
             },
 
-            IBPartitionControllerState::Error { .. } => {
+            IBPartitionControllerState::Error { cause } => {
                 if state.status.as_ref().and_then(|s| s.pkey).is_some()
                     && state.is_marked_as_deleted()
                 {
                     Ok(StateHandlerOutcome::transition(
                         IBPartitionControllerState::Deleting,
                     ))
+                } else if cause == MISSING_READY_PKEY
+                    && state.status.as_ref().and_then(|s| s.pkey).is_some()
+                {
+                    Ok(StateHandlerOutcome::transition(
+                        IBPartitionControllerState::Ready,
+                    ))
                 } else {
-                    // If pkey is none, keep it in error state.
+                    // Preserve the Error state unless a recovery condition above applies.
                     Ok(StateHandlerOutcome::do_nothing())
                 }
             }

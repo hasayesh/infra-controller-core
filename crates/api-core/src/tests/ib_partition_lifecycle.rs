@@ -180,6 +180,123 @@ async fn test_ib_partition_lifecycle_impl(
 }
 
 #[crate::sqlx_test]
+async fn manually_restored_pkey_resumes_partition_lifecycle(pool: sqlx::PgPool) {
+    let mut config = common::api_fixtures::get_config();
+    config.ib_config = Some(IBFabricConfig {
+        enabled: true,
+        ..Default::default()
+    });
+    let env = common::api_fixtures::create_test_env_with_overrides(
+        pool.clone(),
+        TestEnvOverrides::with_config(config),
+    )
+    .await;
+
+    for (label, deleted, cause, expected_state) in [
+        (
+            "active",
+            false,
+            "The pkey is None when IBPartition is ready",
+            "ready",
+        ),
+        (
+            "deleted",
+            true,
+            "The pkey is None when IBPartition is ready",
+            "deleting",
+        ),
+        ("unrelated-error", false, "Unrelated failure", "error"),
+    ] {
+        let partition = create_ib_partition_with_api(&env.api, format!("manual-restore-{label}"))
+            .await
+            .unwrap()
+            .into_inner();
+        let id = partition.id.unwrap();
+        let pkey = partition.status.unwrap().pkey.unwrap();
+        env.run_ib_partition_controller_iteration().await;
+        if deleted {
+            env.api
+                .delete_ib_partition(Request::new(rpc::forge::IbPartitionDeletionRequest {
+                    id: Some(id),
+                }))
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE ib_partitions SET status=NULL, controller_state=$2 WHERE id=$1")
+            .bind(id)
+            .bind(serde_json::json!({"state": "error", "cause": cause}))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        env.run_ib_partition_controller_iteration().await;
+        let before: serde_json::Value =
+            sqlx::query_scalar("SELECT controller_state FROM ib_partitions WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            before["state"], "error",
+            "an unknown PKey must remain blocked"
+        );
+
+        // Simulate operator restoration without changing the controller state.
+        let before_version: String = sqlx::query_scalar(
+            "UPDATE ib_partitions
+             SET status=jsonb_set(COALESCE(status, '{}'::jsonb), '{pkey}', to_jsonb($2::text), true),
+                 controller_state_outcome=NULL
+             WHERE id=$1 RETURNING controller_state_version",
+        )
+        .bind(id)
+        .bind(&pkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        env.run_ib_partition_controller_iteration().await;
+        let (state, restored, version, outcome): (String, String, String, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT controller_state->>'state', status->>'pkey', controller_state_version,
+                    controller_state_outcome FROM ib_partitions WHERE id=$1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(restored, pkey);
+        assert_eq!(state, expected_state, "{label}");
+        if expected_state == "error" {
+            assert_eq!(version, before_version);
+            assert_eq!(outcome["outcome"], "donothing");
+        } else {
+            assert_ne!(version, before_version);
+        }
+
+        if deleted {
+            env.run_ib_partition_controller_iteration().await;
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM ib_partitions WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "normal cleanup must finish after repair");
+            let numeric_pkey = u16::from_str_radix(pkey.trim_start_matches("0x"), 16).unwrap();
+            let pool_state: serde_json::Value = sqlx::query_scalar(
+                "SELECT state FROM resource_pool WHERE name='ib_fabrics.default.pkey' AND value=$1",
+            )
+            .bind(numeric_pkey.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                pool_state["state"], "free",
+                "the reservation must be released"
+            );
+        }
+    }
+}
+
+#[crate::sqlx_test]
 async fn test_ib_partition_lifecycle(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
     test_ib_partition_lifecycle_impl(pool).await
 }
